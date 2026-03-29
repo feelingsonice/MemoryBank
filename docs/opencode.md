@@ -10,7 +10,7 @@ For building the binaries, starting `memory-bank-server`, and the shared configu
 
 OpenCode uses Memory Bank in two separate ways:
 
-- Recall uses MCP. OpenCode connects to `http://127.0.0.1:8080/mcp` and can call `retrieve_memory`.
+- Recall uses MCP. OpenCode connects to `http://127.0.0.1:3737/mcp` and can call `retrieve_memory`.
 - Capture uses the Memory Bank plugin at `.opencode/plugins/memory-bank.js`. The plugin listens to OpenCode events, shells out to `memory-bank-hook`, and forwards normalized fragments to `POST /ingest`.
 
 Without the plugin, OpenCode can still retrieve from Memory Bank through MCP, but it will not capture new memories.
@@ -47,7 +47,7 @@ Use the main [README Quick Start](../README.md#quick-start) or [Build From Sourc
   "mcp": {
     "memory-bank": {
       "type": "remote",
-      "url": "http://127.0.0.1:8080/mcp",
+      "url": "http://127.0.0.1:3737/mcp",
       "enabled": true
     }
   }
@@ -76,7 +76,7 @@ If your binary lives somewhere else, set:
 
 ```bash
 export MEMORY_BANK_HOOK_BIN=/absolute/path/to/memory-bank-hook
-export MEMORY_BANK_SERVER_URL=http://127.0.0.1:8080
+export MEMORY_BANK_SERVER_URL=http://127.0.0.1:3737
 ```
 
 `MEMORY_BANK_SERVER_URL` is only needed if you are not using the default server address.

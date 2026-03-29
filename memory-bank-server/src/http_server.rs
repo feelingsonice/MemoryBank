@@ -4,13 +4,14 @@ use std::sync::Arc;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Json, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use memory_bank_protocol::IngestEnvelope;
 use rmcp::model::LoggingMessageNotificationParam;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
     StreamableHttpServerConfig, StreamableHttpService,
 };
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -31,13 +32,14 @@ pub struct HttpServer {
 impl HttpServer {
     pub async fn bind(
         port: u16,
+        health: HealthResponse,
         memory: MemoryHandle,
         ingest: IngestService,
         log_tx: broadcast::Sender<LoggingMessageNotificationParam>,
     ) -> Result<Self, AppError> {
         let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let shutdown = CancellationToken::new();
-        let app = build_app(memory, ingest, log_tx, &shutdown);
+        let app = build_app(health, memory, ingest, log_tx, &shutdown);
         let listener = TcpListener::bind(bind_addr)
             .await
             .map_err(|e| AppError::HttpServer(format!("Failed to bind to {}: {}", bind_addr, e)))?;
@@ -80,12 +82,13 @@ impl HttpServer {
 }
 
 fn build_app(
+    health: HealthResponse,
     memory: MemoryHandle,
     ingest: IngestService,
     log_tx: broadcast::Sender<LoggingMessageNotificationParam>,
     shutdown: &CancellationToken,
 ) -> axum::Router {
-    let state = HttpState { ingest };
+    let state = HttpState { health, ingest };
     let mcp_service = StreamableHttpService::new(
         move || Ok(McpServer::new(memory.clone(), log_tx.clone())),
         Arc::new(LocalSessionManager::default()),
@@ -96,6 +99,7 @@ fn build_app(
     );
     let ingest_routes = axum::Router::new()
         .route("/ingest", post(handle_ingest))
+        .route("/healthz", get(handle_healthz))
         .with_state(state)
         .layer(DefaultBodyLimit::disable());
 
@@ -107,6 +111,7 @@ fn build_app(
 
 #[derive(Clone)]
 struct HttpState {
+    health: HealthResponse,
     ingest: IngestService,
 }
 
@@ -147,6 +152,20 @@ async fn handle_ingest(
     }
 }
 
+async fn handle_healthz(State(state): State<HttpState>) -> Json<HealthResponse> {
+    Json(state.health)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HealthResponse {
+    pub ok: bool,
+    pub namespace: String,
+    pub port: u16,
+    pub llm_provider: String,
+    pub encoder_provider: String,
+    pub version: &'static str,
+}
+
 async fn shutdown_signal(shutdown: CancellationToken) {
     tokio::signal::ctrl_c().await.ok();
     info!("Shutdown signal received; waiting for in-flight requests to finish");
@@ -155,7 +174,7 @@ async fn shutdown_signal(shutdown: CancellationToken) {
 
 #[cfg(test)]
 mod tests {
-    use super::build_app;
+    use super::{HealthResponse, build_app};
     use crate::actor::MemoryHandle;
     use crate::ingest::IngestService;
     use axum::body::Body;
@@ -255,6 +274,22 @@ mod tests {
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    #[tokio::test]
+    async fn healthz_route_returns_ok_payload() {
+        let app = app().await;
+
+        let response = app
+            .oneshot(
+                Request::get("/healthz")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     async fn app() -> axum::Router {
         let (log_tx, _) = broadcast::channel::<LoggingMessageNotificationParam>(8);
         let shutdown = CancellationToken::new();
@@ -262,7 +297,15 @@ mod tests {
         let ingest = IngestService::open(&test_db_path(), memory.clone(), 0)
             .await
             .expect("ingest service");
-        build_app(memory, ingest, log_tx, &shutdown)
+        let health = HealthResponse {
+            ok: true,
+            namespace: "default".to_string(),
+            port: 3737,
+            llm_provider: "anthropic".to_string(),
+            encoder_provider: "fast-embed".to_string(),
+            version: "test",
+        };
+        build_app(health, memory, ingest, log_tx, &shutdown)
     }
 
     fn sample_payload() -> IngestEnvelope {
@@ -290,8 +333,10 @@ mod tests {
     }
 
     fn test_db_path() -> PathBuf {
-        std::env::temp_dir()
-            .join(format!("memory_bank_http_server_test_{}.db", unique_suffix()))
+        std::env::temp_dir().join(format!(
+            "memory_bank_http_server_test_{}.db",
+            unique_suffix()
+        ))
     }
 
     fn unique_suffix() -> u128 {

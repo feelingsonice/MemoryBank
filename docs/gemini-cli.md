@@ -8,7 +8,7 @@ For building the binaries, starting `memory-bank-server`, and the shared configu
 
 Gemini CLI uses Memory Bank in two separate ways:
 
-- Recall uses MCP. Gemini CLI connects to `http://127.0.0.1:8080/mcp` and can call `retrieve_memory`.
+- Recall uses MCP. Gemini CLI connects to `http://127.0.0.1:3737/mcp` and can call `retrieve_memory`.
 - Capture uses Gemini hooks. Those hooks shell out to `memory-bank-hook`, which forwards normalized fragments to `POST /ingest`.
 
 ## Hooks Used
@@ -29,7 +29,7 @@ Use the main [README Quick Start](../README.md#quick-start) or [Build From Sourc
 2. Register the MCP server in Gemini CLI.
 
 ```bash
-gemini mcp add --scope project --transport http memory-bank http://127.0.0.1:8080/mcp
+gemini mcp add --scope project --transport http memory-bank http://127.0.0.1:3737/mcp
 ```
 
 3. Add the Memory Bank MCP entry and hooks to `.gemini/settings.json`.
@@ -40,7 +40,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
 {
   "mcpServers": {
     "memory-bank": {
-      "httpUrl": "http://127.0.0.1:8080/mcp"
+      "httpUrl": "http://127.0.0.1:3737/mcp"
     }
   },
   "hooks": {
@@ -52,7 +52,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
           {
             "name": "memory-bank",
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event BeforeAgent --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event BeforeAgent --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -65,7 +65,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
           {
             "name": "memory-bank",
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event BeforeTool --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event BeforeTool --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -78,7 +78,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
           {
             "name": "memory-bank",
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event AfterTool --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event AfterTool --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -91,7 +91,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
           {
             "name": "memory-bank",
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event AfterAgent --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent gemini-cli --event AfterAgent --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -109,7 +109,7 @@ If you want the same Memory Bank setup in every Gemini CLI session on this machi
 - register MCP at user scope:
 
 ```bash
-gemini mcp add --scope user --transport http memory-bank http://127.0.0.1:8080/mcp
+gemini mcp add --scope user --transport http memory-bank http://127.0.0.1:3737/mcp
 ```
 
 - move the same `mcpServers` and `hooks` config into `~/.gemini/settings.json`

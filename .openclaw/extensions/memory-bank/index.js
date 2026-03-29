@@ -4,7 +4,8 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const DEFAULT_AGENT = "openclaw";
-const DEFAULT_SERVER_URL = "http://127.0.0.1:8080";
+const APP_ROOT_DIR_NAME = ".memory_bank";
+const DEFAULT_SERVER_URL = "http://127.0.0.1:3737";
 const DEDUPE_CACHE_LIMIT = 2048;
 const DUPLICATE_WINDOW_MS = 5_000;
 const MEMORY_BANK_PREFERENCE_SYSTEM_CONTEXT =
@@ -269,6 +270,8 @@ function resolvePluginConfig(api, platform) {
   const cwd = platform.cwd();
   const env = platform.env || {};
   const resolvePath = createPathResolver(api, platform);
+  const appSettings = loadAppSettings(platform);
+  const appConfigRoot = resolveAppConfigRoot(platform);
 
   return {
     debug: Boolean(pluginConfig.debug) || env.MEMORY_BANK_OPENCLAW_DEBUG === "1",
@@ -285,15 +288,52 @@ function resolvePluginConfig(api, platform) {
         resolvePath,
         firstNonEmpty(pluginConfig.hookBinary, env.MEMORY_BANK_HOOK_BIN),
       ),
+      appConfigRoot && path.join(appConfigRoot, "bin", "memory-bank-hook"),
       path.join(cwd, "target/debug/memory-bank-hook"),
       path.join(cwd, "target/release/memory-bank-hook"),
     ),
     serverUrl: firstNonEmpty(
       pluginConfig.serverUrl,
       env.MEMORY_BANK_SERVER_URL,
+      resolveServerUrlFromSettings(appSettings),
       DEFAULT_SERVER_URL,
     ),
   };
+}
+
+function resolveAppConfigRoot(platform) {
+  const homeDir = firstNonEmpty(platform.env?.HOME, platform.homeDir?.());
+  if (!homeDir) {
+    return null;
+  }
+  return path.join(homeDir, APP_ROOT_DIR_NAME);
+}
+
+function loadAppSettings(platform) {
+  const appRoot = resolveAppConfigRoot(platform);
+  if (!appRoot) {
+    return null;
+  }
+
+  const settingsPath = path.join(appRoot, "settings.json");
+  if (!platform.fileExists(settingsPath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(platform.readFile(settingsPath));
+  } catch {
+    return null;
+  }
+}
+
+function resolveServerUrlFromSettings(appSettings) {
+  const port = appSettings?.service?.port;
+  if (typeof port !== "number" || !Number.isFinite(port)) {
+    return null;
+  }
+
+  return `http://127.0.0.1:${port}`;
 }
 
 function getPluginConfig(api) {
@@ -693,8 +733,14 @@ function createPlatform() {
     fileExists(filePath) {
       return fs.existsSync(filePath);
     },
+    homeDir() {
+      return process.env.HOME || null;
+    },
     now() {
       return Date.now();
+    },
+    readFile(filePath) {
+      return fs.readFileSync(filePath, "utf8");
     },
     spawnSync(binary, args, options) {
       return spawnSync(binary, args, {

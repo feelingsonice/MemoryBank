@@ -1,18 +1,22 @@
 [package]
-name = "memory-bank-hook"
+name = "memory-bank-cli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "mb"
+path = "src/main.rs"
+
 [dependencies]
-blake3.workspace = true
+chrono.workspace = true
 clap.workspace = true
+dialoguer.workspace = true
 memory-bank-app = { path = "../memory-bank-app" }
-memory-bank-protocol = { path = "../memory-bank-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-url.workspace = true
 ureq.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

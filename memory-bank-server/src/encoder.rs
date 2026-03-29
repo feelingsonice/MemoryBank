@@ -72,6 +72,14 @@ pub struct InitializedEncoder {
     pub model_id: String,
 }
 
+impl InitializedEncoder {
+    pub fn provider_name(&self) -> &'static str {
+        match &self.client {
+            EncoderClient::FastEmbed(_) => "fast-embed",
+        }
+    }
+}
+
 pub fn initialize(
     config: EncoderProviderConfig,
     models_dir: &Path,

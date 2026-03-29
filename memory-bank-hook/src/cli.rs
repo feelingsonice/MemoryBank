@@ -9,8 +9,8 @@ pub struct HookArgs {
     #[arg(long)]
     pub event: String,
 
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
-    pub server_url: String,
+    #[arg(long, env = "MEMORY_BANK_SERVER_URL")]
+    pub server_url: Option<String>,
 }
 
 impl HookArgs {
@@ -37,7 +37,7 @@ mod tests {
 
         assert_eq!(args.agent, "claude-code");
         assert_eq!(args.event, "Stop");
-        assert_eq!(args.server_url, "http://127.0.0.1:8080");
+        assert_eq!(args.server_url, None);
     }
 
     #[test]
@@ -53,7 +53,7 @@ mod tests {
         ])
         .expect("parse hook");
 
-        assert_eq!(args.server_url, "http://127.0.0.1:9090/");
+        assert_eq!(args.server_url.as_deref(), Some("http://127.0.0.1:9090/"));
     }
 
     #[test]
@@ -77,11 +77,11 @@ mod tests {
         let config = HookArgs {
             agent: "windsurf".to_string(),
             event: "AfterAgent".to_string(),
-            server_url: "http://127.0.0.1:8080".to_string(),
+            server_url: Some("http://127.0.0.1:8080".to_string()),
         };
 
         assert_eq!(config.agent, "windsurf");
         assert_eq!(config.event, "AfterAgent");
-        assert_eq!(config.server_url, "http://127.0.0.1:8080");
+        assert_eq!(config.server_url.as_deref(), Some("http://127.0.0.1:8080"));
     }
 }

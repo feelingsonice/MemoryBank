@@ -1,56 +1,12 @@
 use clap::Parser;
 use clap::ValueEnum;
+use memory_bank_app::{
+    AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL, DEFAULT_GEMINI_MODEL,
+    DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, Namespace, ServerSettings,
+};
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
-use std::str::FromStr;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Namespace(String);
-
-impl Namespace {
-    const DEFAULT: &str = "default";
-    const APP_DIR: &str = ".memory_bank";
-
-    fn sanitize(raw: &str) -> String {
-        let sanitized: String = raw
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-
-        if sanitized.is_empty() {
-            Self::DEFAULT.to_string()
-        } else {
-            sanitized
-        }
-    }
-}
-
-impl AsRef<str> for Namespace {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Namespace {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl FromStr for Namespace {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Self::sanitize(s)))
-    }
-}
 
 #[derive(Debug)]
 pub struct Dirs {
@@ -60,22 +16,15 @@ pub struct Dirs {
 }
 
 impl Dirs {
-    /// Returns the top-level app directory: `{home_dir}/.memory_bank/`.
-    fn app_dir() -> PathBuf {
-        let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        base.join(Namespace::APP_DIR)
-    }
-
-    pub fn create(namespace: &Namespace) -> Result<Self, std::io::Error> {
-        let app_dir = Self::app_dir();
-        let data = app_dir.join("namespaces").join(namespace.as_ref());
-        let dirs = Self {
+    pub fn create(paths: &AppPaths, namespace: &Namespace) -> Result<Self, std::io::Error> {
+        let data = paths.ensure_namespace_dir(namespace)?;
+        let models = paths.models_dir();
+        std::fs::create_dir_all(&models)?;
+        Ok(Self {
             db: data.join("memory.db"),
-            models: app_dir.join("models"),
+            models,
             data,
-        };
-        std::fs::create_dir_all(&dirs.data)?;
-        Ok(dirs)
+        })
     }
 }
 
@@ -87,6 +36,20 @@ pub enum LlmProviderType {
     Ollama,
 }
 
+impl std::str::FromStr for LlmProviderType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "gemini" => Ok(Self::Gemini),
+            "anthropic" => Ok(Self::Anthropic),
+            "open-ai" => Ok(Self::OpenAi),
+            "ollama" => Ok(Self::Ollama),
+            other => Err(format!("unsupported llm provider '{other}'")),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LlmProviderConfig {
     Gemini { api_key: String, model: String },
@@ -96,34 +59,52 @@ pub enum LlmProviderConfig {
 }
 
 impl LlmProviderConfig {
-    const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
-    const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
-    const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
-    const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
-    const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
-}
-
-impl TryFrom<LlmProviderType> for LlmProviderConfig {
-    type Error = crate::error::AppError;
-
-    fn try_from(provider: LlmProviderType) -> Result<Self, Self::Error> {
+    fn from_resolved(
+        provider: LlmProviderType,
+        settings: Option<&ServerSettings>,
+    ) -> Result<Self, crate::error::AppError> {
         match provider {
             LlmProviderType::Gemini => Ok(Self::Gemini {
                 api_key: require_env("GEMINI_API_KEY")?,
-                model: env_or_default("MEMORY_BANK_LLM_MODEL", Self::DEFAULT_GEMINI_MODEL),
+                model: env_setting_or_default(
+                    "MEMORY_BANK_LLM_MODEL",
+                    settings.and_then(|s| s.llm_model.as_deref()),
+                    DEFAULT_GEMINI_MODEL,
+                ),
             }),
             LlmProviderType::Anthropic => Ok(Self::Anthropic {
                 api_key: require_env("ANTHROPIC_API_KEY")?,
-                model: env_or_default("MEMORY_BANK_LLM_MODEL", Self::DEFAULT_ANTHROPIC_MODEL),
+                model: env_setting_or_default(
+                    "MEMORY_BANK_LLM_MODEL",
+                    settings.and_then(|s| s.llm_model.as_deref()),
+                    DEFAULT_ANTHROPIC_MODEL,
+                ),
             }),
             LlmProviderType::OpenAi => Ok(Self::OpenAi {
                 api_key: require_env("OPENAI_API_KEY")?,
-                model: env_or_default("MEMORY_BANK_LLM_MODEL", Self::DEFAULT_OPENAI_MODEL),
+                model: env_setting_or_default(
+                    "MEMORY_BANK_LLM_MODEL",
+                    settings.and_then(|s| s.llm_model.as_deref()),
+                    DEFAULT_OPENAI_MODEL,
+                ),
             }),
             LlmProviderType::Ollama => Ok(Self::Ollama {
-                url: env_or_default("MEMORY_BANK_OLLAMA_URL", Self::DEFAULT_OLLAMA_URL),
-                model: env_or_default("MEMORY_BANK_OLLAMA_MODEL", Self::DEFAULT_OLLAMA_MODEL),
+                url: env_setting_or_default("MEMORY_BANK_OLLAMA_URL", None, DEFAULT_OLLAMA_URL),
+                model: env_setting_or_default(
+                    "MEMORY_BANK_OLLAMA_MODEL",
+                    settings.and_then(|s| s.llm_model.as_deref()),
+                    DEFAULT_OLLAMA_MODEL,
+                ),
             }),
+        }
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Self::Gemini { .. } => "gemini",
+            Self::Anthropic { .. } => "anthropic",
+            Self::OpenAi { .. } => "open-ai",
+            Self::Ollama { .. } => "ollama",
         }
     }
 }
@@ -146,6 +127,19 @@ enum EncoderProviderType {
     RemoteApi,
 }
 
+impl std::str::FromStr for EncoderProviderType {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "fast-embed" => Ok(Self::FastEmbed),
+            "local-api" => Ok(Self::LocalApi),
+            "remote-api" => Ok(Self::RemoteApi),
+            other => Err(format!("unsupported encoder provider '{other}'")),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EncoderProviderConfig {
     FastEmbed { model: String },
@@ -154,24 +148,39 @@ pub enum EncoderProviderConfig {
 }
 
 impl EncoderProviderConfig {
-    const DEFAULT_FASTEMBED_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
-}
-
-impl TryFrom<EncoderProviderType> for EncoderProviderConfig {
-    type Error = crate::error::AppError;
-
-    fn try_from(provider: EncoderProviderType) -> Result<Self, Self::Error> {
+    fn from_resolved(
+        provider: EncoderProviderType,
+        settings: Option<&ServerSettings>,
+    ) -> Result<Self, crate::error::AppError> {
         match provider {
             EncoderProviderType::FastEmbed => Ok(Self::FastEmbed {
-                model: env_or_default("MEMORY_BANK_FASTEMBED_MODEL", Self::DEFAULT_FASTEMBED_MODEL),
+                model: env_setting_or_default(
+                    "MEMORY_BANK_FASTEMBED_MODEL",
+                    settings.and_then(|s| s.fastembed_model.as_deref()),
+                    DEFAULT_FASTEMBED_MODEL,
+                ),
             }),
             EncoderProviderType::LocalApi => Ok(Self::LocalApi {
-                url: require_env("MEMORY_BANK_LOCAL_ENCODER_URL")?,
+                url: require_env_or_setting(
+                    "MEMORY_BANK_LOCAL_ENCODER_URL",
+                    settings.and_then(|s| s.local_encoder_url.as_deref()),
+                )?,
             }),
             EncoderProviderType::RemoteApi => Ok(Self::RemoteApi {
                 _api_key: require_env("MEMORY_BANK_REMOTE_ENCODER_API_KEY")?,
-                url: require_env("MEMORY_BANK_REMOTE_ENCODER_URL")?,
+                url: require_env_or_setting(
+                    "MEMORY_BANK_REMOTE_ENCODER_URL",
+                    settings.and_then(|s| s.remote_encoder_url.as_deref()),
+                )?,
             }),
+        }
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            Self::FastEmbed { .. } => "fast-embed",
+            Self::LocalApi { .. } => "local-api",
+            Self::RemoteApi { .. } => "remote-api",
         }
     }
 }
@@ -189,23 +198,23 @@ impl fmt::Display for EncoderProviderConfig {
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Memory Bank server")]
 pub struct ServeArgs {
-    #[arg(long, default_value_t = 8080)]
-    port: u16,
+    #[arg(long, env = "MEMORY_BANK_PORT")]
+    port: Option<u16>,
 
-    #[arg(long, default_value = Namespace::DEFAULT)]
-    namespace: Namespace,
+    #[arg(long, env = "MEMORY_BANK_NAMESPACE")]
+    namespace: Option<Namespace>,
 
-    #[arg(long, value_enum, default_value_t = LlmProviderType::Anthropic)]
-    llm_provider: LlmProviderType,
+    #[arg(long, value_enum, env = "MEMORY_BANK_LLM_PROVIDER")]
+    llm_provider: Option<LlmProviderType>,
 
-    #[arg(long, value_enum, default_value_t = EncoderProviderType::FastEmbed)]
-    encoder_provider: EncoderProviderType,
+    #[arg(long, value_enum, env = "MEMORY_BANK_ENCODER_PROVIDER")]
+    encoder_provider: Option<EncoderProviderType>,
 
-    #[arg(long, default_value_t = 0)]
-    history_window_size: u32,
+    #[arg(long, env = "MEMORY_BANK_HISTORY_WINDOW_SIZE")]
+    history_window_size: Option<u32>,
 
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(i32).range(1..))]
-    nearest_neighbor_count: i32,
+    #[arg(long, env = "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT", value_parser = clap::value_parser!(i32).range(1..))]
+    nearest_neighbor_count: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -228,18 +237,59 @@ impl ServeArgs {
 impl TryFrom<ServeArgs> for ServeConfig {
     type Error = crate::error::AppError;
 
-    fn try_from(config: ServeArgs) -> Result<Self, Self::Error> {
-        let dirs = Dirs::create(&config.namespace)?;
+    fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
+        let app_paths = AppPaths::from_system()
+            .map_err(|error| crate::error::AppError::Config(error.to_string()))?;
+        let settings = AppSettings::load(&app_paths)
+            .map_err(|error| crate::error::AppError::Config(error.to_string()))?;
+        let server_settings = settings.server.as_ref();
+
+        let namespace = args
+            .namespace
+            .unwrap_or_else(|| settings.active_namespace());
+        let dirs = Dirs::create(&app_paths, &namespace)?;
+        let llm_provider = match args.llm_provider {
+            Some(provider) => provider,
+            None => parse_optional_value(server_settings.and_then(|s| s.llm_provider.as_deref()))?
+                .unwrap_or(LlmProviderType::Anthropic),
+        };
+        let encoder_provider = match args.encoder_provider {
+            Some(provider) => provider,
+            None => {
+                parse_optional_value(server_settings.and_then(|s| s.encoder_provider.as_deref()))?
+                    .unwrap_or(EncoderProviderType::FastEmbed)
+            }
+        };
 
         Ok(Self {
-            port: config.port,
-            namespace: config.namespace,
-            llm: config.llm_provider.try_into()?,
-            encoder: config.encoder_provider.try_into()?,
-            history_window_size: config.history_window_size,
-            nearest_neighbor_count: config.nearest_neighbor_count,
+            port: args.port.unwrap_or_else(|| settings.resolved_port()),
+            namespace,
+            llm: LlmProviderConfig::from_resolved(llm_provider, server_settings)?,
+            encoder: EncoderProviderConfig::from_resolved(encoder_provider, server_settings)?,
+            history_window_size: args
+                .history_window_size
+                .or_else(|| server_settings.and_then(|s| s.history_window_size))
+                .unwrap_or(0),
+            nearest_neighbor_count: args
+                .nearest_neighbor_count
+                .or_else(|| server_settings.and_then(|s| s.nearest_neighbor_count))
+                .unwrap_or(10),
             dirs,
         })
+    }
+}
+
+fn parse_optional_value<T>(value: Option<&str>) -> Result<Option<T>, crate::error::AppError>
+where
+    T: std::str::FromStr,
+    T::Err: fmt::Display,
+{
+    match value {
+        Some(value) => value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|error| crate::error::AppError::Config(error.to_string())),
+        None => Ok(None),
     }
 }
 
@@ -247,31 +297,31 @@ fn require_env(name: &str) -> Result<String, crate::error::AppError> {
     env::var(name).map_err(|_| crate::error::AppError::Config(format!("{} must be set", name)))
 }
 
-fn env_or_default(name: &str, default: &str) -> String {
-    env::var(name).unwrap_or_else(|_| default.to_string())
+fn require_env_or_setting(
+    name: &str,
+    setting: Option<&str>,
+) -> Result<String, crate::error::AppError> {
+    env::var(name)
+        .ok()
+        .or_else(|| setting.map(str::to_owned))
+        .ok_or_else(|| crate::error::AppError::Config(format!("{name} must be set")))
+}
+
+fn env_setting_or_default(name: &str, setting: Option<&str>, default: &str) -> String {
+    env::var(name)
+        .ok()
+        .or_else(|| setting.map(str::to_owned))
+        .unwrap_or_else(|| default.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memory_bank_app::{DEFAULT_PORT, SETTINGS_SCHEMA_VERSION, ServiceSettings};
     use std::sync::Mutex;
+    use tempfile::TempDir;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn serve_parses_with_defaults() {
-        let args = ServeArgs::try_parse_from(["memory-bank-server"]).expect("parse serve");
-
-        assert_eq!(args.port, 8080);
-        assert_eq!(args.namespace.as_ref(), "default");
-        assert!(matches!(args.llm_provider, LlmProviderType::Anthropic));
-        assert!(matches!(
-            args.encoder_provider,
-            EncoderProviderType::FastEmbed
-        ));
-        assert_eq!(args.history_window_size, 0);
-        assert_eq!(args.nearest_neighbor_count, 10);
-    }
 
     #[test]
     fn serve_parses_with_explicit_values() {
@@ -292,15 +342,15 @@ mod tests {
         ])
         .expect("parse serve");
 
-        assert_eq!(args.port, 9000);
-        assert_eq!(args.namespace.as_ref(), "team-a");
-        assert!(matches!(args.llm_provider, LlmProviderType::OpenAi));
+        assert_eq!(args.port, Some(9000));
+        assert_eq!(args.namespace.expect("namespace").as_ref(), "team-a");
+        assert!(matches!(args.llm_provider, Some(LlmProviderType::OpenAi)));
         assert!(matches!(
             args.encoder_provider,
-            EncoderProviderType::FastEmbed
+            Some(EncoderProviderType::FastEmbed)
         ));
-        assert_eq!(args.history_window_size, 42);
-        assert_eq!(args.nearest_neighbor_count, 24);
+        assert_eq!(args.history_window_size, Some(42));
+        assert_eq!(args.nearest_neighbor_count, Some(24));
     }
 
     #[test]
@@ -317,24 +367,17 @@ mod tests {
     }
 
     #[test]
-    fn serve_parses_ollama_provider() {
-        let args = ServeArgs::try_parse_from(["memory-bank-server", "--llm-provider", "ollama"])
-            .expect("parse serve");
-
-        assert!(matches!(args.llm_provider, LlmProviderType::Ollama));
-    }
-
-    #[test]
     fn ollama_provider_uses_defaults() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvVarGuard::new(&["MEMORY_BANK_OLLAMA_URL", "MEMORY_BANK_OLLAMA_MODEL"]);
 
-        let config = LlmProviderConfig::try_from(LlmProviderType::Ollama).expect("ollama config");
+        let config =
+            LlmProviderConfig::from_resolved(LlmProviderType::Ollama, None).expect("ollama");
 
         assert!(matches!(
             config,
             LlmProviderConfig::Ollama { url, model }
-            if url == "http://localhost:11434" && model == "qwen3:4b"
+            if url == DEFAULT_OLLAMA_URL && model == DEFAULT_OLLAMA_MODEL
         ));
     }
 
@@ -348,7 +391,8 @@ mod tests {
             env::set_var("MEMORY_BANK_OLLAMA_MODEL", "qwen3:8b");
         }
 
-        let config = LlmProviderConfig::try_from(LlmProviderType::Ollama).expect("ollama config");
+        let config =
+            LlmProviderConfig::from_resolved(LlmProviderType::Ollama, None).expect("ollama");
 
         assert!(matches!(
             config,
@@ -358,26 +402,59 @@ mod tests {
     }
 
     #[test]
-    fn namespace_sanitizes_unsupported_characters() {
-        let namespace: Namespace = format!(
-            "server-http-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        )
-        .parse()
-        .expect("namespace");
+    fn serve_config_uses_settings_defaults_when_flags_are_omitted() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let temp = TempDir::new().expect("tempdir");
+        let _guard = EnvVarGuard::new(&[
+            "HOME",
+            "MEMORY_BANK_PORT",
+            "MEMORY_BANK_NAMESPACE",
+            "MEMORY_BANK_LLM_PROVIDER",
+            "MEMORY_BANK_ENCODER_PROVIDER",
+            "MEMORY_BANK_HISTORY_WINDOW_SIZE",
+            "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "ANTHROPIC_API_KEY",
+        ]);
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::set_var("ANTHROPIC_API_KEY", "secret");
+        }
 
-        assert!(!namespace.as_ref().contains(' '));
-        assert!(!namespace.as_ref().contains('/'));
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            active_namespace: Some("team-a".to_string()),
+            service: Some(ServiceSettings {
+                port: Some(4555),
+                autostart: None,
+            }),
+            server: Some(ServerSettings {
+                llm_provider: Some("anthropic".to_string()),
+                history_window_size: Some(9),
+                nearest_neighbor_count: Some(12),
+                ..ServerSettings::default()
+            }),
+            integrations: None,
+        };
+        settings.save(&paths).expect("save settings");
+
+        let config = ServeConfig::try_from(
+            ServeArgs::try_parse_from(["memory-bank-server"]).expect("parse"),
+        )
+        .expect("config");
+
+        assert_eq!(config.port, 4555);
+        assert_eq!(config.namespace.as_ref(), "team-a");
+        assert_eq!(config.history_window_size, 9);
+        assert_eq!(config.nearest_neighbor_count, 12);
+        assert!(config.dirs.db.ends_with("team-a/memory.db"));
+        assert!(config.dirs.models.ends_with(".memory_bank/models"));
     }
 
     #[test]
-    fn empty_namespace_falls_back_to_default() {
-        let namespace: Namespace = "".parse().expect("namespace");
-
-        assert_eq!(namespace.as_ref(), "default");
+    fn settings_fallback_uses_new_default_port() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.resolved_port(), DEFAULT_PORT);
     }
 
     struct EnvVarGuard {

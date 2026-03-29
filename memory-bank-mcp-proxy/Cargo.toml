@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 clap.workspace = true
+memory-bank-app = { path = "../memory-bank-app" }
 memory-bank-protocol = { path = "../memory-bank-protocol" }
 rmcp.workspace = true
 serde_json.workspace = true

@@ -13,6 +13,7 @@ dirs.workspace = true
 fastembed.workspace = true
 hf-hub.workspace = true
 libsqlite3-sys.workspace = true
+memory-bank-app = { path = "../memory-bank-app" }
 memory-bank-protocol = { path = "../memory-bank-protocol" }
 rig-core.workspace = true
 rmcp.workspace = true
@@ -31,4 +32,5 @@ ureq.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tower.workspace = true

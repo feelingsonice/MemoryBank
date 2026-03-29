@@ -4,7 +4,8 @@ import { spawnSync } from "node:child_process";
 
 const LOG_SERVICE = "memory-bank-opencode";
 const DEFAULT_AGENT = "opencode";
-const DEFAULT_SERVER_URL = "http://127.0.0.1:8080";
+const APP_ROOT_DIR_NAME = ".memory_bank";
+const DEFAULT_SERVER_URL = "http://127.0.0.1:3737";
 const DEDUPE_CACHE_LIMIT = 2048;
 const IMMEDIATE_ASSISTANT_RETRY_ATTEMPTS = 4;
 const IMMEDIATE_ASSISTANT_RETRY_DELAY_MS = 25;
@@ -822,6 +823,10 @@ function createBoundedIdCache(limit) {
 function resolvePluginConfig({ directory, worktree }, platform) {
   const projectRoot = worktree || directory || platform.cwd();
   const env = platform.env || {};
+  const appSettings = loadAppSettings(platform);
+  const appConfigRoot = resolveAppConfigRoot(platform);
+  const appHookBinary =
+    appConfigRoot && path.join(appConfigRoot, "bin", "memory-bank-hook");
 
   return {
     debugEnabled: envFlag(
@@ -832,9 +837,11 @@ function resolvePluginConfig({ directory, worktree }, platform) {
       projectRoot,
       env.MEMORY_BANK_OPENCODE_DEBUG_FILE,
     ),
-    hookBinary: resolveHookBinary(projectRoot, env, platform),
+    hookBinary: resolveHookBinary(projectRoot, env, platform, appHookBinary),
     projectRoot,
-    serverUrl: firstString(env.MEMORY_BANK_SERVER_URL) || DEFAULT_SERVER_URL,
+    serverUrl:
+      firstString(env.MEMORY_BANK_SERVER_URL, resolveServerUrlFromSettings(appSettings)) ||
+      DEFAULT_SERVER_URL,
   };
 }
 
@@ -847,7 +854,7 @@ function resolveOptionalDebugFilePath(projectRoot, configuredPath) {
   return path.isAbsolute(filePath) ? filePath : path.resolve(projectRoot, filePath);
 }
 
-function resolveHookBinary(projectRoot, env, platform) {
+function resolveHookBinary(projectRoot, env, platform, appManagedBinary) {
   const configured = firstString(
     env.MEMORY_BANK_HOOK_BIN,
     env.MEMORY_BANK_OPENCODE_HOOK_BIN,
@@ -859,11 +866,48 @@ function resolveHookBinary(projectRoot, env, platform) {
   const binaryName =
     process.platform === "win32" ? "memory-bank-hook.exe" : "memory-bank-hook";
   const candidates = [
+    appManagedBinary,
     path.join(projectRoot, "target", "debug", binaryName),
     path.join(projectRoot, "target", "release", binaryName),
-  ];
+  ].filter(Boolean);
 
   return candidates.find((candidate) => platform.fileExists(candidate)) || candidates[0];
+}
+
+function resolveAppConfigRoot(platform) {
+  const homeDir = firstString(platform.env?.HOME, platform.homeDir?.());
+  if (!homeDir) {
+    return null;
+  }
+  return path.join(homeDir, APP_ROOT_DIR_NAME);
+}
+
+function loadAppSettings(platform) {
+  const appRoot = resolveAppConfigRoot(platform);
+  if (!appRoot) {
+    return null;
+  }
+
+  const settingsPath = path.join(appRoot, "settings.json");
+  if (!platform.fileExists(settingsPath)) {
+    return null;
+  }
+
+  try {
+    const contents = platform.readFile(settingsPath);
+    return JSON.parse(contents);
+  } catch {
+    return null;
+  }
+}
+
+function resolveServerUrlFromSettings(appSettings) {
+  const port = appSettings?.service?.port;
+  if (typeof port !== "number" || !Number.isFinite(port)) {
+    return null;
+  }
+
+  return `http://127.0.0.1:${port}`;
 }
 
 function createPlatform(overrides = {}) {
@@ -881,6 +925,12 @@ function createPlatform(overrides = {}) {
     env: process.env,
     fileExists(filePath) {
       return fs.existsSync(filePath);
+    },
+    homeDir() {
+      return process.env.HOME || null;
+    },
+    readFile(filePath) {
+      return fs.readFileSync(filePath, "utf8");
     },
     setTimeout(fn, delayMs) {
       return setTimeout(fn, delayMs);

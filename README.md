@@ -25,19 +25,25 @@ Currently supports:
 
 ## Quick Start
 
-The intended default install path is the repository's GitHub Releases page. When releases are available, download the prebuilt `memory-bank-server` and `memory-bank-hook` binaries from [GitHub Releases](../../releases). If you plan to use OpenClaw, you also need `memory-bank-mcp-proxy`. If you would rather build locally, jump to [Build From Source](#build-from-source).
+The intended default install path is the repository's GitHub Releases page. The user-facing install flow is the `mb` CLI plus the bootstrap installer at [`./install.sh`](./install.sh). The installer tracks the latest published release and downloads the correct tarball for the current macOS or Linux architecture.
 
-1. Start the server.
+1. Run the installer.
+
+```bash
+./install.sh
+```
+
+2. If you are developing locally and want to start the server without the managed service, run:
 
 ```bash
 export ANTHROPIC_API_KEY=your-key
-./memory-bank-server --llm-provider anthropic
+./target/release/memory-bank-server --llm-provider anthropic
 ```
 
-By default the server binds to `127.0.0.1:8080` and exposes:
+By default the managed service binds to `127.0.0.1:3737` and exposes:
 
-- MCP: `http://127.0.0.1:8080/mcp`
-- Ingest: `http://127.0.0.1:8080/ingest`
+- MCP: `http://127.0.0.1:3737/mcp`
+- Ingest: `http://127.0.0.1:3737/ingest`
 
 The first startup may take a little longer because the embedding model is downloaded and cached locally.
 
@@ -68,6 +74,20 @@ Before answering, call retrieve_memory for my editor preference and tell me what
 
 If everything is wired correctly, the agent should call `retrieve_memory` and answer using the stored note.
 
+## Release Assets
+
+Each GitHub Release publishes four platform-specific tarballs plus `SHA256SUMS`:
+
+- `memory-bank-x86_64-apple-darwin.tar.gz`
+- `memory-bank-aarch64-apple-darwin.tar.gz`
+- `memory-bank-x86_64-unknown-linux-gnu.tar.gz`
+- `memory-bank-aarch64-unknown-linux-gnu.tar.gz`
+- `SHA256SUMS`
+
+These tarballs extract directly into the `~/.memory_bank/` app-root layout expected by `mb` and `install.sh`.
+
+Linux note: the release pipeline currently ships native `gnu` builds for modern glibc-based Linux distributions.
+
 ## Features
 
 - Cross-agent continuity. Memories captured from Claude Code, Gemini CLI, OpenCode, or OpenClaw can be recalled from the same Memory Bank namespace.
@@ -87,7 +107,7 @@ If everything is wired correctly, the agent should call `retrieve_memory` and an
 1. Your agent emits conversation events.
 2. `memory-bank-hook` normalizes those events and sends them to `POST /ingest`.
 3. `memory-bank-server` groups fragments into turns, analyzes them with your configured LLM, and stores memory notes in SQLite.
-4. Your agent calls `retrieve_memory` from the MCP endpoint at `http://127.0.0.1:8080/mcp` whenever earlier context could improve the answer.
+4. Your agent calls `retrieve_memory` from the MCP endpoint at `http://127.0.0.1:3737/mcp` whenever earlier context could improve the answer.
 
 Important: MCP handles recall only. To actually capture memories, you also need the hook side configured for your agent.
 
@@ -126,10 +146,11 @@ If you are choosing an agent today, all four are supported. The main difference 
 
 ## What This Repo Builds
 
-This workspace currently contains four Rust crates:
+This workspace currently contains five Rust crates:
 
 | Crate | Type | Purpose |
 | --- | --- | --- |
+| `memory-bank-cli` | Binary (`mb`) | User-facing control plane for setup, service management, namespace switching, logs, and diagnostics. |
 | `memory-bank-server` | Binary | Runs the local HTTP server, hosts `/mcp` and `/ingest`, stores memory, and serves `retrieve_memory`. |
 | `memory-bank-hook` | Binary | Reads hook/plugin payloads from stdin, normalizes them, and posts them to the server. |
 | `memory-bank-mcp-proxy` | Binary | Exposes `retrieve_memory` as a stdio MCP server and forwards calls to the upstream Memory Bank HTTP MCP server. |
@@ -137,6 +158,7 @@ This workspace currently contains four Rust crates:
 
 For most users, the only artifacts you need are:
 
+- `mb`
 - `memory-bank-server`
 - `memory-bank-hook`
 - `memory-bank-mcp-proxy` if you are using OpenClaw
@@ -165,10 +187,12 @@ Release binaries will be written to:
 - `target/release/memory-bank-server`
 - `target/release/memory-bank-hook`
 - `target/release/memory-bank-mcp-proxy`
+- `target/release/mb`
 
 Useful verification commands:
 
 ```bash
+./target/release/mb --help
 ./target/release/memory-bank-server --help
 ./target/release/memory-bank-hook --help
 ./target/release/memory-bank-mcp-proxy --help
@@ -185,6 +209,15 @@ export ANTHROPIC_API_KEY=your-key
 ```
 
 Then follow the guide for your agent in [`/docs`](./docs) to wire MCP plus hook-based capture.
+
+## Release Process
+
+GitHub Actions manages CI and releases:
+
+- CI runs on every push and pull request and checks formatting, `cargo check`, and `cargo test`
+- Releases are built from semver tags like `v0.1.0`
+- The release workflow builds native tarballs for macOS and Linux on all supported architectures
+- Releases are created as drafts first, assets are uploaded, and the release is published only after every asset and checksum has been attached
 
 ## Configuration And Environment Variables
 
@@ -207,7 +240,7 @@ Before changing settings, it helps to keep the split clear:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--port` | `8080` | Local HTTP port for the server. MCP is exposed at `/mcp` and ingest is exposed at `/ingest`. |
+| `--port` | `3737` | Local HTTP port for the server. MCP is exposed at `/mcp` and ingest is exposed at `/ingest`. |
 | `--namespace` | `default` | Storage namespace. Each namespace gets its own SQLite database. |
 | `--llm-provider` | `anthropic` | Memory-analysis provider. Supported values: `gemini`, `anthropic`, `open-ai`, `ollama`. |
 | `--encoder-provider` | `fast-embed` | Embedding provider. Supported values: `fast-embed`, `local-api`, `remote-api`. Only `fast-embed` is implemented today. |
@@ -230,7 +263,7 @@ Notes:
 | --- | --- | --- |
 | `--agent` | required | Source identifier. Supported today: `claude-code`, `gemini-cli`, `openclaw`, `opencode`. |
 | `--event` | required | Event name for the incoming hook or plugin payload. |
-| `--server-url` | `http://127.0.0.1:8080` | Base URL for the running Memory Bank server. |
+| `--server-url` | `http://127.0.0.1:3737` | Base URL for the running Memory Bank server. |
 
 ### MCP Proxy CLI Flags
 
@@ -238,7 +271,7 @@ Notes:
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--server-url` | `http://127.0.0.1:8080` | Base URL for the running Memory Bank server. The proxy forwards stdio MCP calls to the server's `/mcp` endpoint and also accepts an explicit `/mcp` URL. |
+| `--server-url` | `http://127.0.0.1:3737` | Base URL for the running Memory Bank server. The proxy forwards stdio MCP calls to the server's `/mcp` endpoint and also accepts an explicit `/mcp` URL. |
 
 ### LLM Provider Environment Variables
 
@@ -288,8 +321,8 @@ These are only relevant if you are using the bundled OpenCode plugin:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `MEMORY_BANK_HOOK_BIN` | `./target/debug/memory-bank-hook` with fallback to `target/release/memory-bank-hook` | Overrides which hook binary the plugin executes. |
-| `MEMORY_BANK_SERVER_URL` | `http://127.0.0.1:8080` | Overrides where the plugin sends hook fragments. |
+| `MEMORY_BANK_HOOK_BIN` | `~/.memory_bank/bin/memory-bank-hook` | Overrides which hook binary the plugin executes. |
+| `MEMORY_BANK_SERVER_URL` | `http://127.0.0.1:3737` | Overrides where the plugin sends hook fragments. |
 | `MEMORY_BANK_OPENCODE_DEBUG` | unset | Enables verbose plugin diagnostics when set to `1`. |
 | `MEMORY_BANK_OPENCODE_DEBUG_FILE` | unset | If set, also mirrors plugin logs to a file. |
 
@@ -299,8 +332,8 @@ These are only relevant if you are using the repo-owned OpenClaw extension:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `MEMORY_BANK_HOOK_BIN` | `./target/debug/memory-bank-hook` with fallback to `target/release/memory-bank-hook` | Fallback override for which hook binary the extension executes. OpenClaw plugin config is the primary config surface. |
-| `MEMORY_BANK_SERVER_URL` | `http://127.0.0.1:8080` | Fallback override for where the extension sends hook fragments and where `memory-bank-mcp-proxy` forwards recall calls. |
+| `MEMORY_BANK_HOOK_BIN` | `~/.memory_bank/bin/memory-bank-hook` | Fallback override for which hook binary the extension executes. OpenClaw plugin config is the primary config surface. |
+| `MEMORY_BANK_SERVER_URL` | `http://127.0.0.1:3737` | Fallback override for where the extension sends hook fragments and where `memory-bank-mcp-proxy` forwards recall calls. |
 | `MEMORY_BANK_OPENCLAW_DEBUG` | unset | Enables verbose OpenClaw extension diagnostics when set to `1`. |
 | `MEMORY_BANK_OPENCLAW_DEBUG_FILE` | unset | If set, also mirrors OpenClaw extension logs to a file. |
 
