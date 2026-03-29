@@ -4,14 +4,35 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  verify-main:
+    name: Verify tag is on main
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch main
+        run: git fetch origin main --no-tags
+
+      - name: Ensure tagged commit is reachable from main
+        run: |
+          set -eu
+          TAG_SHA="${GITHUB_SHA}"
+          if ! git merge-base --is-ancestor "${TAG_SHA}" "origin/main"; then
+            echo "Refusing to release: tagged commit ${TAG_SHA} is not reachable from origin/main." >&2
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify-main
     strategy:
       fail-fast: false
       matrix:
