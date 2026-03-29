@@ -115,7 +115,7 @@ jobs:
           tar -C "${STAGE_DIR}" -czf "memory-bank-${TARGET}.tar.gz" .
 
       - name: Upload packaged tarball
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: release-${{ matrix.target }}
           path: memory-bank-${{ matrix.target }}.tar.gz
@@ -132,7 +132,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist-artifacts
           pattern: release-*
