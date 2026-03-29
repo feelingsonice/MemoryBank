@@ -6,6 +6,13 @@ It combines a local MCP server for recall, a lightweight hook binary for capture
 
 This repository is an implementation inspired by the original [A-MEM](https://arxiv.org/abs/2502.12110) paper, adapted for practical MCP-based agent workflows.
 
+Currently supports:
+
+- Claude Code
+- Gemini CLI
+- OpenCode
+- OpenClaw
+
 ## Why Memory Bank
 
 - Cross-agent continuity. A fact learned in Claude Code, Gemini CLI, OpenCode, or OpenClaw can be recalled later in another supported agent, and vice versa.
