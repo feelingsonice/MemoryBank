@@ -12,7 +12,11 @@ detect_target() {
   case "${os}" in
     Darwin)
       case "${arch}" in
-        x86_64) printf '%s\n' "x86_64-apple-darwin" ;;
+        x86_64)
+          echo "Intel macOS release binaries are not available yet because the current FastEmbed/ONNX Runtime dependency does not publish a supported x86_64-apple-darwin artifact." >&2
+          echo "For now, please build from source on Intel macOS." >&2
+          exit 1
+          ;;
         arm64|aarch64) printf '%s\n' "aarch64-apple-darwin" ;;
         *)
           echo "Unsupported macOS architecture: ${arch}" >&2

@@ -25,7 +25,7 @@ Currently supports:
 
 ## Quick Start
 
-The intended default install path is the repository's GitHub Releases page. The user-facing install flow is the `mb` CLI plus the bootstrap installer at [`./install.sh`](./install.sh). The installer tracks the latest published release and downloads the correct tarball for the current macOS or Linux architecture.
+The intended default install path is the repository's GitHub Releases page. The user-facing install flow is the `mb` CLI plus the bootstrap installer at [`./install.sh`](./install.sh). The installer tracks the latest published release and downloads the correct tarball for the current supported macOS or Linux architecture.
 
 1. Run the installer.
 
@@ -76,9 +76,8 @@ If everything is wired correctly, the agent should call `retrieve_memory` and an
 
 ## Release Assets
 
-Each GitHub Release publishes four platform-specific tarballs plus `SHA256SUMS`:
+Each GitHub Release currently publishes three platform-specific tarballs plus `SHA256SUMS`:
 
-- `memory-bank-x86_64-apple-darwin.tar.gz`
 - `memory-bank-aarch64-apple-darwin.tar.gz`
 - `memory-bank-x86_64-unknown-linux-gnu.tar.gz`
 - `memory-bank-aarch64-unknown-linux-gnu.tar.gz`
@@ -87,6 +86,8 @@ Each GitHub Release publishes four platform-specific tarballs plus `SHA256SUMS`:
 These tarballs extract directly into the `~/.memory_bank/` app-root layout expected by `mb` and `install.sh`.
 
 Linux note: the release pipeline currently ships native `gnu` builds for modern glibc-based Linux distributions.
+
+Intel macOS note: release binaries are temporarily unavailable on `x86_64-apple-darwin` because the current FastEmbed and ONNX Runtime dependency chain does not publish a compatible prebuilt package for that target. Intel macOS users can still build from source.
 
 ## Features
 
@@ -216,7 +217,7 @@ GitHub Actions manages CI and releases:
 
 - CI runs on every push and pull request and checks formatting, `cargo check`, and `cargo test`
 - Releases are built from semver tags like `v0.1.0`
-- The release workflow builds native tarballs for macOS and Linux on all supported architectures
+- The release workflow builds native tarballs for Apple Silicon macOS plus x86_64 and ARM64 Linux
 - Releases are created as drafts first, assets are uploaded, and the release is published only after every asset and checksum has been attached
 
 ## Configuration And Environment Variables

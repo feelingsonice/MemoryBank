@@ -1,5 +1,6 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, QueryBuilder, Sqlite, SqlitePool, Transaction};
+use std::ffi::c_char;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Once;
@@ -604,7 +605,7 @@ async fn insert_link<'e>(
 
 type SqliteVecInitFn = unsafe extern "C" fn(
     *mut libsqlite3_sys::sqlite3,
-    *mut *mut i8,
+    *mut *mut c_char,
     *const libsqlite3_sys::sqlite3_api_routines,
 ) -> i32;
 
