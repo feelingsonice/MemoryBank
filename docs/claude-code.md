@@ -8,7 +8,7 @@ For building the binaries, starting `memory-bank-server`, and the shared configu
 
 Claude Code uses Memory Bank in two separate ways:
 
-- Recall uses MCP. Claude Code connects to `http://127.0.0.1:8080/mcp` and can call `retrieve_memory`.
+- Recall uses MCP. Claude Code connects to `http://127.0.0.1:3737/mcp` and can call `retrieve_memory`.
 - Capture uses Claude hooks. Those hooks shell out to `memory-bank-hook`, which forwards normalized fragments to `POST /ingest`.
 
 ## Hooks Used
@@ -29,7 +29,7 @@ Use the main [README Quick Start](../README.md#quick-start) or [Build From Sourc
 2. Register the MCP server in Claude Code.
 
 ```bash
-claude mcp add --transport http --scope local memory-bank http://127.0.0.1:8080/mcp
+claude mcp add --transport http --scope local memory-bank http://127.0.0.1:3737/mcp
 ```
 
 3. Add the Memory Bank hooks to `.claude/settings.local.json`.
@@ -44,7 +44,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
         "hooks": [
           {
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event UserPromptSubmit --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event UserPromptSubmit --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -54,7 +54,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
         "hooks": [
           {
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event PreToolUse --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event PreToolUse --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -64,7 +64,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
         "hooks": [
           {
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event PostToolUse --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event PostToolUse --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -74,7 +74,7 @@ Replace `/absolute/path/to/memory-bank-hook` with the absolute path to your `mem
         "hooks": [
           {
             "type": "command",
-            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event Stop --server-url http://127.0.0.1:8080"
+            "command": "/absolute/path/to/memory-bank-hook --agent claude-code --event Stop --server-url http://127.0.0.1:3737"
           }
         ]
       }
@@ -94,7 +94,7 @@ If you want the same Memory Bank setup in every Claude Code session on this mach
 - register MCP at user scope:
 
 ```bash
-claude mcp add --transport http --scope user memory-bank http://127.0.0.1:8080/mcp
+claude mcp add --transport http --scope user memory-bank http://127.0.0.1:3737/mcp
 ```
 
 - put the same `hooks` object in `~/.claude/settings.json`

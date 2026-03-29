@@ -274,6 +274,17 @@ pub struct InitializedLlm {
     pub model_id: String,
 }
 
+impl InitializedLlm {
+    pub fn provider_name(&self) -> &'static str {
+        match &self.client {
+            LlmClient::Gemini(_) => "gemini",
+            LlmClient::Anthropic(_) => "anthropic",
+            LlmClient::OpenAi(_) => "open-ai",
+            LlmClient::Ollama(_) => "ollama",
+        }
+    }
+}
+
 pub fn initialize(config: LlmProviderConfig) -> Result<InitializedLlm, AppError> {
     let model_id = config.to_string();
     let client = llm_client_from_config(config)?;

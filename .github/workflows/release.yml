@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: Package release tarball
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -eu
+          STAGE_DIR="dist/memory-bank"
+          BIN_DIR="${STAGE_DIR}/bin"
+          OPENCODE_DIR="${STAGE_DIR}/integrations/opencode"
+          OPENCLAW_DIR="${STAGE_DIR}/integrations/openclaw"
+
+          rm -rf dist
+          mkdir -p "${BIN_DIR}" "${OPENCODE_DIR}" "${OPENCLAW_DIR}"
+
+          cp "target/${TARGET}/release/mb" "${BIN_DIR}/mb"
+          cp "target/${TARGET}/release/memory-bank-server" "${BIN_DIR}/memory-bank-server"
+          cp "target/${TARGET}/release/memory-bank-hook" "${BIN_DIR}/memory-bank-hook"
+          cp "target/${TARGET}/release/memory-bank-mcp-proxy" "${BIN_DIR}/memory-bank-mcp-proxy"
+
+          chmod +x "${BIN_DIR}/mb" \
+            "${BIN_DIR}/memory-bank-server" \
+            "${BIN_DIR}/memory-bank-hook" \
+            "${BIN_DIR}/memory-bank-mcp-proxy"
+
+          cp ".opencode/plugins/memory-bank.js" "${OPENCODE_DIR}/memory-bank.js"
+          cp -R ".openclaw/extensions/memory-bank" "${OPENCLAW_DIR}/memory-bank"
+
+          tar -C "${STAGE_DIR}" -czf "memory-bank-${TARGET}.tar.gz" .
+
+      - name: Upload packaged tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: memory-bank-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    runs-on: ubuntu-24.04
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -eu
+          cd dist-artifacts
+          sha256sum memory-bank-*.tar.gz > SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release create "${TAG}" \
+            --draft \
+            --title "${TAG}" \
+            --generate-notes
+
+      - name: Upload release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release upload "${TAG}" dist-artifacts/memory-bank-*.tar.gz dist-artifacts/SHA256SUMS --clobber
+
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release edit "${TAG}" --draft=false

@@ -3,12 +3,8 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Memory Bank stdio MCP proxy")]
 pub struct ProxyArgs {
-    #[arg(
-        long,
-        env = "MEMORY_BANK_SERVER_URL",
-        default_value = "http://127.0.0.1:8080"
-    )]
-    pub server_url: String,
+    #[arg(long, env = "MEMORY_BANK_SERVER_URL")]
+    pub server_url: Option<String>,
 }
 
 impl ProxyArgs {
@@ -25,7 +21,7 @@ mod tests {
     #[test]
     fn parse_defaults_server_url() {
         let args = ProxyArgs::try_parse_from(["memory-bank-mcp-proxy"]).expect("parse");
-        assert_eq!(args.server_url, "http://127.0.0.1:8080");
+        assert_eq!(args.server_url, None);
     }
 
     #[test]
@@ -36,6 +32,6 @@ mod tests {
             "http://127.0.0.1:9090/",
         ])
         .expect("parse");
-        assert_eq!(args.server_url, "http://127.0.0.1:9090/");
+        assert_eq!(args.server_url.as_deref(), Some("http://127.0.0.1:9090/"));
     }
 }

@@ -12,7 +12,7 @@ mod memory_window;
 
 use crate::actor::MemoryActor;
 use crate::config::ServeConfig;
-use crate::http_server::HttpServer;
+use crate::http_server::{HealthResponse, HttpServer};
 use crate::ingest::IngestService;
 use tracing::info;
 
@@ -63,6 +63,9 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
     let db =
         db::MemoryDb::open(&dirs.db, &llm.model_id, &encoder.model_id, &encoder.client).await?;
 
+    let llm_provider_name = llm.provider_name().to_string();
+    let encoder_provider_name = encoder.provider_name().to_string();
+
     info!("Starting background memory actor");
     let (memory_handle, _memory_task) =
         MemoryActor::spawn(db, llm.client, encoder.client, nearest_neighbor_count);
@@ -70,6 +73,16 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
     info!(db_path = %dirs.db.display(), "Opening durable ingest service");
     let ingest = IngestService::open(&dirs.db, memory_handle.clone(), history_window_size).await?;
 
-    let server = HttpServer::bind(port, memory_handle, ingest, logging_state.sender()).await?;
+    let health = HealthResponse {
+        ok: true,
+        namespace: namespace.to_string(),
+        port,
+        llm_provider: llm_provider_name,
+        encoder_provider: encoder_provider_name,
+        version: env!("CARGO_PKG_VERSION"),
+    };
+
+    let server =
+        HttpServer::bind(port, health, memory_handle, ingest, logging_state.sender()).await?;
     server.run().await
 }

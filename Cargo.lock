@@ -868,6 +868,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "dialoguer"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "658bce805d770f407bc62102fca7c2c64ceef2fbcb2b8bd19d2765ce093980de"
+dependencies = [
+ "console",
+ "shell-words",
+ "tempfile",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2079,11 +2092,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memory-bank-app"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "memory-bank-cli"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "dialoguer",
+ "memory-bank-app",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "ureq 2.12.1",
+]
+
+[[package]]
 name = "memory-bank-hook"
 version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "memory-bank-app",
  "memory-bank-protocol",
  "serde",
  "serde_json",
@@ -2101,6 +2141,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "memory-bank-app",
  "memory-bank-protocol",
  "rmcp",
  "serde_json",
@@ -2135,6 +2176,7 @@ dependencies = [
  "fastembed",
  "hf-hub",
  "libsqlite3-sys",
+ "memory-bank-app",
  "memory-bank-protocol",
  "rig-core",
  "rmcp",
@@ -2143,6 +2185,7 @@ dependencies = [
  "serde_json",
  "sqlite-vec",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-retry",
@@ -3580,6 +3623,12 @@ checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
 ]
+
+[[package]]
+name = "shell-words"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc6fe69c597f9c37bfeeeeeb33da3530379845f10be461a66d16d03eca2ded77"
 
 [[package]]
 name = "shlex"

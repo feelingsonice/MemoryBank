@@ -13,7 +13,7 @@ For building the binaries, starting `memory-bank-server`, and the shared configu
 
 OpenClaw uses Memory Bank in two separate ways:
 
-- Recall uses the stdio `memory-bank-mcp-proxy`, which forwards `retrieve_memory` calls to `http://127.0.0.1:8080/mcp`.
+- Recall uses the stdio `memory-bank-mcp-proxy`, which forwards `retrieve_memory` calls to `http://127.0.0.1:3737/mcp`.
 - Capture uses the repo-owned OpenClaw extension. The extension listens to OpenClaw lifecycle hooks, shells out to `memory-bank-hook`, and forwards normalized fragments to `POST /ingest`.
 - The extension also injects a short system reminder telling OpenClaw to prefer `retrieve_memory` for durable memory and provenance questions such as "how do you know?".
 
@@ -46,15 +46,15 @@ Use the main [README Quick Start](../README.md#quick-start) or [Build From Sourc
 2. Register the Memory Bank MCP proxy with OpenClaw.
 
 ```bash
-openclaw mcp set memory-bank '{"command":"/absolute/path/to/memory-bank-mcp-proxy","args":["--server-url","http://127.0.0.1:8080"]}'
+openclaw mcp set memory-bank '{"command":"/absolute/path/to/memory-bank-mcp-proxy","args":["--server-url","http://127.0.0.1:3737"]}'
 ```
 
 This stores a stdio MCP server definition under OpenClaw's MCP registry. The proxy also advertises Memory Bank as the preferred long-term memory source for prior-session recall inside OpenClaw.
 
 `memory-bank-mcp-proxy --server-url` accepts either:
 
-- the base server URL, such as `http://127.0.0.1:8080`
-- or the explicit MCP URL, such as `http://127.0.0.1:8080/mcp`
+- the base server URL, such as `http://127.0.0.1:3737`
+- or the explicit MCP URL, such as `http://127.0.0.1:3737/mcp`
 
 This guide uses the base server URL form because the proxy appends `/mcp` automatically when needed.
 
@@ -84,7 +84,7 @@ Update `~/.openclaw/openclaw.json` to include:
     "servers": {
       "memory-bank": {
         "command": "/absolute/path/to/memory-bank-mcp-proxy",
-        "args": ["--server-url", "http://127.0.0.1:8080"]
+        "args": ["--server-url", "http://127.0.0.1:3737"]
       }
     }
   },
@@ -94,7 +94,7 @@ Update `~/.openclaw/openclaw.json` to include:
         "enabled": true,
         "config": {
           "hookBinary": "/absolute/path/to/memory-bank-hook",
-          "serverUrl": "http://127.0.0.1:8080"
+          "serverUrl": "http://127.0.0.1:3737"
         }
       }
     },
