@@ -10,7 +10,7 @@ pub struct Namespace(String);
 
 impl Namespace {
     const DEFAULT: &str = "default";
-    const APP_DIR: &str = "memory-bank";
+    const APP_DIR: &str = ".memory_bank";
 
     fn sanitize(raw: &str) -> String {
         let sanitized: String = raw
@@ -60,9 +60,9 @@ pub struct Dirs {
 }
 
 impl Dirs {
-    /// Returns the top-level app directory: `{data_dir}/memory-bank/`.
+    /// Returns the top-level app directory: `{home_dir}/.memory_bank/`.
     fn app_dir() -> PathBuf {
-        let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+        let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         base.join(Namespace::APP_DIR)
     }
 

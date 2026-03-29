@@ -325,12 +325,18 @@ The exact setup steps and examples for those files live in [`/docs`](./docs).
 
 ## Storage Layout
 
-Memory Bank stores data under your per-user application data directory in a top-level `memory-bank` folder.
+Memory Bank stores data under your home directory in a top-level `.memory_bank` folder.
 
-- App root: `{data_dir}/memory-bank/`
-- Namespaces: `{data_dir}/memory-bank/namespaces/<namespace>/`
-- Database: `{data_dir}/memory-bank/namespaces/<namespace>/memory.db`
-- Model cache: `{data_dir}/memory-bank/models/`
+- App root: `{home_dir}/.memory_bank/`
+- Namespaces: `{home_dir}/.memory_bank/namespaces/<namespace>/`
+- Database: `{home_dir}/.memory_bank/namespaces/<namespace>/memory.db`
+- Model cache: `{home_dir}/.memory_bank/models/`
+
+Examples:
+
+- macOS: `~/.memory_bank/`
+- Linux: `~/.memory_bank/`
+- Windows: `%USERPROFILE%/.memory_bank/`
 
 This means you can isolate experiments, teams, or projects by running separate namespaces.
 
