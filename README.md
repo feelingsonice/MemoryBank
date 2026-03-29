@@ -215,8 +215,9 @@ Then follow the guide for your agent in [`/docs`](./docs) to wire MCP plus hook-
 
 GitHub Actions manages CI and releases:
 
-- CI runs on every push and pull request and checks formatting, `cargo check`, and `cargo test`
+- CI runs on pull requests targeting `main` and checks formatting, `cargo check`, and `cargo test`
 - Releases are built from semver tags like `v0.1.0`
+- The release workflow re-runs formatting, `cargo check`, and `cargo test` before any release build or publish step
 - The release workflow builds native tarballs for Apple Silicon macOS plus x86_64 and ARM64 Linux
 - Releases are created as drafts first, assets are uploaded, and the release is published only after every asset and checksum has been attached
 

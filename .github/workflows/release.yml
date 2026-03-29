@@ -33,9 +33,33 @@ jobs:
             exit 1
           fi
 
+  validate:
+    name: Validate release commit
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check
+        run: cargo check --workspace
+
+      - name: Cargo test
+        run: cargo test --workspace
+
   build:
     name: Build ${{ matrix.target }}
-    needs: verify-main
+    needs:
+      - verify-main
+      - validate
     strategy:
       fail-fast: false
       matrix:
