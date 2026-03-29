@@ -1,0 +1,75 @@
+mod actor;
+pub mod config;
+mod db;
+mod encoder;
+pub mod error;
+mod http_server;
+mod ingest;
+mod llm;
+mod logging;
+mod mcp_server;
+mod memory_window;
+
+use crate::actor::MemoryActor;
+use crate::config::ServeConfig;
+use crate::http_server::HttpServer;
+use crate::ingest::IngestService;
+use tracing::info;
+
+pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
+    let ServeConfig {
+        port,
+        namespace,
+        llm,
+        encoder,
+        history_window_size,
+        nearest_neighbor_count,
+        dirs,
+    } = config;
+
+    let logging_state = logging::Logging::initialize()?;
+
+    info!(
+        port,
+        namespace = %namespace,
+        llm_provider = %llm,
+        encoder_provider = %encoder,
+        history_window_size,
+        nearest_neighbor_count,
+        data_dir = %dirs.data.display(),
+        db_path = %dirs.db.display(),
+        models_dir = %dirs.models.display(),
+        "Starting Memory Bank server",
+    );
+
+    info!(
+        encoder_provider = %encoder,
+        models_dir = %dirs.models.display(),
+        "Initializing encoder provider",
+    );
+    let encoder = encoder::initialize(encoder, &dirs.models)?;
+    info!(encoder_model = %encoder.model_id, "Encoder provider ready");
+
+    info!(llm_provider = %llm, "Initializing LLM provider");
+    let llm = llm::initialize(llm)?;
+    info!(llm_model = %llm.model_id, "LLM provider ready");
+
+    info!(
+        db_path = %dirs.db.display(),
+        llm_model = %llm.model_id,
+        encoder_model = %encoder.model_id,
+        "Opening memory database",
+    );
+    let db =
+        db::MemoryDb::open(&dirs.db, &llm.model_id, &encoder.model_id, &encoder.client).await?;
+
+    info!("Starting background memory actor");
+    let (memory_handle, _memory_task) =
+        MemoryActor::spawn(db, llm.client, encoder.client, nearest_neighbor_count);
+
+    info!(db_path = %dirs.db.display(), "Opening durable ingest service");
+    let ingest = IngestService::open(&dirs.db, memory_handle.clone(), history_window_size).await?;
+
+    let server = HttpServer::bind(port, memory_handle, ingest, logging_state.sender()).await?;
+    server.run().await
+}

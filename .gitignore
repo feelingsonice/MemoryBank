@@ -1,0 +1,11 @@
+/target
+.DS_Store
+.memory_bank/
+GEMINI.md
+CLAUDE.md
+.claude
+plan.md
+.gemini
+**/*.log
+opencode.json
+a-mem.pdf

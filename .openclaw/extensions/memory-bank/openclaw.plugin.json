@@ -1,0 +1,23 @@
+{
+  "id": "memory-bank",
+  "name": "Memory Bank",
+  "description": "Captures OpenClaw conversations into Memory Bank through memory-bank-hook.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "serverUrl": {
+        "type": "string"
+      },
+      "hookBinary": {
+        "type": "string"
+      },
+      "debug": {
+        "type": "boolean"
+      },
+      "debugFile": {
+        "type": "string"
+      }
+    }
+  }
+}
