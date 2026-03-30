@@ -1,8 +1,7 @@
-# Memory Bank
-
-<p align="center">
-  <img src="./docs/logo.svg" alt="Memory Bank logo" width="160" />
-</p>
+<h1>
+  <img src="./docs/logo.svg" alt="Memory Bank logo" width="42" align="absmiddle" />
+  Memory Bank
+</h1>
 
 Memory Bank gives coding agents shared, long-term memory across sessions and across tools.
 
