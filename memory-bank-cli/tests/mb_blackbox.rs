@@ -194,6 +194,181 @@ fn stderr_string(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+fn assert_contains_all(haystack: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(
+            haystack.contains(needle),
+            "expected help output to contain `{needle}`\n\n{haystack}"
+        );
+    }
+}
+
+#[test]
+fn mb_top_level_help_describes_commands_and_quick_start() {
+    let harness = MbHarness::new();
+
+    let output = harness.run(&["--help"]);
+    assert!(output.status.success(), "{}", stderr_string(&output));
+
+    let help = stdout_string(&output);
+    assert_contains_all(
+        &help,
+        &[
+            "Run guided setup for provider, service, and agent integrations",
+            "Check current Memory Bank health and configuration",
+            "Diagnose common install and configuration problems",
+            "Read the managed service log",
+            "Manage memory namespaces",
+            "Manage the user-scoped background service",
+            "Inspect and edit saved configuration",
+            "Quick start:",
+            "mb setup",
+            "mb doctor --fix",
+            "mb config show",
+        ],
+    );
+}
+
+#[test]
+fn mb_help_for_status_doctor_and_logs_explains_behavior_and_flags() {
+    let harness = MbHarness::new();
+
+    let status = harness.run(&["status", "--help"]);
+    assert!(status.status.success(), "{}", stderr_string(&status));
+    assert_contains_all(
+        &stdout_string(&status),
+        &[
+            "Show the current Memory Bank status.",
+            "reports the active namespace",
+            "mb doctor",
+            "mb logs",
+        ],
+    );
+
+    let doctor = harness.run(&["doctor", "--help"]);
+    assert!(doctor.status.success(), "{}", stderr_string(&doctor));
+    assert_contains_all(
+        &stdout_string(&doctor),
+        &[
+            "Diagnose common install and configuration problems.",
+            "Doctor checks CLI exposure",
+            "Attempt safe repairs such as exposing `mb`",
+            "mb doctor --fix",
+        ],
+    );
+
+    let logs = harness.run(&["logs", "--help"]);
+    assert!(logs.status.success(), "{}", stderr_string(&logs));
+    assert_contains_all(
+        &stdout_string(&logs),
+        &[
+            "Read the managed service log at `~/.memory_bank/logs/server.log`.",
+            "Keep streaming `~/.memory_bank/logs/server.log` as new lines arrive",
+            "mb logs --follow",
+        ],
+    );
+}
+
+#[test]
+fn mb_help_for_namespace_service_and_config_includes_examples_and_guidance() {
+    let harness = MbHarness::new();
+
+    let namespace = harness.run(&["namespace", "--help"]);
+    assert!(namespace.status.success(), "{}", stderr_string(&namespace));
+    assert_contains_all(
+        &stdout_string(&namespace),
+        &[
+            "Manage Memory Bank namespaces.",
+            "List known namespaces and mark the active one",
+            "Switch the active namespace",
+            "Namespace names are sanitized",
+            "mb namespace use work-project",
+        ],
+    );
+
+    let service = harness.run(&["service", "--help"]);
+    assert!(service.status.success(), "{}", stderr_string(&service));
+    assert_contains_all(
+        &stdout_string(&service),
+        &[
+            "Manage the user-scoped Memory Bank background service.",
+            "launchd on macOS and systemd --user on Linux",
+            "Install the managed service definition",
+            "Read the managed service log",
+            "mb service logs --follow",
+            "`mb service start` installs the service definition first if it is missing.",
+        ],
+    );
+
+    let config = harness.run(&["config", "--help"]);
+    assert!(config.status.success(), "{}", stderr_string(&config));
+    assert_contains_all(
+        &stdout_string(&config),
+        &[
+            "Inspect and edit saved Memory Bank settings.",
+            "Configuration is stored in `~/.memory_bank/settings.toml`.",
+            "service.port",
+            "server.llm_provider",
+            "integrations.openclaw.configured",
+            "Default namespace: default",
+            "server.llm_provider: anthropic | gemini | open-ai | ollama",
+            "mb config set server.llm_provider gemini",
+        ],
+    );
+}
+
+#[test]
+fn mb_nested_help_describes_arguments_and_non_obvious_behavior() {
+    let harness = MbHarness::new();
+
+    let namespace_use = harness.run(&["namespace", "use", "--help"]);
+    assert!(
+        namespace_use.status.success(),
+        "{}",
+        stderr_string(&namespace_use)
+    );
+    assert_contains_all(
+        &stdout_string(&namespace_use),
+        &[
+            "Switch the active namespace.",
+            "restarts it when already running or starts it when stopped",
+            "Namespace name to activate",
+        ],
+    );
+
+    let service_install = harness.run(&["service", "install", "--help"]);
+    assert!(
+        service_install.status.success(),
+        "{}",
+        stderr_string(&service_install)
+    );
+    assert_contains_all(
+        &stdout_string(&service_install),
+        &[
+            "Install the user-scoped Memory Bank service definition for the current platform.",
+            "launchd agent on macOS or a systemd --user unit on Linux",
+        ],
+    );
+
+    let config_set = harness.run(&["config", "set", "--help"]);
+    assert!(
+        config_set.status.success(),
+        "{}",
+        stderr_string(&config_set)
+    );
+    assert_contains_all(
+        &stdout_string(&config_set),
+        &[
+            "Update a single saved config value in `~/.memory_bank/settings.toml`.",
+            "Config key to update. Run `mb config --help` to see supported keys",
+            "New value for the selected key",
+            "server.encoder_provider: fast-embed | local-api | remote-api",
+            "mb config set server.llm_model \"\"",
+            "Use an empty string to clear optional string overrides",
+        ],
+    );
+}
+
 #[test]
 fn mb_config_round_trips_values_through_the_binary() {
     let harness = MbHarness::new();
