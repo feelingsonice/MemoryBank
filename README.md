@@ -74,19 +74,6 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 | OpenCode | HTTP MCP | OpenCode plugin -> `memory-bank-hook` | [OpenCode](./docs/opencode.md) |
 | OpenClaw | stdio MCP proxy -> HTTP MCP | OpenClaw extension -> `memory-bank-hook` | [OpenClaw](./docs/openclaw.md) |
 
-## Useful Commands
-
-```bash
-mb setup
-mb status
-mb doctor
-mb doctor --fix
-mb logs -f
-mb namespace list
-mb namespace use <name>
-mb config show
-```
-
 ## More Docs
 
 - [Troubleshooting](./docs/troubleshooting.md)
