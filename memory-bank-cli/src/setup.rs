@@ -16,7 +16,7 @@ use crate::models::{
 use crate::service::{HealthCheck, install_service, start_service, wait_for_health};
 use inquire::ui::{Color, RenderConfig, StyleSheet, Styled};
 use inquire::validator::Validation;
-use inquire::{Confirm, CustomType, MultiSelect, Password, Select, Text, set_global_render_config};
+use inquire::{Confirm, CustomType, MultiSelect, Select, Text, set_global_render_config};
 use memory_bank_app::{
     AppPaths, AppSettings, DEFAULT_FASTEMBED_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_PORT,
     IntegrationState, IntegrationsSettings, Namespace, SETTINGS_SCHEMA_VERSION, SecretStore,
@@ -57,9 +57,16 @@ struct AdvancedAnswers {
 enum SecretChoice {
     NotRequired,
     KeepStored { key: &'static str },
-    ImportEnvironment { key: &'static str, value: String },
-    ReplaceWithEnvironment { key: &'static str, value: String },
+    UseEnvironment { key: &'static str, value: String },
     ManualEntry { key: &'static str, value: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecretPromptPlan {
+    NotRequired,
+    OfferEnvironment { key: &'static str, value: String },
+    OfferStored { key: &'static str },
+    ManualEntry { key: &'static str },
 }
 
 impl ProviderChoice {
@@ -146,15 +153,12 @@ impl AdvancedAnswers {
 impl SecretChoice {
     fn summary(&self) -> String {
         match self {
-            Self::NotRequired => "Not required for Ollama".to_string(),
+            Self::NotRequired => "No provider secret required for Ollama".to_string(),
             Self::KeepStored { key } => {
-                format!("Keep the existing {key} from ~/.memory_bank/secrets.env")
+                format!("Use the existing {key} from ~/.memory_bank/secrets.env")
             }
-            Self::ImportEnvironment { key, .. } => {
-                format!("Import {key} from the current shell")
-            }
-            Self::ReplaceWithEnvironment { key, .. } => {
-                format!("Replace the stored {key} with the current shell value")
+            Self::UseEnvironment { key, .. } => {
+                format!("Use the current shell {key} and store it in ~/.memory_bank/secrets.env")
             }
             Self::ManualEntry { key, .. } => {
                 format!("Store a newly entered {key} in ~/.memory_bank/secrets.env")
@@ -258,11 +262,13 @@ fn collect_setup_answers(
 ) -> Result<Option<SetupAnswers>, AppError> {
     print_setup_intro();
 
-    println!("Core setup");
+    print_setup_section("Basic");
     let namespace = match prompt_namespace(settings.active_namespace())? {
         Some(namespace) => namespace,
         None => return Ok(None),
     };
+
+    print_setup_section("LLM configuration");
     let provider = match prompt_provider(
         settings
             .server
@@ -297,6 +303,12 @@ fn collect_setup_answers(
         };
         (None, model)
     };
+    let secret_choice = match collect_secret_choice(&provider, secrets)? {
+        Some(secret_choice) => secret_choice,
+        None => return Ok(None),
+    };
+
+    print_setup_section("Preferences");
     let autostart = match prompt_autostart(
         settings
             .service
@@ -312,17 +324,6 @@ fn collect_setup_answers(
     println!("Choose one or more agents to configure in this setup run.");
     let selected_agents = match prompt_agents(detected_agents)? {
         Some(selected_agents) => selected_agents,
-        None => return Ok(None),
-    };
-    println!(
-        "Selected agents: {}",
-        render_agents_summary(&selected_agents)
-    );
-
-    println!();
-    println!("Secrets");
-    let secret_choice = match collect_secret_choice(&provider, secrets)? {
-        Some(secret_choice) => secret_choice,
         None => return Ok(None),
     };
 
@@ -364,7 +365,11 @@ fn print_setup_intro() {
     println!("Memory Bank Setup");
     println!("Configure the local Memory Bank service and any detected agent integrations.");
     println!("You will review everything before any changes are applied.");
+}
+
+fn print_setup_section(title: &str) {
     println!();
+    println!("{title}");
 }
 
 fn apply_setup_answers(
@@ -460,7 +465,7 @@ fn prompt_provider(current: Option<&str>) -> Result<Option<String>, AppError> {
         .iter()
         .position(|choice| *choice == ProviderChoice::from_config_value(current))
         .unwrap_or(0);
-    let choice = Select::new("LLM provider", options)
+    let choice = Select::new("LLM provider:", options)
         .with_starting_cursor(default_index)
         .with_page_size(4)
         .with_help_message(
@@ -507,7 +512,7 @@ fn prompt_model(
         })
         .unwrap_or(0);
     let prompt = format!(
-        "Model for {}",
+        "Model for {}:",
         ProviderChoice::from_config_value(Some(provider))
     );
     let selection = Select::new(&prompt, choices)
@@ -562,7 +567,7 @@ fn prompt_ollama_model(
                         .position(|choice| choice.value() == Some(value))
                 })
                 .unwrap_or(0);
-            let selection = Select::new("Model for Ollama (installed locally)", choices)
+            let selection = Select::new("Model for Ollama (installed locally):", choices)
                 .with_starting_cursor(default_index)
                 .with_page_size(10)
                 .with_help_message(
@@ -603,7 +608,7 @@ fn prompt_custom_ollama_model(
     } else {
         "Enter the local Ollama model name you want Memory Bank to use. Common pulls: qwen3, deepseek-r1, llama3.1, qwen2.5-coder."
     };
-    Text::new("Ollama model name")
+    Text::new("Ollama model name:")
         .with_default(current.unwrap_or(default_model_for_provider("ollama")))
         .with_help_message(help)
         .with_validator(|value: &str| {
@@ -648,61 +653,73 @@ fn collect_secret_choice(
     provider: &str,
     secrets: &SecretStore,
 ) -> Result<Option<SecretChoice>, AppError> {
-    let Some(secret_key) = env_key_for_provider(provider) else {
-        return Ok(Some(SecretChoice::NotRequired));
-    };
+    let plan = secret_prompt_plan(
+        provider,
+        env_key_for_provider(provider).and_then(|key| std::env::var(key).ok()),
+        env_key_for_provider(provider).and_then(|key| secrets.get(key).map(str::to_owned)),
+    );
 
-    let env_value = std::env::var(secret_key).ok();
-    let stored_value = secrets.get(secret_key).map(str::to_owned);
-
-    let choice = match (stored_value.as_deref(), env_value.as_deref()) {
-        (Some(stored_value), Some(env_value)) if stored_value != env_value => {
-            let replace = Confirm::new(&format!(
-                "Replace the stored {secret_key} with the value from your current shell?"
-            ))
-            .with_default(false)
-            .with_help_message(
-                "The managed service always reads ~/.memory_bank/secrets.env, not your shell session.",
-            )
-            .prompt_skippable()?;
-            match replace {
-                Some(true) => SecretChoice::ReplaceWithEnvironment {
-                    key: secret_key,
-                    value: env_value.to_string(),
-                },
-                Some(false) => SecretChoice::KeepStored { key: secret_key },
-                None => return Ok(None),
-            }
-        }
-        (Some(_), _) => SecretChoice::KeepStored { key: secret_key },
-        (None, Some(env_value)) => {
-            let import = Confirm::new(&format!(
-                "Import {secret_key} from your current shell into Memory Bank?"
+    let choice = match plan {
+        SecretPromptPlan::NotRequired => SecretChoice::NotRequired,
+        SecretPromptPlan::OfferEnvironment { key, value } => {
+            let use_env = Confirm::new(&format!(
+                "Store and use the current shell {key} for Memory Bank?"
             ))
             .with_default(true)
             .with_help_message(
-                "This copies the key into ~/.memory_bank/secrets.env so the managed service can use it later.",
+                "This writes the key to ~/.memory_bank/secrets.env so the managed service uses the same provider secret every time it starts.",
             )
             .prompt_skippable()?;
-            match import {
-                Some(true) => SecretChoice::ImportEnvironment {
-                    key: secret_key,
-                    value: env_value.to_string(),
-                },
-                Some(false) => manual_secret_choice(secret_key)?,
+            match use_env {
+                Some(true) => SecretChoice::UseEnvironment { key, value },
+                Some(false) => manual_secret_choice(key)?,
                 None => return Ok(None),
             }
         }
-        (None, None) => manual_secret_choice(secret_key)?,
+        SecretPromptPlan::OfferStored { key } => {
+            let keep = Confirm::new(&format!(
+                "Keep using the stored {key} from ~/.memory_bank/secrets.env?"
+            ))
+            .with_default(true)
+            .with_help_message(
+                "Answer no if you want to replace it with a different key during this setup run.",
+            )
+            .prompt_skippable()?;
+            match keep {
+                Some(true) => SecretChoice::KeepStored { key },
+                Some(false) => manual_secret_choice(key)?,
+                None => return Ok(None),
+            }
+        }
+        SecretPromptPlan::ManualEntry { key } => manual_secret_choice(key)?,
     };
 
     Ok(Some(choice))
 }
 
+fn secret_prompt_plan(
+    provider: &str,
+    env_value: Option<String>,
+    stored_value: Option<String>,
+) -> SecretPromptPlan {
+    let Some(secret_key) = env_key_for_provider(provider) else {
+        return SecretPromptPlan::NotRequired;
+    };
+
+    match (env_value, stored_value) {
+        (Some(value), _) => SecretPromptPlan::OfferEnvironment {
+            key: secret_key,
+            value,
+        },
+        (None, Some(_)) => SecretPromptPlan::OfferStored { key: secret_key },
+        (None, None) => SecretPromptPlan::ManualEntry { key: secret_key },
+    }
+}
+
 fn manual_secret_choice(secret_key: &'static str) -> Result<SecretChoice, AppError> {
-    let entered = Password::new(&format!("Enter {secret_key}"))
+    let entered = Text::new(&format!("Enter {secret_key}:"))
         .with_help_message(
-            "This will be stored in ~/.memory_bank/secrets.env for the managed service.",
+            "This will be stored in ~/.memory_bank/secrets.env for the managed service. Input is shown as you type.",
         )
         .with_validator(|value: &str| {
             Ok(if value.trim().is_empty() {
@@ -711,12 +728,11 @@ fn manual_secret_choice(secret_key: &'static str) -> Result<SecretChoice, AppErr
                 Validation::Valid
             })
         })
-        .without_confirmation()
         .prompt_skippable()?;
     match entered {
         Some(value) if !value.trim().is_empty() => Ok(SecretChoice::ManualEntry {
             key: secret_key,
-            value,
+            value: value.trim().to_string(),
         }),
         Some(_) => Err(AppError::MissingProviderSecret(secret_key)),
         None => Err(AppError::SetupCanceled),
@@ -909,9 +925,7 @@ fn current_integration_status(current: Option<&IntegrationsSettings>, agent: Age
 fn apply_secret_choice(secrets: &mut SecretStore, choice: &SecretChoice) {
     match choice {
         SecretChoice::NotRequired | SecretChoice::KeepStored { .. } => {}
-        SecretChoice::ImportEnvironment { key, value }
-        | SecretChoice::ReplaceWithEnvironment { key, value }
-        | SecretChoice::ManualEntry { key, value } => {
+        SecretChoice::UseEnvironment { key, value } | SecretChoice::ManualEntry { key, value } => {
             secrets.set(*key, value.clone());
         }
     }
@@ -1005,6 +1019,54 @@ mod tests {
         assert!(summary.contains("Store a newly entered ANTHROPIC_API_KEY"));
         assert!(!summary.contains("super-secret"));
         assert!(!summary.contains("Advanced overrides"));
+    }
+
+    #[test]
+    fn secret_prompt_plan_prefers_shell_key_over_stored_secret() {
+        let plan = secret_prompt_plan(
+            "anthropic",
+            Some("from-shell".to_string()),
+            Some("stored".to_string()),
+        );
+
+        assert_eq!(
+            plan,
+            SecretPromptPlan::OfferEnvironment {
+                key: "ANTHROPIC_API_KEY",
+                value: "from-shell".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn secret_prompt_plan_uses_stored_secret_when_shell_key_is_missing() {
+        let plan = secret_prompt_plan("gemini", None, Some("stored".to_string()));
+
+        assert_eq!(
+            plan,
+            SecretPromptPlan::OfferStored {
+                key: "GEMINI_API_KEY"
+            }
+        );
+    }
+
+    #[test]
+    fn secret_prompt_plan_requires_manual_entry_when_no_secret_exists() {
+        let plan = secret_prompt_plan("open-ai", None, None);
+
+        assert_eq!(
+            plan,
+            SecretPromptPlan::ManualEntry {
+                key: "OPENAI_API_KEY"
+            }
+        );
+    }
+
+    #[test]
+    fn secret_prompt_plan_skips_secret_flow_for_ollama() {
+        let plan = secret_prompt_plan("ollama", Some("ignored".to_string()), None);
+
+        assert_eq!(plan, SecretPromptPlan::NotRequired);
     }
 
     #[test]
@@ -1191,7 +1253,7 @@ mod tests {
 
         apply_secret_choice(
             &mut secrets,
-            &SecretChoice::ReplaceWithEnvironment {
+            &SecretChoice::UseEnvironment {
                 key: "ANTHROPIC_API_KEY",
                 value: "updated".to_string(),
             },
