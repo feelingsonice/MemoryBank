@@ -22,10 +22,10 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --all -- --check
+        run: make fmt-check
 
       - name: Cargo check
-        run: cargo check --workspace
+        run: make check
 
-      - name: Cargo test
-        run: cargo test --workspace
+      - name: Validate test suite
+        run: make test-ci

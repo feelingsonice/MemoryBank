@@ -212,8 +212,26 @@ Useful verification commands:
 ./target/release/memory-bank-server --help
 ./target/release/memory-bank-hook --help
 ./target/release/memory-bank-mcp-proxy --help
-cargo test --workspace
+make test
 ```
+
+Useful Make targets:
+
+```bash
+make help
+make build
+make build-release
+make test
+make test-ci
+make test-cli-blackbox
+make test-cli-real
+```
+
+Notes:
+
+- `make test` is the default local suite and includes the `mb` black-box CLI tests.
+- `make test-ci` matches the CI and release validation suite and intentionally skips the heavier `mb` black-box integration test target.
+- `make test-cli-real` opt-ins to the installed-tool integration checks for Claude Code, Gemini CLI, OpenCode, and OpenClaw by setting `MEMORY_BANK_REAL_BIN_TESTS=1`.
 
 ### What To Run After Building
 
@@ -230,11 +248,16 @@ Then follow the guide for your agent in [`/docs`](./docs) to wire MCP plus hook-
 
 GitHub Actions manages CI and releases:
 
-- CI runs on pull requests targeting `main` and checks formatting, `cargo check`, and `cargo test`
+- CI runs on pull requests targeting `main` and uses `make fmt-check`, `make check`, and `make test-ci`
 - Releases are built from semver tags like `v0.1.0`
-- The release workflow re-runs formatting, `cargo check`, and `cargo test` before any release build or publish step
+- The release workflow re-runs `make fmt-check`, `make check`, and `make test-ci` before any release build or publish step
 - The release workflow builds native tarballs for Apple Silicon macOS plus x86_64 and ARM64 Linux
 - Releases are created as drafts first, assets are uploaded, and the release is published only after every asset and checksum has been attached
+
+The heavier local-only test layers are intentionally excluded from CI and release validation:
+
+- `mb` black-box CLI integration tests live behind `make test` or `make test-cli-blackbox`
+- Real installed-tool checks live behind `make test-cli-real`
 
 ## Configuration And Environment Variables
 

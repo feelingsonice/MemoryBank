@@ -1,6 +1,8 @@
 use crate::AppError;
 use crate::assets::{copy_if_needed, find_on_path};
 use crate::command_utils::{CommandOutcome, run_command_capture, shell_escape};
+#[cfg(test)]
+use crate::command_utils::{CommandRunOptions, run_command_capture_with_options};
 use crate::constants::{HOOK_BINARY_NAME, MCP_PROXY_BINARY_NAME};
 use crate::json_config::{
     array_mut, ensure_object, load_json_config, object_mut, write_json_config_with_backups,
@@ -109,6 +111,31 @@ pub(crate) fn integration_configured(settings: &AppSettings, agent: AgentKind) -
 
 fn configure_claude(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
     ensure_claude_user_mcp(server_url)?;
+
+    let settings_path = paths.home_dir.join(".claude/settings.json");
+    let mut root = load_json_config(&settings_path)?;
+    let events = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
+    for event in events {
+        let command = build_hook_command(
+            &paths.binary_path(HOOK_BINARY_NAME),
+            "claude-code",
+            event,
+            server_url,
+        );
+        upsert_claude_hook(&mut root, event, &command)?;
+    }
+    write_json_config_with_backups(paths, &settings_path, &root)
+}
+
+#[cfg(test)]
+fn configure_claude_with_options(
+    paths: &AppPaths,
+    server_url: &str,
+    options: &CommandRunOptions,
+) -> Result<(), AppError> {
+    ensure_claude_user_mcp_with_runner(server_url, |args| {
+        run_command_capture_with_options("claude", args, options)
+    })?;
 
     let settings_path = paths.home_dir.join(".claude/settings.json");
     let mut root = load_json_config(&settings_path)?;
@@ -242,8 +269,15 @@ fn configure_openclaw(paths: &AppPaths, server_url: &str) -> Result<(), AppError
 }
 
 fn ensure_claude_user_mcp(server_url: &str) -> Result<(), AppError> {
+    ensure_claude_user_mcp_with_runner(server_url, |args| run_command_capture("claude", args))
+}
+
+fn ensure_claude_user_mcp_with_runner<F>(server_url: &str, mut run: F) -> Result<(), AppError>
+where
+    F: FnMut(&[&str]) -> Result<CommandOutcome, AppError>,
+{
     let desired_url = format!("{server_url}/mcp");
-    let current = run_command_capture("claude", &["mcp", "get", "memory-bank"])?;
+    let current = run(&["mcp", "get", "memory-bank"])?;
 
     if claude_mcp_matches(&current, &desired_url) {
         return Ok(());
@@ -251,8 +285,7 @@ fn ensure_claude_user_mcp(server_url: &str) -> Result<(), AppError> {
 
     if current.success {
         if claude_mcp_scope(&current).as_deref() == Some("user") {
-            let removal =
-                run_command_capture("claude", &["mcp", "remove", "memory-bank", "-s", "user"])?;
+            let removal = run(&["mcp", "remove", "memory-bank", "-s", "user"])?;
             if !removal.success {
                 return Err(removal.into_error());
             }
@@ -263,29 +296,26 @@ fn ensure_claude_user_mcp(server_url: &str) -> Result<(), AppError> {
         }
     }
 
-    let addition = run_command_capture(
-        "claude",
-        &[
-            "mcp",
-            "add",
-            "--transport",
-            "http",
-            "--scope",
-            "user",
-            "memory-bank",
-            &desired_url,
-        ],
-    )?;
+    let addition = run(&[
+        "mcp",
+        "add",
+        "--transport",
+        "http",
+        "--scope",
+        "user",
+        "memory-bank",
+        &desired_url,
+    ])?;
 
     if !addition.success {
-        let verify = run_command_capture("claude", &["mcp", "get", "memory-bank"])?;
+        let verify = run(&["mcp", "get", "memory-bank"])?;
         if claude_mcp_matches(&verify, &desired_url) {
             return Ok(());
         }
         return Err(addition.into_error());
     }
 
-    let verify = run_command_capture("claude", &["mcp", "get", "memory-bank"])?;
+    let verify = run(&["mcp", "get", "memory-bank"])?;
     if claude_mcp_matches(&verify, &desired_url) {
         Ok(())
     } else {
@@ -459,6 +489,9 @@ fn upsert_openclaw_plugin_load_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::real_binary_tests::RealBinaryTestEnv;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::fs;
     use tempfile::TempDir;
 
@@ -467,6 +500,7 @@ mod tests {
         let outcome = CommandOutcome {
             program: "claude".to_string(),
             args: vec!["mcp".to_string(), "get".to_string(), "memory-bank".to_string()],
+            exit_code: Some(0),
             success: true,
             stdout: "memory-bank:\n  Scope: User config (available in all your projects)\n  Status: ✗ Failed to connect\n  Type: http\n  URL: http://127.0.0.1:3737/mcp\n".to_string(),
             stderr: String::new(),
@@ -671,5 +705,218 @@ mod tests {
                     .to_string()
             ])
         );
+    }
+
+    #[test]
+    fn configure_gemini_is_idempotent_across_reruns() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        configure_gemini(&paths, "http://127.0.0.1:3737").expect("first configure");
+        configure_gemini(&paths, "http://127.0.0.1:3737").expect("second configure");
+
+        let rendered =
+            fs::read_to_string(paths.home_dir.join(".gemini/settings.json")).expect("settings");
+        assert_eq!(
+            rendered
+                .matches("\"httpUrl\": \"http://127.0.0.1:3737/mcp\"")
+                .count(),
+            1
+        );
+        assert_eq!(rendered.matches("\"name\": \"memory-bank\"").count(), 4);
+    }
+
+    #[test]
+    fn configure_opencode_is_idempotent_across_reruns() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let plugin_source = paths.integrations_dir.join("opencode/memory-bank.js");
+        fs::create_dir_all(plugin_source.parent().expect("parent")).expect("parent");
+        fs::write(&plugin_source, "// plugin").expect("plugin source");
+
+        configure_opencode(&paths, "http://127.0.0.1:3737").expect("first configure");
+        configure_opencode(&paths, "http://127.0.0.1:3737").expect("second configure");
+
+        let rendered = fs::read_to_string(paths.home_dir.join(".config/opencode/opencode.json"))
+            .expect("settings");
+        assert_eq!(rendered.matches("\"memory-bank\"").count(), 1);
+        assert_eq!(rendered.matches("http://127.0.0.1:3737/mcp").count(), 1);
+    }
+
+    #[test]
+    fn configure_openclaw_is_idempotent_across_reruns() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        configure_openclaw(&paths, "http://127.0.0.1:3737").expect("first configure");
+        configure_openclaw(&paths, "http://127.0.0.1:3737").expect("second configure");
+
+        let rendered =
+            fs::read_to_string(paths.home_dir.join(".openclaw/openclaw.json")).expect("settings");
+        let load_path = paths
+            .integrations_dir
+            .join("openclaw/memory-bank")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(rendered.matches(&load_path).count(), 1);
+        assert_eq!(rendered.matches("\"memory-bank\"").count(), 2);
+    }
+
+    #[test]
+    fn ensure_claude_user_mcp_rejects_conflicting_project_scope() {
+        let error = ensure_claude_user_mcp_with_runner("http://127.0.0.1:3737", |_| {
+            Ok(CommandOutcome {
+                program: "claude".to_string(),
+                args: vec!["mcp".to_string(), "get".to_string(), "memory-bank".to_string()],
+                exit_code: Some(0),
+                success: true,
+                stdout: "memory-bank:\n  Scope: Project config\n  Type: http\n  URL: http://127.0.0.1:3737/mcp\n".to_string(),
+                stderr: String::new(),
+            })
+        })
+        .expect_err("conflicting project config should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting `memory-bank` MCP server outside user scope")
+        );
+    }
+
+    #[test]
+    fn ensure_claude_user_mcp_accepts_verification_after_add_failure() {
+        let responses = RefCell::new(VecDeque::from([
+            CommandOutcome {
+                program: "claude".to_string(),
+                args: vec!["mcp".to_string(), "get".to_string(), "memory-bank".to_string()],
+                exit_code: Some(1),
+                success: false,
+                stdout: String::new(),
+                stderr: "not found".to_string(),
+            },
+            CommandOutcome {
+                program: "claude".to_string(),
+                args: vec![
+                    "mcp".to_string(),
+                    "add".to_string(),
+                    "--transport".to_string(),
+                    "http".to_string(),
+                    "--scope".to_string(),
+                    "user".to_string(),
+                    "memory-bank".to_string(),
+                    "http://127.0.0.1:3737/mcp".to_string(),
+                ],
+                exit_code: Some(1),
+                success: false,
+                stdout: String::new(),
+                stderr: "transient add failure".to_string(),
+            },
+            CommandOutcome {
+                program: "claude".to_string(),
+                args: vec!["mcp".to_string(), "get".to_string(), "memory-bank".to_string()],
+                exit_code: Some(0),
+                success: true,
+                stdout: "memory-bank:\n  Scope: User config\n  Type: http\n  URL: http://127.0.0.1:3737/mcp\n".to_string(),
+                stderr: String::new(),
+            },
+        ]));
+
+        ensure_claude_user_mcp_with_runner("http://127.0.0.1:3737", |_| {
+            responses
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| AppError::Message("missing scripted response".to_string()))
+        })
+        .expect("verify should recover after add failure");
+    }
+
+    #[test]
+    fn real_claude_configuration_round_trip() {
+        let Some(env) = RealBinaryTestEnv::for_binary("claude") else {
+            return;
+        };
+        env.seed_agent_artifacts().expect("agent artifacts");
+
+        configure_claude_with_options(&env.paths, "http://127.0.0.1:3737", &env.command_options())
+            .expect("configure claude");
+
+        let outcome = env
+            .run_cli("claude", &["mcp", "get", "memory-bank"])
+            .expect("claude mcp get");
+
+        assert!(outcome.success);
+        let output = outcome.combined_output();
+        assert!(output.contains("Scope: User config"));
+        assert!(output.contains("Type: http"));
+        assert!(output.contains("http://127.0.0.1:3737/mcp"));
+
+        let settings =
+            fs::read_to_string(env.paths.home_dir.join(".claude/settings.json")).expect("settings");
+        assert!(settings.contains("UserPromptSubmit"));
+        assert!(settings.contains("PostToolUse"));
+        assert!(settings.contains("memory-bank-hook"));
+    }
+
+    #[test]
+    fn real_gemini_configuration_round_trip() {
+        let Some(env) = RealBinaryTestEnv::for_binary("gemini") else {
+            return;
+        };
+        env.seed_agent_artifacts().expect("agent artifacts");
+        env.seed_gemini_home().expect("gemini home");
+
+        configure_gemini(&env.paths, "http://127.0.0.1:3737").expect("configure gemini");
+
+        let outcome = env
+            .run_cli("gemini", &["mcp", "list"])
+            .expect("gemini mcp list");
+
+        assert!(outcome.success);
+        let output = outcome.combined_output();
+        assert!(output.contains("memory-bank"));
+        assert!(output.contains("http://127.0.0.1:3737/mcp"));
+    }
+
+    #[test]
+    fn real_opencode_configuration_round_trip() {
+        let Some(env) = RealBinaryTestEnv::for_binary("opencode") else {
+            return;
+        };
+        env.seed_agent_artifacts().expect("agent artifacts");
+
+        configure_opencode(&env.paths, "http://127.0.0.1:3737").expect("configure opencode");
+
+        let outcome = env
+            .run_cli("opencode", &["mcp", "list"])
+            .expect("opencode mcp list");
+
+        assert!(outcome.success);
+        let output = outcome.combined_output();
+        assert!(output.contains("memory-bank"));
+        assert!(output.contains("http://127.0.0.1:3737/mcp"));
+    }
+
+    #[test]
+    fn real_openclaw_configuration_round_trip() {
+        let Some(env) = RealBinaryTestEnv::for_binary("openclaw") else {
+            return;
+        };
+        env.seed_agent_artifacts().expect("agent artifacts");
+
+        configure_openclaw(&env.paths, "http://127.0.0.1:3737").expect("configure openclaw");
+
+        let outcome = env
+            .run_cli("openclaw", &["config", "validate", "--json"])
+            .expect("openclaw validate");
+
+        assert!(outcome.success);
+        let output = outcome.combined_output();
+        assert!(output.contains(r#""valid":true"#) || output.contains(r#""valid": true"#));
+
+        let settings =
+            fs::read_to_string(env.paths.home_dir.join(".openclaw/openclaw.json")).expect("config");
+        assert!(settings.contains("memory-bank-mcp-proxy"));
+        assert!(settings.contains("memory-bank-hook"));
+        assert!(settings.contains("http://127.0.0.1:3737"));
     }
 }

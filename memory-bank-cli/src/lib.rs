@@ -8,6 +8,8 @@ mod error;
 mod json_config;
 mod models;
 mod operations;
+#[cfg(test)]
+mod real_binary_tests;
 mod service;
 mod setup;
 
