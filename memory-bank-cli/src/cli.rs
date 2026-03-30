@@ -69,6 +69,7 @@ pub enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 pub enum InternalCommand {
     RunServer,
+    BootstrapInstall,
 }
 
 #[cfg(test)]
@@ -108,6 +109,18 @@ mod tests {
             cli.command,
             Command::Internal {
                 command: InternalCommand::RunServer
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_hidden_bootstrap_install_command() {
+        let cli = Cli::try_parse_from(["mb", "internal", "bootstrap-install"]).expect("parse cli");
+
+        assert!(matches!(
+            cli.command,
+            Command::Internal {
+                command: InternalCommand::BootstrapInstall
             }
         ));
     }

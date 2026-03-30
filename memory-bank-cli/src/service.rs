@@ -1,4 +1,5 @@
 use crate::AppError;
+use crate::assets::{ExposureCheck, inspect_cli_exposure};
 use crate::command_utils::{current_uid, run_command, shell_escape};
 use crate::config::{
     llm_provider_value, normalize_ollama_url, validate_encoder_provider, validate_llm_provider,
@@ -411,6 +412,21 @@ pub(crate) fn collect_doctor_issues(
     for binary in [SERVER_BINARY_NAME, HOOK_BINARY_NAME, MCP_PROXY_BINARY_NAME] {
         if !is_runnable_file(&paths.binary_path(binary)) {
             issues.push(format!("{binary} is missing from ~/.memory_bank/bin"));
+        }
+    }
+    match inspect_cli_exposure(paths)? {
+        ExposureCheck::Active(_) => {}
+        ExposureCheck::Missing => {
+            issues.push(
+                "no managed `mb` exposure was found for the current shell or future shells"
+                    .to_string(),
+            );
+        }
+        ExposureCheck::Collision(path) => {
+            issues.push(format!(
+                "another `mb` executable already exists on PATH at {}",
+                path.display()
+            ));
         }
     }
 

@@ -27,6 +27,14 @@ Currently supports:
 
 The intended default install path is the repository's GitHub Releases page. The user-facing install flow is the `mb` CLI plus the bootstrap installer at [`./install.sh`](./install.sh). The installer tracks the latest published release and downloads the correct tarball for the current supported macOS or Linux architecture.
 
+For remote installs, the canonical one-step form is:
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/feelingsonice/MemoryBank/main/install.sh)"
+```
+
+That form preserves interactive setup more reliably than a literal `curl ... | sh`. Piped installs are still supported as best-effort: if the installer cannot open an interactive terminal, it will finish installing and ask you to run `mb setup` afterward.
+
 If you are developing locally and want the installer to build from this checkout instead of downloading a release artifact, use:
 
 ```bash
@@ -176,6 +184,12 @@ Prebuilt binaries from GitHub Releases should be the easiest install path. If yo
 
 - `./install.sh --from-source` to build this checkout and install it into `~/.memory_bank` using the same layout as a release install
 - `cargo build --release --workspace` if you want the binaries only and plan to run them manually
+
+If you are fetching the installer remotely, prefer:
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/feelingsonice/MemoryBank/main/install.sh)"
+```
 
 ### Requirements
 

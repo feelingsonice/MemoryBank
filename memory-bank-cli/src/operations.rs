@@ -1,6 +1,6 @@
 use crate::AppError;
 use crate::agents::{AgentKind, integration_configured};
-use crate::assets::{ensure_path_entry, materialize_install_artifacts};
+use crate::assets::{ExposureMode, materialize_and_expose_cli, materialize_install_artifacts};
 use crate::cli::{ConfigCommand, NamespaceCommand, ServiceCommand};
 use crate::command_utils::yes_no;
 use crate::config::{
@@ -68,8 +68,7 @@ pub(crate) fn run_doctor(fix: bool) -> Result<(), AppError> {
 
     if fix {
         paths.ensure_base_dirs()?;
-        materialize_install_artifacts(&paths)?;
-        ensure_path_entry(&paths)?;
+        materialize_and_expose_cli(&paths)?;
         let secrets = SecretStore::load(&paths)?;
         let service = service_status(&paths)?;
         if !service.installed {
@@ -237,6 +236,33 @@ pub(crate) fn run_internal_server() -> Result<(), AppError> {
     }
 
     Err(AppError::Io(command.exec()))
+}
+
+pub(crate) fn run_internal_bootstrap_install() -> Result<(), AppError> {
+    let paths = AppPaths::from_system()?;
+    let exposure = materialize_and_expose_cli(&paths)?;
+
+    println!(
+        "Memory Bank binaries are installed under {}.",
+        paths.root.display()
+    );
+    match exposure.mode {
+        ExposureMode::Direct => {
+            println!("`mb` is available directly in this shell.");
+        }
+        ExposureMode::Launcher => {
+            println!("A managed `mb` launcher was installed on your current PATH.");
+        }
+        ExposureMode::ShellInitFallback => {
+            println!("Managed shell startup files were updated for future shells.");
+            println!(
+                "Use `{}` in this shell until you start a new terminal.",
+                paths.binary_path("mb").display()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn list_namespaces(paths: &AppPaths) -> Result<Vec<Namespace>, AppError> {

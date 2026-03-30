@@ -187,33 +187,37 @@ install_from_release() {
   tar -xzf "${ARCHIVE_PATH}" -C "${APP_ROOT}"
 }
 
-ensure_path_entry() {
-  case "${SHELL:-}" in
-    */zsh)
-      SHELL_RC="${HOME}/.zshrc"
-      ;;
-    */bash)
-      SHELL_RC="${HOME}/.bashrc"
-      ;;
-    *)
-      SHELL_RC="${HOME}/.profile"
-      ;;
-  esac
+bootstrap_install() {
+  "${BIN_DIR}/mb" internal bootstrap-install
+}
 
-  if [ ! -f "${SHELL_RC}" ]; then
-    touch "${SHELL_RC}"
+tty_available() {
+  [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+current_session_setup_command() {
+  if command -v mb >/dev/null 2>&1; then
+    printf '%s\n' "mb setup"
+  else
+    printf '%s\n' "${BIN_DIR}/mb setup"
   fi
+}
 
-  if ! grep -q '\.memory_bank/bin' "${SHELL_RC}"; then
-    {
-      printf '\n# Memory Bank\n'
-      printf 'export PATH="$HOME/.memory_bank/bin:$PATH"\n'
-    } >> "${SHELL_RC}"
+print_deferred_setup_notice() {
+  SETUP_COMMAND="$(current_session_setup_command)"
+  echo "Skipping guided setup for now."
+  echo "Run \`${SETUP_COMMAND}\` to finish configuring Memory Bank."
+  if ! command -v mb >/dev/null 2>&1; then
+    echo "Bare \`mb\` will work in a new shell after your shell startup files reload."
   fi
 }
 
 run_setup() {
   "${BIN_DIR}/mb" setup
+}
+
+run_setup_via_tty() {
+  "${BIN_DIR}/mb" setup </dev/tty >/dev/tty 2>&1
 }
 
 main() {
@@ -225,8 +229,24 @@ main() {
     install_from_release
   fi
 
-  ensure_path_entry
-  run_setup
+  bootstrap_install
+
+  if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+    print_deferred_setup_notice
+    return
+  fi
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    run_setup
+    return
+  fi
+
+  if tty_available; then
+    run_setup_via_tty
+    return
+  fi
+
+  print_deferred_setup_notice
 }
 
 main "$@"

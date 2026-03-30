@@ -2,7 +2,7 @@ use crate::AppError;
 use crate::agents::{
     AgentKind, AgentSetupOutcome, configure_selected_agents, detect_installed_agents,
 };
-use crate::assets::{ensure_path_entry, materialize_install_artifacts};
+use crate::assets::{ExposureOutcome, materialize_and_expose_cli};
 use crate::command_utils::yes_no;
 use crate::config::{normalize_ollama_url, set_integrations, set_server, set_service};
 use crate::constants::{
@@ -207,7 +207,7 @@ pub(crate) fn run_setup() -> Result<(), AppError> {
         return Ok(());
     }
 
-    let (health, agent_outcome) =
+    let (health, agent_outcome, exposure) =
         apply_setup_answers(&paths, &mut settings, &mut secrets, &answers)?;
     println!();
     println!(
@@ -229,7 +229,7 @@ pub(crate) fn run_setup() -> Result<(), AppError> {
         }
     }
     println!();
-    println!("{}", render_post_setup_help());
+    println!("{}", render_post_setup_help(&exposure));
     Ok(())
 }
 
@@ -445,14 +445,13 @@ fn apply_setup_answers(
     settings: &mut AppSettings,
     secrets: &mut SecretStore,
     answers: &SetupAnswers,
-) -> Result<(HealthCheck, AgentSetupOutcome), AppError> {
+) -> Result<(HealthCheck, AgentSetupOutcome, ExposureOutcome), AppError> {
     let total_steps = 6;
     let preview_settings = build_settings_for_answers(settings, answers, &[]);
 
-    apply_step(1, total_steps, "Install artifacts and update PATH", || {
+    let exposure = apply_step(1, total_steps, "Install artifacts and expose CLI", || {
         paths.ensure_base_dirs()?;
-        materialize_install_artifacts(paths)?;
-        ensure_path_entry(paths)
+        materialize_and_expose_cli(paths)
     })?;
 
     let agent_outcome = {
@@ -489,7 +488,7 @@ fn apply_setup_answers(
         wait_for_health(settings, HEALTH_STARTUP_TIMEOUT, HEALTH_POLL_INTERVAL)
     })?;
 
-    Ok((health, agent_outcome))
+    Ok((health, agent_outcome, exposure))
 }
 
 fn print_step_start(index: usize, total: usize, label: &str) -> Result<(), AppError> {
@@ -1053,29 +1052,21 @@ fn render_review_summary(answers: &SetupAnswers) -> String {
     lines.join("\n")
 }
 
-fn render_post_setup_help() -> String {
+fn render_post_setup_help(exposure: &ExposureOutcome) -> String {
     [
         styled_section("What's next"),
         "A few useful commands after setup:".to_string(),
-        // format!(
-        //     "  {}  Check service health, namespace, and provider",
-        //     styled_command("mb status")
-        // ),
-        // format!(
-        //     "  {}  Watch the managed service logs live",
-        //     styled_command("mb logs -f")
-        // ),
         format!(
             "  {}  Review the saved configuration",
-            styled_command("mb config show")
+            styled_command(&format!("{} config show", exposure.command_prefix))
         ),
         format!(
             "  {}  Run the guided setup again any time",
-            styled_command("mb setup")
+            styled_command(&format!("{} setup", exposure.command_prefix))
         ),
         format!(
             "  {}  Check for common install or config issues",
-            styled_command("mb doctor")
+            styled_command(&format!("{} doctor", exposure.command_prefix))
         ),
     ]
     .join("\n")
@@ -1141,13 +1132,28 @@ mod tests {
 
     #[test]
     fn render_post_setup_help_mentions_key_commands() {
-        let help = render_post_setup_help();
+        let help = render_post_setup_help(&ExposureOutcome {
+            mode: crate::assets::ExposureMode::Launcher,
+            bare_command_works_now: true,
+            command_prefix: "mb".to_string(),
+        });
 
-        assert!(help.contains("mb status"));
-        assert!(help.contains("mb logs -f"));
         assert!(help.contains("mb config show"));
         assert!(help.contains("mb setup"));
         assert!(help.contains("mb doctor"));
+    }
+
+    #[test]
+    fn render_post_setup_help_uses_absolute_path_when_bare_mb_is_not_ready() {
+        let help = render_post_setup_help(&ExposureOutcome {
+            mode: crate::assets::ExposureMode::ShellInitFallback,
+            bare_command_works_now: false,
+            command_prefix: "/tmp/.memory_bank/bin/mb".to_string(),
+        });
+
+        assert!(help.contains("/tmp/.memory_bank/bin/mb config show"));
+        assert!(help.contains("/tmp/.memory_bank/bin/mb setup"));
+        assert!(help.contains("/tmp/.memory_bank/bin/mb doctor"));
     }
 
     #[test]

@@ -41,7 +41,7 @@ last=""
 for arg in "$@"; do
   last="$arg"
 done
-[ -n "$last" ] && cat "$last"
+[ -n "$last" ] && /bin/cat "$last"
 exit 0
 "#,
                 shim_log.display()
@@ -105,11 +105,7 @@ esac
             );
         }
 
-        let path = format!(
-            "{}:{}",
-            shim_dir.path().display(),
-            env::var("PATH").unwrap_or_default()
-        );
+        let path = format!("{}:/usr/bin:/bin", shim_dir.path().display());
 
         Self {
             _home: home,
@@ -135,6 +131,7 @@ esac
         command.env("NO_COLOR", "1");
         command.env("CI", "1");
         command.env("TERM", "dumb");
+        command.env("SHELL", "/bin/zsh");
         command.env("XDG_CONFIG_HOME", self.paths.home_dir.join(".config"));
         command.env("XDG_STATE_HOME", self.paths.home_dir.join(".local/state"));
         command.env("XDG_DATA_HOME", self.paths.home_dir.join(".local/share"));
@@ -288,6 +285,99 @@ fn mb_setup_fails_cleanly_without_a_tty() {
 
     assert!(!output.status.success());
     assert!(stderr_string(&output).contains("interactive terminal"));
+}
+
+#[test]
+fn mb_internal_bootstrap_install_creates_a_managed_launcher() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+    let launcher_dir = harness.paths.home_dir.join(".local/bin");
+    let path = format!(
+        "{launcher_dir}:/usr/bin:/bin",
+        launcher_dir = launcher_dir.display()
+    );
+
+    let output = harness.run_with_env(
+        &["internal", "bootstrap-install"],
+        &[("PATH", &path), ("SHELL", "/bin/bash")],
+    );
+
+    assert!(output.status.success(), "{}", stderr_string(&output));
+    let launcher = fs::read_to_string(launcher_dir.join("mb")).expect("launcher");
+    assert!(launcher.contains("Memory Bank managed launcher"));
+    assert!(stdout_string(&output).contains("managed `mb` launcher"));
+}
+
+#[test]
+fn mb_internal_bootstrap_install_falls_back_to_managed_shell_init() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+
+    let output = harness.run_with_env(
+        &["internal", "bootstrap-install"],
+        &[("PATH", "/usr/bin:/bin"), ("SHELL", "/bin/zsh")],
+    );
+
+    assert!(output.status.success(), "{}", stderr_string(&output));
+    let env_file = fs::read_to_string(harness.paths.root.join("env.sh")).expect("env file");
+    assert!(env_file.contains("Memory Bank managed environment"));
+    let zprofile = fs::read_to_string(harness.paths.home_dir.join(".zprofile")).expect("zprofile");
+    let zshrc = fs::read_to_string(harness.paths.home_dir.join(".zshrc")).expect("zshrc");
+    assert!(zprofile.contains("# >>> Memory Bank >>>"));
+    assert!(zshrc.contains("# >>> Memory Bank >>>"));
+}
+
+#[test]
+fn mb_internal_bootstrap_install_fails_on_unrelated_mb_collision() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+    let launcher_dir = harness.paths.home_dir.join(".local/bin");
+    fs::create_dir_all(&launcher_dir).expect("launcher dir");
+    let collision = launcher_dir.join("mb");
+    fs::write(&collision, "#!/bin/sh\nexit 0\n").expect("collision");
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&collision).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&collision, permissions).expect("permissions");
+    }
+    let path = format!(
+        "{launcher_dir}:/usr/bin:/bin",
+        launcher_dir = launcher_dir.display()
+    );
+
+    let output = harness.run_with_env(
+        &["internal", "bootstrap-install"],
+        &[("PATH", &path), ("SHELL", "/bin/bash")],
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        stderr_string(&output).contains("another executable already exists on PATH"),
+        "{}",
+        stderr_string(&output)
+    );
+}
+
+#[test]
+fn mb_doctor_fix_provisions_cli_exposure() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+    let launcher_dir = harness.paths.home_dir.join(".local/bin");
+    let path = format!(
+        "{launcher_dir}:{}",
+        harness.path,
+        launcher_dir = launcher_dir.display()
+    );
+
+    let output = harness.run_with_env(
+        &["doctor", "--fix"],
+        &[("PATH", &path), ("SHELL", "/bin/bash")],
+    );
+
+    assert!(output.status.success(), "{}", stderr_string(&output));
+    let launcher = fs::read_to_string(launcher_dir.join("mb")).expect("launcher");
+    assert!(launcher.contains("Memory Bank managed launcher"));
 }
 
 #[test]

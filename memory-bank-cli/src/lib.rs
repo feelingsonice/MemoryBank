@@ -30,6 +30,7 @@ pub fn run() -> Result<(), AppError> {
         Command::Config { command } => operations::run_config(command),
         Command::Internal { command } => match command {
             InternalCommand::RunServer => operations::run_internal_server(),
+            InternalCommand::BootstrapInstall => operations::run_internal_bootstrap_install(),
         },
     }
 }

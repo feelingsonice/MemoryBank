@@ -7,7 +7,37 @@ use crate::constants::{
 use memory_bank_app::AppPaths;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Component;
 use std::path::{Path, PathBuf};
+
+const MANAGED_LAUNCHER_MARKER: &str = "# Memory Bank managed launcher";
+const MANAGED_LAUNCHER_EXEC_LINE: &str = r#"exec "$HOME/.memory_bank/bin/mb" "$@""#;
+const MANAGED_ENV_MARKER: &str = "# Memory Bank managed environment";
+const RC_BLOCK_START: &str = "# >>> Memory Bank >>>";
+const RC_BLOCK_END: &str = "# <<< Memory Bank <<<";
+const RC_SOURCE_LINE: &str =
+    r#"[ -f "$HOME/.memory_bank/env.sh" ] && . "$HOME/.memory_bank/env.sh""#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExposureMode {
+    Direct,
+    Launcher,
+    ShellInitFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExposureOutcome {
+    pub(crate) mode: ExposureMode,
+    pub(crate) bare_command_works_now: bool,
+    pub(crate) command_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExposureCheck {
+    Active(ExposureOutcome),
+    Missing,
+    Collision(PathBuf),
+}
 
 pub(crate) fn materialize_install_artifacts(paths: &AppPaths) -> Result<(), AppError> {
     paths.ensure_base_dirs()?;
@@ -31,41 +61,25 @@ pub(crate) fn materialize_install_artifacts(paths: &AppPaths) -> Result<(), AppE
     Ok(())
 }
 
-pub(crate) fn ensure_path_entry(paths: &AppPaths) -> Result<(), AppError> {
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    let target_rc = if shell.ends_with("zsh") {
-        paths.home_dir.join(".zshrc")
-    } else if shell.ends_with("bash") {
-        paths.home_dir.join(".bashrc")
-    } else {
-        paths.home_dir.join(".profile")
-    };
-    let export_line = r#"export PATH="$HOME/.memory_bank/bin:$PATH""#;
-    let existing = fs::read_to_string(&target_rc).unwrap_or_default();
-    if existing.contains(".memory_bank/bin") {
-        return Ok(());
-    }
+pub(crate) fn materialize_and_expose_cli(paths: &AppPaths) -> Result<ExposureOutcome, AppError> {
+    materialize_install_artifacts(paths)?;
+    ensure_cli_exposure(paths)
+}
 
-    let mut updated = existing;
-    if !updated.ends_with('\n') && !updated.is_empty() {
-        updated.push('\n');
-    }
-    updated.push_str("# Memory Bank\n");
-    updated.push_str(export_line);
-    updated.push('\n');
-    fs::write(target_rc, updated)?;
-    Ok(())
+pub(crate) fn ensure_cli_exposure(paths: &AppPaths) -> Result<ExposureOutcome, AppError> {
+    let path_entries = current_path_entries();
+    let shell = current_shell();
+    ensure_cli_exposure_with_context(paths, &path_entries, &shell)
+}
+
+pub(crate) fn inspect_cli_exposure(paths: &AppPaths) -> Result<ExposureCheck, AppError> {
+    let path_entries = current_path_entries();
+    let shell = current_shell();
+    inspect_cli_exposure_with_context(paths, &path_entries, &shell)
 }
 
 pub(crate) fn find_on_path(binary: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for entry in std::env::split_paths(&path_var) {
-        let candidate = entry.join(binary);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    find_on_entries(&current_path_entries(), binary)
 }
 
 pub(crate) fn find_repo_root() -> Option<PathBuf> {
@@ -222,6 +236,296 @@ fn write_asset_file(path: &Path, contents: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn ensure_cli_exposure_with_context(
+    paths: &AppPaths,
+    path_entries: &[PathBuf],
+    shell: &str,
+) -> Result<ExposureOutcome, AppError> {
+    let resolved_mb = find_on_entries(path_entries, MB_BINARY_NAME);
+    let real_binary = paths.binary_path(MB_BINARY_NAME);
+
+    if let Some(path) = resolved_mb {
+        if same_path(&path, &real_binary) {
+            return Ok(direct_exposure(paths));
+        }
+        if is_managed_launcher(&path, paths) {
+            return Ok(launcher_exposure(paths));
+        }
+        return Err(cli_collision_error(&path));
+    }
+
+    if is_path_entry_present(path_entries, &paths.bin_dir) {
+        return Ok(direct_exposure(paths));
+    }
+
+    if let Some(launcher_dir) = first_launcher_dir(paths, path_entries) {
+        install_managed_launcher(&launcher_dir.join(MB_BINARY_NAME), paths)?;
+        return Ok(launcher_exposure(paths));
+    }
+
+    install_shell_init_fallback(paths, shell)?;
+    Ok(shell_init_exposure(paths))
+}
+
+fn inspect_cli_exposure_with_context(
+    paths: &AppPaths,
+    path_entries: &[PathBuf],
+    shell: &str,
+) -> Result<ExposureCheck, AppError> {
+    let resolved_mb = find_on_entries(path_entries, MB_BINARY_NAME);
+    let real_binary = paths.binary_path(MB_BINARY_NAME);
+
+    if let Some(path) = resolved_mb {
+        if same_path(&path, &real_binary) {
+            return Ok(ExposureCheck::Active(direct_exposure(paths)));
+        }
+        if is_managed_launcher(&path, paths) {
+            return Ok(ExposureCheck::Active(launcher_exposure(paths)));
+        }
+        return Ok(ExposureCheck::Collision(path));
+    }
+
+    if is_path_entry_present(path_entries, &paths.bin_dir) && is_executable_file(&real_binary) {
+        return Ok(ExposureCheck::Active(direct_exposure(paths)));
+    }
+
+    if shell_init_fallback_is_managed(paths, shell)? {
+        return Ok(ExposureCheck::Active(shell_init_exposure(paths)));
+    }
+
+    Ok(ExposureCheck::Missing)
+}
+
+fn direct_exposure(_paths: &AppPaths) -> ExposureOutcome {
+    ExposureOutcome {
+        mode: ExposureMode::Direct,
+        bare_command_works_now: true,
+        command_prefix: MB_BINARY_NAME.to_string(),
+    }
+}
+
+fn launcher_exposure(_paths: &AppPaths) -> ExposureOutcome {
+    ExposureOutcome {
+        mode: ExposureMode::Launcher,
+        bare_command_works_now: true,
+        command_prefix: MB_BINARY_NAME.to_string(),
+    }
+}
+
+fn shell_init_exposure(paths: &AppPaths) -> ExposureOutcome {
+    ExposureOutcome {
+        mode: ExposureMode::ShellInitFallback,
+        bare_command_works_now: false,
+        command_prefix: paths.binary_path(MB_BINARY_NAME).display().to_string(),
+    }
+}
+
+fn cli_collision_error(path: &Path) -> AppError {
+    AppError::Message(format!(
+        "cannot expose `mb` because another executable already exists on PATH at {}",
+        path.display()
+    ))
+}
+
+fn current_path_entries() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default()
+}
+
+fn current_shell() -> String {
+    std::env::var("SHELL").unwrap_or_default()
+}
+
+fn find_on_entries(entries: &[PathBuf], binary: &str) -> Option<PathBuf> {
+    for entry in entries {
+        let candidate = entry.join(binary);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn first_launcher_dir(paths: &AppPaths, path_entries: &[PathBuf]) -> Option<PathBuf> {
+    let local_bin = paths.home_dir.join(".local/bin");
+    let home_bin = paths.home_dir.join("bin");
+
+    path_entries.iter().find_map(|entry| {
+        if same_path(entry, &local_bin) || same_path(entry, &home_bin) {
+            Some(entry.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn install_managed_launcher(path: &Path, paths: &AppPaths) -> Result<(), AppError> {
+    if path.exists() && !is_managed_launcher(path, paths) {
+        return Err(cli_collision_error(path));
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, render_managed_launcher())?;
+    set_mode(path, 0o755)?;
+    Ok(())
+}
+
+fn render_managed_launcher() -> String {
+    format!("#!/usr/bin/env sh\n{MANAGED_LAUNCHER_MARKER}\n{MANAGED_LAUNCHER_EXEC_LINE}\n")
+}
+
+fn is_managed_launcher(path: &Path, _paths: &AppPaths) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    contents.contains(MANAGED_LAUNCHER_MARKER)
+        && contents.contains(MANAGED_LAUNCHER_EXEC_LINE)
+        && path.file_name().and_then(|name| name.to_str()) == Some(MB_BINARY_NAME)
+}
+
+fn install_shell_init_fallback(paths: &AppPaths, shell: &str) -> Result<(), AppError> {
+    let env_file = shell_env_file(paths);
+    if let Some(parent) = env_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&env_file, render_managed_env_file())?;
+
+    for target in shell_init_targets_for_shell(paths, shell) {
+        ensure_source_block(&target)?;
+    }
+    Ok(())
+}
+
+fn shell_init_fallback_is_managed(paths: &AppPaths, shell: &str) -> Result<bool, AppError> {
+    let env_file = shell_env_file(paths);
+    if !matches!(fs::read_to_string(&env_file), Ok(contents) if contents == render_managed_env_file())
+    {
+        return Ok(false);
+    }
+
+    for target in shell_init_targets_for_shell(paths, shell) {
+        if !has_source_block(&target)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn shell_env_file(paths: &AppPaths) -> PathBuf {
+    paths.root.join("env.sh")
+}
+
+fn render_managed_env_file() -> String {
+    format!(
+        "{MANAGED_ENV_MARKER}\ncase \":$PATH:\" in\n  *\":$HOME/.memory_bank/bin:\"*) ;;\n  *) export PATH=\"$HOME/.memory_bank/bin:$PATH\" ;;\nesac\n"
+    )
+}
+
+fn shell_init_targets_for_shell(paths: &AppPaths, shell: &str) -> Vec<PathBuf> {
+    if shell.ends_with("zsh") {
+        vec![
+            paths.home_dir.join(".zprofile"),
+            paths.home_dir.join(".zshrc"),
+        ]
+    } else if shell.ends_with("bash") {
+        vec![bash_login_file(paths), paths.home_dir.join(".bashrc")]
+    } else {
+        vec![paths.home_dir.join(".profile")]
+    }
+}
+
+fn bash_login_file(paths: &AppPaths) -> PathBuf {
+    for candidate in [
+        paths.home_dir.join(".bash_profile"),
+        paths.home_dir.join(".bash_login"),
+        paths.home_dir.join(".profile"),
+    ] {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    paths.home_dir.join(".bash_profile")
+}
+
+fn ensure_source_block(path: &Path) -> Result<(), AppError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let block = render_source_block();
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    if existing.contains(&block) {
+        return Ok(());
+    }
+
+    let updated = replace_or_append_block(&existing, &block);
+    fs::write(path, updated)?;
+    Ok(())
+}
+
+fn has_source_block(path: &Path) -> Result<bool, AppError> {
+    Ok(fs::read_to_string(path)
+        .map(|contents| contents.contains(&render_source_block()))
+        .unwrap_or(false))
+}
+
+fn render_source_block() -> String {
+    format!("{RC_BLOCK_START}\n{RC_SOURCE_LINE}\n{RC_BLOCK_END}\n")
+}
+
+fn replace_or_append_block(existing: &str, block: &str) -> String {
+    if let Some(start) = existing.find(RC_BLOCK_START)
+        && let Some(end_offset) = existing[start..].find(RC_BLOCK_END)
+    {
+        let end = start + end_offset + RC_BLOCK_END.len();
+        let mut updated = String::new();
+        updated.push_str(&existing[..start]);
+        if !updated.ends_with('\n') && !updated.is_empty() {
+            updated.push('\n');
+        }
+        updated.push_str(block);
+        let suffix = &existing[end..];
+        if !suffix.is_empty() && !suffix.starts_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(suffix.trim_start_matches('\n'));
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        return updated;
+    }
+
+    let mut updated = existing.to_string();
+    if !updated.ends_with('\n') && !updated.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str(block);
+    updated
+}
+
+fn is_path_entry_present(entries: &[PathBuf], target: &Path) -> bool {
+    entries.iter().any(|entry| same_path(entry, target))
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    normalize_components(left).eq(normalize_components(right))
+}
+
+fn normalize_components(path: &Path) -> impl Iterator<Item = Component<'_>> {
+    path.components()
+        .filter(|component| *component != Component::CurDir)
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<(), AppError> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
         && path
@@ -236,25 +540,117 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn ensure_path_entry_is_idempotent_for_current_shell_rc_file() {
+    fn ensure_cli_exposure_uses_direct_mode_when_app_bin_is_on_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        paths.ensure_base_dirs().expect("base dirs");
+        fs::write(paths.binary_path(MB_BINARY_NAME), "#!/bin/sh\n").expect("write mb");
+        set_mode(&paths.binary_path(MB_BINARY_NAME), 0o755).expect("chmod");
+
+        let outcome =
+            ensure_cli_exposure_with_context(&paths, &[paths.bin_dir.clone()], "/bin/zsh")
+                .expect("direct exposure");
+
+        assert_eq!(outcome.mode, ExposureMode::Direct);
+        assert!(outcome.bare_command_works_now);
+        assert_eq!(outcome.command_prefix, "mb");
+    }
+
+    #[test]
+    fn ensure_cli_exposure_creates_managed_launcher_in_first_path_match() {
         let temp = TempDir::new().expect("tempdir");
         let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
 
-        ensure_path_entry(&paths).expect("first path update");
-        ensure_path_entry(&paths).expect("second path update");
+        let launcher_dir = paths.home_dir.join(".local/bin");
+        let other_dir = paths.home_dir.join("bin");
+        let outcome = ensure_cli_exposure_with_context(
+            &paths,
+            &[launcher_dir.clone(), other_dir],
+            "/bin/bash",
+        )
+        .expect("launcher exposure");
 
-        let shell = std::env::var("SHELL").unwrap_or_default();
-        let rc_path = if shell.ends_with("zsh") {
-            paths.home_dir.join(".zshrc")
-        } else if shell.ends_with("bash") {
-            paths.home_dir.join(".bashrc")
-        } else {
-            paths.home_dir.join(".profile")
-        };
-        let contents = fs::read_to_string(&rc_path).expect("rc file");
+        assert_eq!(outcome.mode, ExposureMode::Launcher);
+        assert!(outcome.bare_command_works_now);
+        assert_eq!(
+            fs::read_to_string(launcher_dir.join(MB_BINARY_NAME)).expect("launcher"),
+            render_managed_launcher()
+        );
+    }
 
-        assert_eq!(contents.matches("# Memory Bank").count(), 1);
-        assert_eq!(contents.matches(".memory_bank/bin").count(), 1);
+    #[test]
+    fn ensure_cli_exposure_rejects_unrelated_mb_collision() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let collision_dir = paths.home_dir.join(".local/bin");
+        fs::create_dir_all(&collision_dir).expect("collision dir");
+        let collision_path = collision_dir.join(MB_BINARY_NAME);
+        fs::write(&collision_path, "#!/bin/sh\nexit 0\n").expect("write collision");
+        set_mode(&collision_path, 0o755).expect("chmod");
+
+        let error = ensure_cli_exposure_with_context(&paths, &[collision_dir], "/bin/bash")
+            .expect_err("collision");
+
+        assert!(
+            error
+                .to_string()
+                .contains("another executable already exists on PATH")
+        );
+    }
+
+    #[test]
+    fn ensure_cli_exposure_falls_back_to_managed_shell_init() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        let outcome =
+            ensure_cli_exposure_with_context(&paths, &[PathBuf::from("/usr/bin")], "/bin/zsh")
+                .expect("shell init fallback");
+
+        assert_eq!(outcome.mode, ExposureMode::ShellInitFallback);
+        assert!(!outcome.bare_command_works_now);
+        assert_eq!(
+            outcome.command_prefix,
+            paths.binary_path(MB_BINARY_NAME).display().to_string()
+        );
+        assert_eq!(
+            fs::read_to_string(shell_env_file(&paths)).expect("env file"),
+            render_managed_env_file()
+        );
+        assert!(has_source_block(&paths.home_dir.join(".zprofile")).expect("zprofile"));
+        assert!(has_source_block(&paths.home_dir.join(".zshrc")).expect("zshrc"));
+    }
+
+    #[test]
+    fn shell_init_fallback_is_idempotent() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        install_shell_init_fallback(&paths, "/bin/bash").expect("first fallback");
+        install_shell_init_fallback(&paths, "/bin/bash").expect("second fallback");
+
+        let bashrc = fs::read_to_string(paths.home_dir.join(".bashrc")).expect("bashrc");
+        let bash_profile =
+            fs::read_to_string(paths.home_dir.join(".bash_profile")).expect("bash profile");
+
+        assert_eq!(bashrc.matches(RC_BLOCK_START).count(), 1);
+        assert_eq!(bash_profile.matches(RC_BLOCK_START).count(), 1);
+    }
+
+    #[test]
+    fn inspect_cli_exposure_reports_shell_init_fallback_as_healthy() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        install_shell_init_fallback(&paths, "/bin/bash").expect("fallback");
+
+        let inspection =
+            inspect_cli_exposure_with_context(&paths, &[PathBuf::from("/usr/bin")], "/bin/bash")
+                .expect("inspection");
+
+        assert_eq!(
+            inspection,
+            ExposureCheck::Active(shell_init_exposure(&paths))
+        );
     }
 
     #[test]
