@@ -1,5 +1,9 @@
 # Memory Bank
 
+<p align="center">
+  <img src="./docs/logo.svg" alt="Memory Bank logo" width="160" />
+</p>
+
 Memory Bank gives coding agents shared, long-term memory across sessions and across tools.
 
 It runs locally, stores memory in your own namespaced SQLite databases, and works with Claude Code, Gemini CLI, OpenCode, and OpenClaw.

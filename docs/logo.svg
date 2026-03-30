@@ -1,0 +1,28 @@
+<svg width="180" height="120" viewBox="0 0 180 120" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Memory Bank logo</title>
+  <desc id="desc">Three memory fragments converging into a shared vault-like memory bank.</desc>
+
+  <g stroke="#2563EB" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="16" y="16" width="34" height="20" rx="10"/>
+    <rect x="16" y="50" width="34" height="20" rx="10"/>
+    <rect x="16" y="84" width="34" height="20" rx="10"/>
+
+    <path d="M50 26H68"/>
+    <path d="M50 60H68"/>
+    <path d="M50 94H68"/>
+
+    <path d="M68 26L86 48"/>
+    <path d="M68 60H86"/>
+    <path d="M68 94L86 72"/>
+
+    <path d="M86 60H98"/>
+
+    <rect x="98" y="18" width="66" height="84" rx="18"/>
+    <circle cx="131" cy="60" r="18"/>
+    <circle cx="131" cy="60" r="3" fill="#2563EB" stroke="none"/>
+
+    <path d="M131 42V50"/>
+    <path d="M146.6 69L139.7 65"/>
+    <path d="M115.4 69L122.3 65"/>
+  </g>
+</svg>
