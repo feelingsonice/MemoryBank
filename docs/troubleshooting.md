@@ -143,4 +143,4 @@ Use the agent-specific guide for the integration you are using:
 - [OpenCode](./opencode.md)
 - [OpenClaw](./openclaw.md)
 
-For a high-level overview of the moving parts, see [How Memory Bank Works](./how-it-works.md). For platform support and cost notes, see [Requirements and Cost](./requirements-and-cost.md).
+For a high-level overview of the moving parts, see [Architecture](./architecture.md). For platform support and provider notes, see [Requirements](./requirements.md).

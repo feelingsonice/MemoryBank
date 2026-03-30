@@ -1,4 +1,4 @@
-# Requirements and Cost
+# Requirements
 
 ## Supported Platforms
 
@@ -40,14 +40,16 @@ The first startup can be slower than later ones because the default embedding mo
 
 There is no separate external database to provision for the default path.
 
-## How Cost Works
+## Provider Billing
 
-Memory Bank's cost is separate from the cost of the coding agent you use directly.
+Memory Bank itself is free to use. It does not charge you.
+
+What can cost money is the hosted provider you choose for Memory Bank's internal memory analysis.
 
 For example:
 
-- Claude Code plus Memory Bank on Anthropic means both Claude Code usage and Memory Bank's internal memory-analysis calls can matter
-- OpenCode plus Memory Bank on Ollama avoids hosted LLM charges for Memory Bank's internal analysis, but OpenCode itself may still have its own costs depending on how you use it
+- Claude Code plus Memory Bank on Anthropic means your Claude Code usage and your Anthropic usage can both matter, because they are separate systems
+- OpenCode plus Memory Bank on Ollama avoids hosted LLM charges for Memory Bank's internal analysis, though OpenCode itself may still have its own separate billing depending on how you use it
 
 In the current design, each finalized turn usually triggers:
 
@@ -57,15 +59,15 @@ In the current design, each finalized turn usually triggers:
 
 The default embedding path is local FastEmbed, so the default setup does not add a separate embedding API bill.
 
-## Caching And Cost Control
+## Token Caching And Provider Usage
 
-Memory Bank already benefits from provider-side caching where supported:
+Memory Bank already takes advantage of provider-side prompt or token caching where supported:
 
 - Anthropic prompt caching is enabled
 - OpenAI prompt caching is automatic on supported models
 - Gemini relies on the provider's implicit caching on supported models
 
-If you want to keep costs down:
+If you want to keep hosted-provider usage lower:
 
 - choose a smaller or cheaper hosted model during `mb setup`
 - use Ollama if you want Memory Bank's internal analysis to stay local
@@ -85,9 +87,10 @@ For most users, the main questions are:
 - Can my machine run the local service? Usually yes if it can run the supported agent and a small local background process.
 - Will the first run take longer? Yes, because of local model download and cache warm-up.
 - Do I need a GPU? Not for the normal managed setup.
-- Will Memory Bank add cost on top of my agent? Yes, unless you use a local provider like Ollama for Memory Bank's internal analysis.
+- Is Memory Bank itself paid software? No.
+- Could a hosted provider bill me for Memory Bank's internal analysis? Yes, if you choose Anthropic, Gemini, or OpenAI instead of a local provider like Ollama.
 
 ## Related Docs
 
 - [Troubleshooting](./troubleshooting.md)
-- [How Memory Bank Works](./how-it-works.md)
+- [Architecture](./architecture.md)

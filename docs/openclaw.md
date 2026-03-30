@@ -46,4 +46,4 @@ Useful checks:
 
 Then restart OpenClaw and run the same smoke test used in the main README.
 
-If you need general fixes, use [Troubleshooting](./troubleshooting.md). For platform support and cost notes, see [Requirements and Cost](./requirements-and-cost.md).
+If you need general fixes, use [Troubleshooting](./troubleshooting.md). For platform support and provider notes, see [Requirements](./requirements.md).

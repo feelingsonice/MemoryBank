@@ -77,8 +77,8 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 ## More Docs
 
 - [Troubleshooting](./docs/troubleshooting.md)
-- [How Memory Bank Works](./docs/how-it-works.md)
-- [Requirements and Cost](./docs/requirements-and-cost.md)
+- [Architecture](./docs/architecture.md)
+- [Requirements](./docs/requirements.md)
 - [Claude Code Guide](./docs/claude-code.md)
 - [Gemini CLI Guide](./docs/gemini-cli.md)
 - [OpenCode Guide](./docs/opencode.md)

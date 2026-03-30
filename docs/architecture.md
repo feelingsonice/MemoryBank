@@ -1,4 +1,4 @@
-# How Memory Bank Works
+# Architecture
 
 Memory Bank is a local memory service for coding agents.
 
@@ -93,7 +93,7 @@ That separation is what makes cross-agent memory possible. You can use one tool 
 
 ## Related Docs
 
-- [Requirements and Cost](./requirements-and-cost.md)
+- [Requirements](./requirements.md)
 - [Troubleshooting](./troubleshooting.md)
 - [Claude Code](./claude-code.md)
 - [Gemini CLI](./gemini-cli.md)
