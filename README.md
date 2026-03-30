@@ -1,5 +1,5 @@
 <h1>
-  <img src="./docs/logo.svg" alt="Memory Bank logo" width="42" align="absmiddle" />
+  <img src="./docs/logo.svg" alt="Memory Bank logo" width="88" align="absmiddle" />
   Memory Bank
 </h1>
 
