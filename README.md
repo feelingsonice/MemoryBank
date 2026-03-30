@@ -27,6 +27,12 @@ Currently supports:
 
 The intended default install path is the repository's GitHub Releases page. The user-facing install flow is the `mb` CLI plus the bootstrap installer at [`./install.sh`](./install.sh). The installer tracks the latest published release and downloads the correct tarball for the current supported macOS or Linux architecture.
 
+If you are developing locally and want the installer to build from this checkout instead of downloading a release artifact, use:
+
+```bash
+./install.sh --from-source
+```
+
 1. Run the installer.
 
 ```bash
@@ -83,7 +89,7 @@ Each GitHub Release currently publishes three platform-specific tarballs plus `S
 - `memory-bank-aarch64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS`
 
-These tarballs extract directly into the `~/.memory_bank/` app-root layout expected by `mb` and `install.sh`.
+These tarballs extract directly into the `~/.memory_bank/` app-root layout expected by `mb` and `install.sh`, including the local fallback copy of the setup model catalog under `config/setup-model-catalog.json`.
 
 Linux note: the release pipeline currently ships native `gnu` builds for modern glibc-based Linux distributions.
 
@@ -166,7 +172,10 @@ For most users, the only artifacts you need are:
 
 ## Build From Source
 
-Prebuilt binaries from GitHub Releases should be the easiest install path. If you want to build locally instead, this is the minimum you need.
+Prebuilt binaries from GitHub Releases should be the easiest install path. If you want to build locally instead, you have two good options:
+
+- `./install.sh --from-source` to build this checkout and install it into `~/.memory_bank` using the same layout as a release install
+- `cargo build --release --workspace` if you want the binaries only and plan to run them manually
 
 ### Requirements
 
@@ -181,6 +190,12 @@ Linux users may also need their distro's SQLite development package and `pkg-con
 
 ```bash
 cargo build --release --workspace
+```
+
+If you want the full managed install experience from a local checkout, including copying binaries and bundled assets into `~/.memory_bank`, run:
+
+```bash
+./install.sh --from-source
 ```
 
 Release binaries will be written to:
@@ -282,11 +297,11 @@ These variables configure the server's internal memory-analysis model. They do n
 | Provider | Required | Optional | Default model/value |
 | --- | --- | --- | --- |
 | Anthropic | `ANTHROPIC_API_KEY` | `MEMORY_BANK_LLM_MODEL` | `claude-sonnet-4-6` |
-| Gemini | `GEMINI_API_KEY` | `MEMORY_BANK_LLM_MODEL` | `gemini-2.5-flash` |
-| OpenAI | `OPENAI_API_KEY` | `MEMORY_BANK_LLM_MODEL` | `gpt-4o-mini` |
-| Ollama | none | `MEMORY_BANK_OLLAMA_URL`, `MEMORY_BANK_OLLAMA_MODEL` | `http://localhost:11434`, `qwen3:4b` |
+| Gemini | `GEMINI_API_KEY` | `MEMORY_BANK_LLM_MODEL` | `gemini-3-flash-preview` |
+| OpenAI | `OPENAI_API_KEY` | `MEMORY_BANK_LLM_MODEL` | `gpt-5-mini` |
+| Ollama | none | `MEMORY_BANK_OLLAMA_URL`, `MEMORY_BANK_OLLAMA_MODEL` | `http://localhost:11434`, `qwen3` |
 
-Ollama note: on startup the server verifies that the configured URL points at the native Ollama API root and that the configured model already exists locally.
+Ollama note: on startup the server verifies that the configured URL points at the native Ollama API root and that the configured model already exists locally. `mb setup` will try to read the installed model list from that Ollama daemon and let you pick from those local models first.
 
 ### Encoder Environment Variables
 
@@ -366,6 +381,7 @@ Memory Bank stores data under your home directory in a top-level `.memory_bank` 
 - Namespaces: `{home_dir}/.memory_bank/namespaces/<namespace>/`
 - Database: `{home_dir}/.memory_bank/namespaces/<namespace>/memory.db`
 - Model cache: `{home_dir}/.memory_bank/models/`
+- Setup model catalog fallback: `{home_dir}/.memory_bank/config/setup-model-catalog.json`
 
 Examples:
 

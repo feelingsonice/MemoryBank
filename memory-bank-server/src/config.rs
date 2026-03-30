@@ -89,7 +89,11 @@ impl LlmProviderConfig {
                 ),
             }),
             LlmProviderType::Ollama => Ok(Self::Ollama {
-                url: env_setting_or_default("MEMORY_BANK_OLLAMA_URL", None, DEFAULT_OLLAMA_URL),
+                url: env_setting_or_default(
+                    "MEMORY_BANK_OLLAMA_URL",
+                    settings.and_then(|s| s.ollama_url.as_deref()),
+                    DEFAULT_OLLAMA_URL,
+                ),
                 model: env_setting_or_default(
                     "MEMORY_BANK_OLLAMA_MODEL",
                     settings.and_then(|s| s.llm_model.as_deref()),
@@ -388,7 +392,7 @@ mod tests {
 
         unsafe {
             env::set_var("MEMORY_BANK_OLLAMA_URL", "http://127.0.0.1:11434");
-            env::set_var("MEMORY_BANK_OLLAMA_MODEL", "qwen3:8b");
+            env::set_var("MEMORY_BANK_OLLAMA_MODEL", "qwen3");
         }
 
         let config =
@@ -397,7 +401,7 @@ mod tests {
         assert!(matches!(
             config,
             LlmProviderConfig::Ollama { url, model }
-            if url == "http://127.0.0.1:11434" && model == "qwen3:8b"
+            if url == "http://127.0.0.1:11434" && model == "qwen3"
         ));
     }
 

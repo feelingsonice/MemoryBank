@@ -3,7 +3,13 @@ mod cli;
 use chrono::Local;
 use clap::Parser;
 use cli::{Cli, Command, ConfigCommand, InternalCommand, NamespaceCommand, ServiceCommand};
-use dialoguer::{Confirm, Input, MultiSelect, Password, Select};
+use inquire::ui::{Color, RenderConfig, StyleSheet, Styled};
+use inquire::validator::Validation;
+use inquire::{
+    Confirm, CustomType, InquireError, MultiSelect, Password, Select, Text,
+    set_global_render_config,
+};
+use jsonc_parser::{ParseOptions, parse_to_serde_value};
 use memory_bank_app::{
     AppConfigError, AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL,
     DEFAULT_GEMINI_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL,
@@ -14,11 +20,12 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const MB_BINARY_NAME: &str = "mb";
@@ -27,6 +34,10 @@ const HOOK_BINARY_NAME: &str = "memory-bank-hook";
 const MCP_PROXY_BINARY_NAME: &str = "memory-bank-mcp-proxy";
 const LAUNCHD_LABEL: &str = "com.memory-bank.mb";
 const SYSTEMD_UNIT_NAME: &str = "memory-bank.service";
+const REMOTE_MODEL_CATALOG_URL: &str =
+    "https://raw.githubusercontent.com/feelingsonice/MemoryBank/main/config/setup-model-catalog.json";
+const HEALTH_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn run() -> Result<(), AppError> {
     let cli = Cli::parse();
@@ -53,7 +64,9 @@ pub enum AppError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error("prompt failed: {0}")]
-    Prompt(#[from] dialoguer::Error),
+    Prompt(#[from] InquireError),
+    #[error("setup was canceled")]
+    SetupCanceled,
     #[error("unsupported platform '{0}'")]
     UnsupportedPlatform(String),
     #[error("command `{0}` failed: {1}")]
@@ -109,6 +122,66 @@ impl AgentKind {
     }
 }
 
+impl std::fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderChoice {
+    Anthropic,
+    Gemini,
+    OpenAi,
+    Ollama,
+}
+
+impl ProviderChoice {
+    fn all() -> Vec<Self> {
+        vec![Self::Anthropic, Self::Gemini, Self::OpenAi, Self::Ollama]
+    }
+
+    fn from_config_value(value: Option<&str>) -> Self {
+        match value {
+            Some("gemini") => Self::Gemini,
+            Some("open-ai") => Self::OpenAi,
+            Some("ollama") => Self::Ollama,
+            _ => Self::Anthropic,
+        }
+    }
+
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+            Self::OpenAi => "open-ai",
+            Self::Ollama => "ollama",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Gemini",
+            Self::OpenAi => "OpenAI",
+            Self::Ollama => "Ollama (local)",
+        };
+        f.write_str(label)
+    }
+}
+
+impl std::fmt::Display for ModelChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Preset(model) => f.write_str(model),
+            Self::Current(model) => write!(f, "Current saved model ({model})"),
+            Self::Custom => f.write_str("Enter a custom model..."),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagedPlatform {
     MacOs,
@@ -141,6 +214,21 @@ struct ServiceStatus {
     active: bool,
 }
 
+#[derive(Debug)]
+struct AgentSetupOutcome {
+    configured: Vec<AgentKind>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CommandOutcome {
+    program: String,
+    args: Vec<String>,
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ServerLaunchSpec {
     program: PathBuf,
@@ -149,64 +237,355 @@ struct ServerLaunchSpec {
     remove_env: Vec<&'static str>,
 }
 
-fn run_setup() -> Result<(), AppError> {
-    let paths = AppPaths::from_system()?;
-    paths.ensure_base_dirs()?;
-    materialize_install_artifacts(&paths)?;
-    ensure_path_entry(&paths)?;
+#[derive(Debug, Clone)]
+struct SetupAnswers {
+    namespace: Namespace,
+    provider: String,
+    model: String,
+    ollama_url: Option<String>,
+    autostart: bool,
+    selected_agents: Vec<AgentKind>,
+    secret_choice: SecretChoice,
+    advanced: AdvancedAnswers,
+}
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+struct ModelCatalog {
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderModelCatalog>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+struct ProviderModelCatalog {
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    #[serde(default)]
+    models: Vec<OllamaTagModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagModel {
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdvancedAnswers {
+    port: u16,
+    fastembed_model: String,
+    history_window_size: u32,
+    nearest_neighbor_count: i32,
+}
+
+#[derive(Debug, Clone)]
+enum SecretChoice {
+    NotRequired,
+    KeepStored {
+        key: &'static str,
+    },
+    ImportEnvironment {
+        key: &'static str,
+        value: String,
+    },
+    ReplaceWithEnvironment {
+        key: &'static str,
+        value: String,
+    },
+    ManualEntry {
+        key: &'static str,
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelChoice {
+    Preset(String),
+    Current(String),
+    Custom,
+}
+
+impl ModelChoice {
+    fn value(&self) -> Option<&str> {
+        match self {
+            Self::Preset(model) => Some(model.as_str()),
+            Self::Current(model) => Some(model.as_str()),
+            Self::Custom => None,
+        }
+    }
+}
+
+fn run_setup() -> Result<(), AppError> {
+    ensure_interactive_terminal()?;
+    configure_setup_rendering();
+
+    let paths = AppPaths::from_system()?;
+    let model_catalog = refresh_model_catalog(&paths);
     let mut settings = AppSettings::load(&paths)?;
     let mut secrets = SecretStore::load(&paths)?;
     let detected_agents = detect_installed_agents();
+    let answers = match collect_setup_answers(&settings, &secrets, &detected_agents, &model_catalog) {
+        Ok(Some(answers)) => answers,
+        Ok(None) | Err(AppError::SetupCanceled) => {
+            println!("Setup canceled. No changes were made.");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
 
-    let namespace = prompt_namespace(settings.active_namespace())?;
-    let provider = prompt_provider(
-        settings
-            .server
-            .as_ref()
-            .and_then(|server| server.llm_provider.clone())
-            .as_deref(),
-    )?;
-    let model = prompt_model(
-        &provider,
-        settings
-            .server
-            .as_ref()
-            .and_then(|server| server.llm_model.clone())
-            .as_deref(),
-    )?;
-    let autostart = prompt_autostart(
-        settings
-            .service
-            .as_ref()
-            .and_then(|service| service.autostart),
-    )?;
-    let selected_agents = prompt_agents(&detected_agents)?;
+    println!();
+    println!("{}", render_review_summary(&answers));
+    println!();
 
-    configure_provider_secret(&provider, &mut secrets)?;
-    update_settings_for_setup(
-        &mut settings,
-        namespace.clone(),
-        &provider,
-        &model,
-        autostart,
-        &selected_agents,
-    );
-    settings.save(&paths)?;
-    secrets.save(&paths)?;
+    let confirm = Confirm::new("Apply these changes now?")
+        .with_default(true)
+        .with_help_message(
+            "Nothing under ~/.memory_bank or your agent config files will change until you confirm.",
+        )
+        .prompt_skippable()?;
+    if !matches!(confirm, Some(true)) {
+        println!("Setup canceled. No changes were made.");
+        return Ok(());
+    }
 
-    configure_selected_agents(&paths, &settings, &selected_agents)?;
-    install_service(&paths, &settings)?;
-    start_service(&paths)?;
-
-    let health = fetch_health(&settings)?;
+    let (health, agent_outcome) = apply_setup_answers(&paths, &mut settings, &mut secrets, &answers)?;
+    println!();
     println!(
         "Memory Bank is ready on {} using namespace `{}` and provider `{}`.",
         default_server_url(&settings),
         health.namespace,
         health.llm_provider
     );
+    if !agent_outcome.warnings.is_empty() {
+        println!("Some agent integrations need attention:");
+        for warning in agent_outcome.warnings {
+            println!("  - {warning}");
+        }
+    }
     Ok(())
+}
+
+fn ensure_interactive_terminal() -> Result<(), AppError> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(AppError::Message(
+            "mb setup requires an interactive terminal. Run it in a TTY or use `mb config` for manual changes.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn configure_setup_rendering() {
+    set_global_render_config(setup_render_config());
+}
+
+fn setup_render_config() -> RenderConfig<'static> {
+    let mut config = if no_color_requested() {
+        RenderConfig::empty()
+    } else {
+        RenderConfig::default_colored()
+    };
+    config.prompt_prefix = Styled::new("mb>");
+    config.answered_prompt_prefix = Styled::new("->");
+    config.highlighted_option_prefix = Styled::new(">");
+    config.selected_checkbox = Styled::new("[x]");
+    config.unselected_checkbox = Styled::new("[ ]");
+    config.help_message = StyleSheet::new().with_fg(Color::DarkGrey);
+    config.answer = StyleSheet::new().with_fg(Color::LightCyan);
+    config.selected_option = Some(StyleSheet::new().with_fg(Color::LightBlue));
+    config
+}
+
+fn no_color_requested() -> bool {
+    std::env::var_os("NO_COLOR").is_some()
+        || matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"))
+}
+
+fn collect_setup_answers(
+    settings: &AppSettings,
+    secrets: &SecretStore,
+    detected_agents: &[AgentKind],
+    model_catalog: &ModelCatalog,
+) -> Result<Option<SetupAnswers>, AppError> {
+    print_setup_intro();
+
+    println!("Core setup");
+    let namespace = match prompt_namespace(settings.active_namespace())? {
+        Some(namespace) => namespace,
+        None => return Ok(None),
+    };
+    let provider = match prompt_provider(
+        settings
+            .server
+            .as_ref()
+            .and_then(|server| server.llm_provider.as_deref()),
+    )? {
+        Some(provider) => provider,
+        None => return Ok(None),
+    };
+    let current_ollama_url = settings
+        .server
+        .as_ref()
+        .and_then(|server| server.ollama_url.as_deref());
+    let current_model = settings
+        .server
+        .as_ref()
+        .and_then(|server| server.llm_model.as_deref());
+    let (ollama_url, model) = if provider == "ollama" {
+        let ollama_url = match prompt_ollama_url(current_ollama_url)? {
+            Some(url) => url,
+            None => return Ok(None),
+        };
+        let model = match prompt_ollama_model(current_model, &ollama_url, model_catalog)? {
+            Some(model) => model,
+            None => return Ok(None),
+        };
+        (Some(ollama_url), model)
+    } else {
+        let model = match prompt_model(&provider, current_model, model_catalog)? {
+            Some(model) => model,
+            None => return Ok(None),
+        };
+        (None, model)
+    };
+    let autostart = match prompt_autostart(
+        settings
+            .service
+            .as_ref()
+            .and_then(|service| service.autostart),
+    )? {
+        Some(autostart) => autostart,
+        None => return Ok(None),
+    };
+
+    println!();
+    println!("Agent integrations");
+    println!("Choose one or more agents to configure in this setup run.");
+    let selected_agents = match prompt_agents(detected_agents)? {
+        Some(selected_agents) => selected_agents,
+        None => return Ok(None),
+    };
+    println!("Selected agents: {}", render_agents_summary(&selected_agents));
+
+    println!();
+    println!("Secrets");
+    let secret_choice = match collect_secret_choice(&provider, secrets)? {
+        Some(secret_choice) => secret_choice,
+        None => return Ok(None),
+    };
+
+    let mut advanced = AdvancedAnswers::from_settings(settings);
+    let has_existing_advanced = advanced.has_overrides();
+    println!();
+    println!("Advanced settings");
+    let configure_advanced = match Confirm::new("Configure advanced settings?")
+        .with_default(has_existing_advanced)
+        .with_help_message(
+            "Most users can skip this. You can change these later with `mb config` if needed.",
+        )
+        .prompt_skippable()?
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    if configure_advanced {
+        advanced = match prompt_advanced_settings(settings)? {
+            Some(advanced) => advanced,
+            None => return Ok(None),
+        };
+    }
+
+    Ok(Some(SetupAnswers {
+        namespace,
+        provider,
+        model,
+        ollama_url,
+        autostart,
+        selected_agents,
+        secret_choice,
+        advanced,
+    }))
+}
+
+fn print_setup_intro() {
+    println!("Memory Bank Setup");
+    println!("Configure the local Memory Bank service and any detected agent integrations.");
+    println!("You will review everything before any changes are applied.");
+    println!();
+}
+
+fn apply_setup_answers(
+    paths: &AppPaths,
+    settings: &mut AppSettings,
+    secrets: &mut SecretStore,
+    answers: &SetupAnswers,
+) -> Result<(HealthCheck, AgentSetupOutcome), AppError> {
+    let total_steps = 6;
+    let preview_settings = build_settings_for_answers(settings, answers, &[]);
+
+    apply_step(1, total_steps, "Install artifacts and update PATH", || {
+        paths.ensure_base_dirs()?;
+        materialize_install_artifacts(paths)?;
+        ensure_path_entry(paths)
+    })?;
+
+    let agent_outcome = {
+        print_step_start(2, total_steps, "Configure selected agents")?;
+        let outcome = configure_selected_agents(paths, &preview_settings, &answers.selected_agents)?;
+        if answers.selected_agents.is_empty() {
+            println!("done (no agents selected)");
+        } else if outcome.warnings.is_empty() {
+            println!("done");
+        } else {
+            println!("done with warnings");
+        }
+        outcome
+    };
+
+    let final_settings = build_settings_for_answers(settings, answers, &agent_outcome.configured);
+    *settings = final_settings;
+
+    apply_step(3, total_steps, "Write settings and secrets", || {
+        apply_secret_choice(secrets, &answers.secret_choice);
+        settings.save(paths)?;
+        secrets.save(paths)?;
+        Ok(())
+    })?;
+
+    apply_step(4, total_steps, "Install managed service", || {
+        install_service(paths, settings)
+    })?;
+    apply_step(5, total_steps, "Start managed service", || start_service(paths))?;
+    let health = apply_step(6, total_steps, "Wait for service health", || {
+        wait_for_health(settings, HEALTH_STARTUP_TIMEOUT, HEALTH_POLL_INTERVAL)
+    })?;
+
+    Ok((health, agent_outcome))
+}
+
+fn print_step_start(index: usize, total: usize, label: &str) -> Result<(), AppError> {
+    print!("[{index}/{total}] {label}... ");
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn apply_step<T, F>(index: usize, total: usize, label: &str, action: F) -> Result<T, AppError>
+where
+    F: FnOnce() -> Result<T, AppError>,
+{
+    print_step_start(index, total, label)?;
+    match action() {
+        Ok(value) => {
+            println!("done");
+            Ok(value)
+        }
+        Err(error) => {
+            println!("failed");
+            Err(error)
+        }
+    }
 }
 
 fn run_status() -> Result<(), AppError> {
@@ -311,7 +690,7 @@ fn run_doctor(fix: bool) -> Result<(), AppError> {
     }
 
     if fix {
-        let health = fetch_health(&settings)?;
+        let health = wait_for_health(&settings, HEALTH_STARTUP_TIMEOUT, HEALTH_POLL_INTERVAL)?;
         println!(
             "Post-fix health is ok on {} for namespace `{}`.",
             default_server_url(&settings),
@@ -444,127 +823,321 @@ fn run_internal_server() -> Result<(), AppError> {
     Err(AppError::Io(command.exec()))
 }
 
-fn prompt_namespace(current: Namespace) -> Result<Namespace, AppError> {
-    let input: String = Input::new()
-        .with_prompt("Active namespace")
-        .default(current.to_string())
-        .interact_text()?;
-    Ok(Namespace::new(input))
+fn prompt_namespace(current: Namespace) -> Result<Option<Namespace>, AppError> {
+    let value = Text::new("Active namespace")
+        .with_default(current.to_string().as_str())
+        .with_help_message(
+            "This is the user-level memory space the managed service will run against.",
+        )
+        .with_placeholder("default")
+        .prompt_skippable()?;
+    Ok(value.map(Namespace::new))
 }
 
-fn prompt_provider(current: Option<&str>) -> Result<String, AppError> {
-    let choices = ["anthropic", "gemini", "open-ai", "ollama"];
-    let default_index = current
-        .and_then(|value| choices.iter().position(|choice| choice == &value))
+fn prompt_provider(current: Option<&str>) -> Result<Option<String>, AppError> {
+    let options = ProviderChoice::all();
+    let default_index = options
+        .iter()
+        .position(|choice| *choice == ProviderChoice::from_config_value(current))
         .unwrap_or(0);
-    let selection = Select::new()
-        .with_prompt("LLM provider")
-        .items(&choices)
-        .default(default_index)
-        .interact()?;
-    Ok(choices[selection].to_string())
+    let choice = Select::new("LLM provider", options)
+        .with_starting_cursor(default_index)
+        .with_page_size(4)
+        .with_help_message(
+            "This powers Memory Bank's internal memory analysis, not the coding agent you use directly.",
+        )
+        .prompt_skippable()?;
+    Ok(choice.map(|choice| choice.as_config_value().to_string()))
 }
 
-fn prompt_model(provider: &str, current: Option<&str>) -> Result<String, AppError> {
-    let default_model = current
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_model_for_provider(provider).to_string());
-    let input: String = Input::new()
-        .with_prompt(format!("Model for {provider}"))
-        .default(default_model)
-        .interact_text()?;
-    Ok(input)
-}
-
-fn prompt_autostart(current: Option<bool>) -> Result<bool, AppError> {
-    Confirm::new()
-        .with_prompt("Start Memory Bank automatically on login")
-        .default(current.unwrap_or(true))
-        .interact()
+fn prompt_ollama_url(current: Option<&str>) -> Result<Option<String>, AppError> {
+    Text::new("Ollama URL")
+        .with_default(current.unwrap_or(memory_bank_app::DEFAULT_OLLAMA_URL))
+        .with_help_message(
+            "Memory Bank will query this Ollama daemon for the local models you already have installed.",
+        )
+        .with_placeholder("http://localhost:11434")
+        .prompt_skippable()
         .map_err(AppError::from)
 }
 
-fn prompt_agents(detected: &[AgentKind]) -> Result<Vec<AgentKind>, AppError> {
-    if detected.is_empty() {
-        return Ok(Vec::new());
+fn prompt_model(
+    provider: &str,
+    current: Option<&str>,
+    catalog: &ModelCatalog,
+) -> Result<Option<String>, AppError> {
+    let choices = model_choices_for_provider(provider, current, catalog);
+    let preferred = current
+        .filter(|value| !value.is_empty())
+        .or_else(|| Some(default_model_for_provider(provider)));
+    let default_index = preferred
+        .and_then(|value| choices.iter().position(|choice| choice.value() == Some(value)))
+        .unwrap_or(0);
+    let prompt = format!("Model for {}", ProviderChoice::from_config_value(Some(provider)));
+    let selection = Select::new(&prompt, choices)
+        .with_starting_cursor(default_index)
+        .with_page_size(8)
+        .with_help_message(
+            "Choose a popular model ID for this provider. If you need a different one, pick the custom option and type it exactly.",
+        )
+        .prompt_skippable()?;
+
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+
+    match selection {
+        ModelChoice::Preset(model) => Ok(Some(model)),
+        ModelChoice::Current(model) => Ok(Some(model)),
+        ModelChoice::Custom => {
+            let default_model = current
+                .map(str::to_owned)
+                .unwrap_or_else(|| default_model_for_provider(provider).to_string());
+            let value = Text::new("Custom model string")
+                .with_default(default_model.as_str())
+                .with_help_message("Enter the exact model ID for the selected provider.")
+                .prompt_skippable()?;
+            Ok(value)
+        }
     }
-
-    let labels: Vec<&str> = detected.iter().map(|agent| agent.display_name()).collect();
-    let defaults = vec![true; labels.len()];
-    let selected = MultiSelect::new()
-        .with_prompt("Configure these detected agents")
-        .items(&labels)
-        .defaults(&defaults)
-        .interact()?;
-
-    Ok(selected.into_iter().map(|index| detected[index]).collect())
 }
 
-fn configure_provider_secret(provider: &str, secrets: &mut SecretStore) -> Result<(), AppError> {
+fn prompt_ollama_model(
+    current: Option<&str>,
+    ollama_url: &str,
+    catalog: &ModelCatalog,
+) -> Result<Option<String>, AppError> {
+    match fetch_ollama_models_for_setup(ollama_url) {
+        Ok(models) if !models.is_empty() => {
+            let choices = model_choices_from_values(&models, current);
+            let preferred = current
+                .filter(|value| !value.is_empty())
+                .or_else(|| Some(default_model_for_provider("ollama")));
+            let default_index = preferred
+                .and_then(|value| choices.iter().position(|choice| choice.value() == Some(value)))
+                .unwrap_or(0);
+            let selection = Select::new("Model for Ollama (installed locally)", choices)
+                .with_starting_cursor(default_index)
+                .with_page_size(10)
+                .with_help_message(
+                    "These models were discovered from your Ollama daemon. If yours is missing, choose the custom option.",
+                )
+                .prompt_skippable()?;
+
+            let Some(selection) = selection else {
+                return Ok(None);
+            };
+
+            match selection {
+                ModelChoice::Preset(model) | ModelChoice::Current(model) => Ok(Some(model)),
+                ModelChoice::Custom => prompt_custom_ollama_model(current, catalog),
+            }
+        }
+        Ok(_) => {
+            println!(
+                "No local Ollama models were detected at {}.",
+                ollama_url.trim_end_matches('/')
+            );
+            prompt_custom_ollama_model(current, catalog)
+        }
+        Err(error) => {
+            println!("Could not query Ollama at {ollama_url}: {error}");
+            prompt_custom_ollama_model(current, catalog)
+        }
+    }
+}
+
+fn prompt_custom_ollama_model(
+    current: Option<&str>,
+    catalog: &ModelCatalog,
+) -> Result<Option<String>, AppError> {
+    let suggestions = catalog.models_for_provider("ollama");
+    let help = if suggestions.is_empty() {
+        "Enter the local Ollama model name you want Memory Bank to use."
+    } else {
+        "Enter the local Ollama model name you want Memory Bank to use. Common pulls: qwen3, deepseek-r1, llama3.1, qwen2.5-coder."
+    };
+    Text::new("Ollama model name")
+        .with_default(current.unwrap_or(default_model_for_provider("ollama")))
+        .with_help_message(help)
+        .prompt_skippable()
+        .map_err(AppError::from)
+}
+
+fn prompt_autostart(current: Option<bool>) -> Result<Option<bool>, AppError> {
+    Confirm::new("Start Memory Bank automatically on login?")
+        .with_default(current.unwrap_or(true))
+        .with_help_message("This installs a user-scoped background service for Memory Bank.")
+        .prompt_skippable()
+        .map_err(AppError::from)
+}
+
+fn prompt_agents(detected: &[AgentKind]) -> Result<Option<Vec<AgentKind>>, AppError> {
+    if detected.is_empty() {
+        println!(
+            "No supported agents were detected on PATH. You can rerun `mb setup` later after installing Claude Code, Gemini CLI, OpenCode, or OpenClaw."
+        );
+        return Ok(Some(Vec::new()));
+    }
+
+    let selected = MultiSelect::new("Select which detected agents to configure now", detected.to_vec())
+        .with_all_selected_by_default()
+        .with_page_size(detected.len().min(7))
+        .with_help_message(
+            "Use Space to toggle the highlighted agent. Press Enter to continue with all checked agents.",
+        )
+        .prompt_skippable()?;
+    Ok(selected)
+}
+
+fn collect_secret_choice(
+    provider: &str,
+    secrets: &SecretStore,
+) -> Result<Option<SecretChoice>, AppError> {
     let Some(secret_key) = env_key_for_provider(provider) else {
-        return Ok(());
+        return Ok(Some(SecretChoice::NotRequired));
     };
 
     let env_value = std::env::var(secret_key).ok();
     let stored_value = secrets.get(secret_key).map(str::to_owned);
 
-    match (stored_value.as_deref(), env_value.as_deref()) {
-        (None, Some(env_value)) => {
-            let import = Confirm::new()
-                .with_prompt(format!(
-                    "Use the existing {secret_key} from your current environment for Memory Bank?"
-                ))
-                .default(true)
-                .interact()?;
-            if import {
-                secrets.set(secret_key, env_value);
-                return Ok(());
-            }
-        }
+    let choice = match (stored_value.as_deref(), env_value.as_deref()) {
         (Some(stored_value), Some(env_value)) if stored_value != env_value => {
-            let replace = Confirm::new()
-                .with_prompt(format!(
-                    "A different {secret_key} is already stored. Replace it with the current environment value?"
-                ))
-                .default(false)
-                .interact()?;
-            if replace {
-                secrets.set(secret_key, env_value);
-                return Ok(());
+            let replace = Confirm::new(&format!(
+                "Replace the stored {secret_key} with the value from your current shell?"
+            ))
+            .with_default(false)
+            .with_help_message(
+                "The managed service always reads ~/.memory_bank/secrets.env, not your shell session.",
+            )
+            .prompt_skippable()?;
+            match replace {
+                Some(true) => SecretChoice::ReplaceWithEnvironment {
+                    key: secret_key,
+                    value: env_value.to_string(),
+                },
+                Some(false) => SecretChoice::KeepStored { key: secret_key },
+                None => return Ok(None),
             }
         }
-        (Some(_), _) => return Ok(()),
-        (None, None) => {}
-    }
+        (Some(_), _) => SecretChoice::KeepStored { key: secret_key },
+        (None, Some(env_value)) => {
+            let import = Confirm::new(&format!(
+                "Import {secret_key} from your current shell into Memory Bank?"
+            ))
+            .with_default(true)
+            .with_help_message(
+                "This copies the key into ~/.memory_bank/secrets.env so the managed service can use it later.",
+            )
+            .prompt_skippable()?;
+            match import {
+                Some(true) => SecretChoice::ImportEnvironment {
+                    key: secret_key,
+                    value: env_value.to_string(),
+                },
+                Some(false) => manual_secret_choice(secret_key)?,
+                None => return Ok(None),
+            }
+        }
+        (None, None) => manual_secret_choice(secret_key)?,
+    };
 
-    let entered = Password::new()
-        .with_prompt(format!("Enter {secret_key} for Memory Bank"))
-        .allow_empty_password(false)
-        .interact()?;
-    if entered.trim().is_empty() {
-        return Err(AppError::MissingProviderSecret(secret_key));
-    }
-    secrets.set(secret_key, entered);
-    Ok(())
+    Ok(Some(choice))
 }
 
-fn update_settings_for_setup(
-    settings: &mut AppSettings,
-    namespace: Namespace,
-    provider: &str,
-    model: &str,
-    autostart: bool,
-    selected_agents: &[AgentKind],
-) {
+fn manual_secret_choice(secret_key: &'static str) -> Result<SecretChoice, AppError> {
+    let entered = Password::new(&format!("Enter {secret_key}"))
+        .with_help_message(
+            "This will be stored in ~/.memory_bank/secrets.env for the managed service.",
+        )
+        .without_confirmation()
+        .prompt_skippable()?;
+    match entered {
+        Some(value) if !value.trim().is_empty() => Ok(SecretChoice::ManualEntry {
+            key: secret_key,
+            value,
+        }),
+        Some(_) => Err(AppError::MissingProviderSecret(secret_key)),
+        None => Err(AppError::SetupCanceled),
+    }
+}
+
+fn prompt_advanced_settings(settings: &AppSettings) -> Result<Option<AdvancedAnswers>, AppError> {
+    let current = AdvancedAnswers::from_settings(settings);
+
+    let port = match CustomType::<u16>::new("Port")
+        .with_default(current.port)
+        .with_help_message("Local HTTP port for /mcp, /ingest, and /healthz.")
+        .prompt_skippable()?
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    let fastembed_model = match Text::new("FastEmbed model override")
+        .with_default(current.fastembed_model.as_str())
+        .with_help_message(
+            "Leave this at the default Jina model unless you know you want a different FastEmbed-compatible model.",
+        )
+        .prompt_skippable()?
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    let history_window_size = match CustomType::<u32>::new("History window size")
+        .with_default(current.history_window_size)
+        .with_help_message("0 means unlimited prior turns during memory analysis.")
+        .prompt_skippable()?
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    let nearest_neighbor_count = match CustomType::<i32>::new("Nearest neighbor count")
+        .with_default(current.nearest_neighbor_count)
+        .with_help_message("How many nearest matches to load during recall and graph updates.")
+        .with_validator(|value: &i32| {
+            Ok(if *value >= 1 {
+                Validation::Valid
+            } else {
+                Validation::Invalid("Nearest neighbor count must be at least 1".into())
+            })
+        })
+        .prompt_skippable()?
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+
+    Ok(Some(AdvancedAnswers {
+        port,
+        fastembed_model,
+        history_window_size,
+        nearest_neighbor_count,
+    }))
+}
+
+fn build_settings_for_answers(
+    current: &AppSettings,
+    answers: &SetupAnswers,
+    configured_agents: &[AgentKind],
+) -> AppSettings {
+    let mut settings = current.clone();
     settings.schema_version = SETTINGS_SCHEMA_VERSION;
-    settings.active_namespace = if namespace.as_ref() == DEFAULT_NAMESPACE_NAME {
+    settings.active_namespace = if answers.namespace.as_ref() == DEFAULT_NAMESPACE_NAME {
         None
     } else {
-        Some(namespace.to_string())
+        Some(answers.namespace.to_string())
     };
 
     let mut service = settings.service.clone().unwrap_or_default();
-    service.autostart = autostart.then_some(true);
+    service.autostart = answers.autostart.then_some(true);
+    service.port = if answers.advanced.port == DEFAULT_PORT {
+        None
+    } else {
+        Some(answers.advanced.port)
+    };
     if service.is_empty() {
         settings.service = None;
     } else {
@@ -572,16 +1145,39 @@ fn update_settings_for_setup(
     }
 
     let mut server = settings.server.clone().unwrap_or_default();
-    server.llm_provider = if provider == "anthropic" {
+    server.llm_provider = if answers.provider == "anthropic" {
         None
     } else {
-        Some(provider.to_string())
+        Some(answers.provider.clone())
     };
-    let default_model = default_model_for_provider(provider);
-    server.llm_model = if model == default_model {
+    let default_model = default_model_for_provider(&answers.provider);
+    server.llm_model = if answers.model == default_model {
         None
     } else {
-        Some(model.to_string())
+        Some(answers.model.clone())
+    };
+    server.ollama_url = if answers.provider == "ollama" {
+        match answers.ollama_url.as_deref() {
+            Some(url) if url != memory_bank_app::DEFAULT_OLLAMA_URL => Some(url.to_string()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    server.fastembed_model = if answers.advanced.fastembed_model == DEFAULT_FASTEMBED_MODEL {
+        None
+    } else {
+        Some(answers.advanced.fastembed_model.clone())
+    };
+    server.history_window_size = if answers.advanced.history_window_size == 0 {
+        None
+    } else {
+        Some(answers.advanced.history_window_size)
+    };
+    server.nearest_neighbor_count = if answers.advanced.nearest_neighbor_count == 10 {
+        None
+    } else {
+        Some(answers.advanced.nearest_neighbor_count)
     };
     if server.is_empty() {
         settings.server = None;
@@ -591,18 +1187,137 @@ fn update_settings_for_setup(
 
     settings.integrations = Some(IntegrationsSettings {
         claude_code: Some(IntegrationState {
-            configured: selected_agents.contains(&AgentKind::ClaudeCode),
+            configured: configured_agents.contains(&AgentKind::ClaudeCode),
         }),
         gemini_cli: Some(IntegrationState {
-            configured: selected_agents.contains(&AgentKind::GeminiCli),
+            configured: configured_agents.contains(&AgentKind::GeminiCli),
         }),
         opencode: Some(IntegrationState {
-            configured: selected_agents.contains(&AgentKind::OpenCode),
+            configured: configured_agents.contains(&AgentKind::OpenCode),
         }),
         openclaw: Some(IntegrationState {
-            configured: selected_agents.contains(&AgentKind::OpenClaw),
+            configured: configured_agents.contains(&AgentKind::OpenClaw),
         }),
     });
+
+    settings
+}
+
+fn apply_secret_choice(secrets: &mut SecretStore, choice: &SecretChoice) {
+    match choice {
+        SecretChoice::NotRequired | SecretChoice::KeepStored { .. } => {}
+        SecretChoice::ImportEnvironment { key, value }
+        | SecretChoice::ReplaceWithEnvironment { key, value }
+        | SecretChoice::ManualEntry { key, value } => {
+            secrets.set(*key, value.clone());
+        }
+    }
+}
+
+fn render_review_summary(answers: &SetupAnswers) -> String {
+    let mut lines = vec![
+        "Setup review".to_string(),
+        format!("  Namespace: {}", answers.namespace),
+        format!("  Provider: {}", ProviderChoice::from_config_value(Some(&answers.provider))),
+        format!("  Model: {}", answers.model),
+        format!("  Autostart: {}", yes_no(answers.autostart)),
+        format!("  Agents: {}", render_agents_summary(&answers.selected_agents)),
+        format!("  Secret: {}", answers.secret_choice.summary()),
+    ];
+
+    if let Some(url) = answers.ollama_url.as_deref() {
+        lines.push(format!("  Ollama URL: {url}"));
+    }
+
+    let overrides = answers.advanced.override_lines();
+    if !overrides.is_empty() {
+        lines.push("  Advanced overrides:".to_string());
+        for line in overrides {
+            lines.push(format!("    {line}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn render_agents_summary(agents: &[AgentKind]) -> String {
+    if agents.is_empty() {
+        "none selected".to_string()
+    } else {
+        agents
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl AdvancedAnswers {
+    fn from_settings(settings: &AppSettings) -> Self {
+        let server = settings.server.as_ref();
+        Self {
+            port: settings.resolved_port(),
+            fastembed_model: server
+                .and_then(|server| server.fastembed_model.clone())
+                .unwrap_or_else(|| DEFAULT_FASTEMBED_MODEL.to_string()),
+            history_window_size: server
+                .and_then(|server| server.history_window_size)
+                .unwrap_or(0),
+            nearest_neighbor_count: server
+                .and_then(|server| server.nearest_neighbor_count)
+                .unwrap_or(10),
+        }
+    }
+
+    fn has_overrides(&self) -> bool {
+        self.port != DEFAULT_PORT
+            || self.fastembed_model != DEFAULT_FASTEMBED_MODEL
+            || self.history_window_size != 0
+            || self.nearest_neighbor_count != 10
+    }
+
+    fn override_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.port != DEFAULT_PORT {
+            lines.push(format!("Port: {}", self.port));
+        }
+        if self.fastembed_model != DEFAULT_FASTEMBED_MODEL {
+            lines.push(format!("FastEmbed model: {}", self.fastembed_model));
+        }
+        if self.history_window_size != 0 {
+            lines.push(format!(
+                "History window size: {}",
+                self.history_window_size
+            ));
+        }
+        if self.nearest_neighbor_count != 10 {
+            lines.push(format!(
+                "Nearest neighbor count: {}",
+                self.nearest_neighbor_count
+            ));
+        }
+        lines
+    }
+}
+
+impl SecretChoice {
+    fn summary(&self) -> String {
+        match self {
+            Self::NotRequired => "Not required for Ollama".to_string(),
+            Self::KeepStored { key } => {
+                format!("Keep the existing {key} from ~/.memory_bank/secrets.env")
+            }
+            Self::ImportEnvironment { key, .. } => {
+                format!("Import {key} from the current shell")
+            }
+            Self::ReplaceWithEnvironment { key, .. } => {
+                format!("Replace the stored {key} with the current shell value")
+            }
+            Self::ManualEntry { key, .. } => {
+                format!("Store a newly entered {key} in ~/.memory_bank/secrets.env")
+            }
+        }
+    }
 }
 
 fn detect_installed_agents() -> Vec<AgentKind> {
@@ -651,27 +1366,30 @@ fn install_assets(paths: &AppPaths) -> Result<(), AppError> {
         .join("opencode")
         .join("memory-bank.js");
     let openclaw_target = paths.integrations_dir.join("openclaw").join("memory-bank");
+    let model_catalog_target = &paths.model_catalog_file;
 
-    if opencode_target.exists() && openclaw_target.exists() {
+    if opencode_target.exists() && openclaw_target.exists() && model_catalog_target.exists() {
         return Ok(());
     }
 
     let repo_root = find_repo_root().ok_or_else(|| {
         AppError::Message(
-            "failed to locate repo assets for OpenCode/OpenClaw integration install".to_string(),
+            "failed to locate repo assets for installation".to_string(),
         )
     })?;
     let opencode_source = repo_root.join(".opencode/plugins/memory-bank.js");
     let openclaw_source = repo_root.join(".openclaw/extensions/memory-bank");
+    let model_catalog_source = repo_root.join("config/setup-model-catalog.json");
 
-    if !opencode_source.exists() || !openclaw_source.exists() {
+    if !opencode_source.exists() || !openclaw_source.exists() || !model_catalog_source.exists() {
         return Err(AppError::Message(
-            "repo asset sources for OpenCode/OpenClaw are missing".to_string(),
+            "repo asset sources for installation are missing".to_string(),
         ));
     }
 
     copy_if_needed(&opencode_source, &opencode_target)?;
     copy_dir_recursive(&openclaw_source, &openclaw_target)?;
+    copy_if_needed(&model_catalog_source, model_catalog_target)?;
     Ok(())
 }
 
@@ -713,7 +1431,7 @@ fn copy_if_needed(source: &Path, target: &Path) -> Result<(), AppError> {
     }
 
     fs::copy(source, target)?;
-    let permissions = fs::Permissions::from_mode(0o755);
+    let permissions = source.metadata()?.permissions();
     fs::set_permissions(target, permissions)?;
 
     Ok(())
@@ -764,33 +1482,32 @@ fn configure_selected_agents(
     paths: &AppPaths,
     settings: &AppSettings,
     selected_agents: &[AgentKind],
-) -> Result<(), AppError> {
+) -> Result<AgentSetupOutcome, AppError> {
     let server_url = default_server_url(settings);
+    let mut configured = Vec::new();
+    let mut warnings = Vec::new();
+
     for agent in selected_agents {
-        match agent {
-            AgentKind::ClaudeCode => configure_claude(paths, &server_url)?,
-            AgentKind::GeminiCli => configure_gemini(paths, &server_url)?,
-            AgentKind::OpenCode => configure_opencode(paths, &server_url)?,
-            AgentKind::OpenClaw => configure_openclaw(paths, &server_url)?,
+        let result = match agent {
+            AgentKind::ClaudeCode => configure_claude(paths, &server_url),
+            AgentKind::GeminiCli => configure_gemini(paths, &server_url),
+            AgentKind::OpenCode => configure_opencode(paths, &server_url),
+            AgentKind::OpenClaw => configure_openclaw(paths, &server_url),
+        };
+        match result {
+            Ok(()) => configured.push(*agent),
+            Err(error) => warnings.push(format!("{}: {}", agent.display_name(), error)),
         }
     }
-    Ok(())
+
+    Ok(AgentSetupOutcome {
+        configured,
+        warnings,
+    })
 }
 
 fn configure_claude(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
-    run_command(
-        "claude",
-        &[
-            "mcp",
-            "add",
-            "--transport",
-            "http",
-            "--scope",
-            "user",
-            "memory-bank",
-            &format!("{server_url}/mcp"),
-        ],
-    )?;
+    ensure_claude_user_mcp(server_url)?;
 
     let settings_path = paths.home_dir.join(".claude/settings.json");
     let mut root = load_json_config(&settings_path)?;
@@ -808,20 +1525,6 @@ fn configure_claude(paths: &AppPaths, server_url: &str) -> Result<(), AppError> 
 }
 
 fn configure_gemini(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
-    run_command(
-        "gemini",
-        &[
-            "mcp",
-            "add",
-            "--scope",
-            "user",
-            "--transport",
-            "http",
-            "memory-bank",
-            &format!("{server_url}/mcp"),
-        ],
-    )?;
-
     let settings_path = paths.home_dir.join(".gemini/settings.json");
     let mut root = load_json_config(&settings_path)?;
     ensure_object(&mut root);
@@ -884,22 +1587,6 @@ fn configure_opencode(paths: &AppPaths, server_url: &str) -> Result<(), AppError
 
 fn configure_openclaw(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
     let extension_path = paths.integrations_dir.join("openclaw/memory-bank");
-    run_command(
-        "openclaw",
-        &[
-            "plugins",
-            "install",
-            "-l",
-            extension_path.to_string_lossy().as_ref(),
-        ],
-    )?;
-    let command_json = format!(
-        "{{\"command\":\"{}\",\"args\":[\"--server-url\",\"{}\"]}}",
-        paths.binary_path(MCP_PROXY_BINARY_NAME).display(),
-        server_url
-    );
-    run_command("openclaw", &["mcp", "set", "memory-bank", &command_json])?;
-
     let settings_path = paths.home_dir.join(".openclaw/openclaw.json");
     let mut root = load_json_config(&settings_path)?;
     ensure_object(&mut root);
@@ -924,6 +1611,13 @@ fn configure_openclaw(paths: &AppPaths, server_url: &str) -> Result<(), AppError
     );
 
     let plugins = object_mut(object_mut(&mut root)?.get_mut("plugins").expect("plugins"))?;
+    plugins
+        .entry("load".to_string())
+        .or_insert_with(|| json!({}));
+    upsert_openclaw_plugin_load_path(
+        object_mut(plugins.get_mut("load").expect("load"))?,
+        extension_path.to_string_lossy().as_ref(),
+    )?;
     plugins
         .entry("entries".to_string())
         .or_insert_with(|| json!({}));
@@ -1077,6 +1771,31 @@ fn fetch_health(settings: &AppSettings) -> Result<HealthCheck, AppError> {
         .map_err(|error| AppError::Health(error.to_string()))
 }
 
+fn wait_for_health(
+    settings: &AppSettings,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<HealthCheck, AppError> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match fetch_health(settings) {
+            Ok(health) => return Ok(health),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(AppError::Health(format!(
+                        "service did not become healthy within {}s: {}",
+                        timeout.as_secs(),
+                        error
+                    )));
+                }
+            }
+        }
+
+        thread::sleep(poll_interval);
+    }
+}
+
 fn tail_log_file(path: &Path, follow: bool) -> Result<(), AppError> {
     let mut command = ProcessCommand::new("tail");
     if follow {
@@ -1137,6 +1856,9 @@ fn build_server_launch_spec(
         "ollama" => {
             if let Some(model) = server_settings.llm_model {
                 env.insert("MEMORY_BANK_OLLAMA_MODEL".to_string(), model);
+            }
+            if let Some(url) = server_settings.ollama_url {
+                env.insert("MEMORY_BANK_OLLAMA_URL".to_string(), url);
             }
         }
         _ => {
@@ -1234,6 +1956,11 @@ fn get_config_value(settings: &AppSettings, key: &str) -> Result<String, AppErro
             .as_ref()
             .and_then(|server| server.llm_model.clone())
             .unwrap_or_else(|| DEFAULT_ANTHROPIC_MODEL.to_string())),
+        "server.ollama_url" => Ok(settings
+            .server
+            .as_ref()
+            .and_then(|server| server.ollama_url.clone())
+            .unwrap_or_else(|| memory_bank_app::DEFAULT_OLLAMA_URL.to_string())),
         "server.encoder_provider" => Ok(settings
             .server
             .as_ref()
@@ -1327,6 +2054,20 @@ fn set_config_value(settings: &mut AppSettings, key: &str, value: &str) -> Resul
             let mut server = settings.server.clone().unwrap_or_default();
             server.llm_model = Some(value.to_string());
             settings.server = Some(server);
+        }
+        "server.ollama_url" => {
+            let mut server = settings.server.clone().unwrap_or_default();
+            server.ollama_url =
+                if value.is_empty() || value == memory_bank_app::DEFAULT_OLLAMA_URL {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+            settings.server = if server.is_empty() {
+                None
+            } else {
+                Some(server)
+            };
         }
         "server.encoder_provider" => {
             let mut server = settings.server.clone().unwrap_or_default();
@@ -1540,8 +2281,7 @@ fn load_json_config(path: &Path) -> Result<Value, AppError> {
         return Ok(Value::Object(Map::new()));
     }
     let contents = fs::read_to_string(path)?;
-    let value = serde_json::from_str(&contents)?;
-    Ok(value)
+    parse_json_config(&contents, path)
 }
 
 fn write_json_config_with_backups(
@@ -1641,22 +2381,66 @@ fn systemd_service_path(paths: &AppPaths) -> PathBuf {
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<(), AppError> {
-    let output = ProcessCommand::new(program).args(args).output()?;
-    if output.status.success() {
+    let outcome = run_command_capture(program, args)?;
+    if outcome.success {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let details = if stderr.is_empty() { stdout } else { stderr };
-    Err(AppError::CommandFailed(
-        format!("{program} {}", args.join(" ")),
-        details,
-    ))
+    Err(outcome.into_error())
+}
+
+fn run_command_capture(program: &str, args: &[&str]) -> Result<CommandOutcome, AppError> {
+    let output = ProcessCommand::new(program).args(args).output().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            AppError::MissingBinary(program.to_string())
+        } else {
+            AppError::Io(error)
+        }
+    })?;
+
+    Ok(CommandOutcome {
+        program: program.to_string(),
+        args: args.iter().map(|value| (*value).to_string()).collect(),
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
 }
 
 fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
+}
+
+fn parse_json_config(contents: &str, path: &Path) -> Result<Value, AppError> {
+    if contents.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+
+    match serde_json::from_str(contents) {
+        Ok(value) => Ok(value),
+        Err(strict_error) => match parse_to_serde_value(contents, &jsonc_parse_options()) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Ok(Value::Object(Map::new())),
+            Err(relaxed_error) => Err(AppError::Message(format!(
+                "failed to parse {}: {} (also failed with JSONC parser: {})",
+                path.display(),
+                strict_error,
+                relaxed_error
+            ))),
+        },
+    }
+}
+
+fn jsonc_parse_options() -> ParseOptions {
+    ParseOptions {
+        allow_comments: true,
+        allow_loose_object_property_names: false,
+        allow_trailing_commas: true,
+        allow_missing_commas: false,
+        allow_single_quoted_strings: false,
+        allow_hexadecimal_numbers: false,
+        allow_unary_plus_numbers: false,
+    }
 }
 
 fn ensure_object(value: &mut Value) {
@@ -1677,6 +2461,110 @@ fn array_mut(value: &mut Value) -> Result<&mut Vec<Value>, AppError> {
         .ok_or_else(|| AppError::Message("expected JSON array".to_string()))
 }
 
+fn ensure_claude_user_mcp(server_url: &str) -> Result<(), AppError> {
+    let desired_url = format!("{server_url}/mcp");
+    let current = run_command_capture("claude", &["mcp", "get", "memory-bank"])?;
+
+    if claude_mcp_matches(&current, &desired_url) {
+        return Ok(());
+    }
+
+    if current.success {
+        if claude_mcp_scope(&current).as_deref() == Some("user") {
+            let removal = run_command_capture("claude", &["mcp", "remove", "memory-bank", "-s", "user"])?;
+            if !removal.success {
+                return Err(removal.into_error());
+            }
+        } else {
+            return Err(AppError::Message(
+                "Claude Code already has a conflicting `memory-bank` MCP server outside user scope; remove or rename that entry before rerunning setup".to_string(),
+            ));
+        }
+    }
+
+    let addition = run_command_capture(
+        "claude",
+        &[
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            "--scope",
+            "user",
+            "memory-bank",
+            &desired_url,
+        ],
+    )?;
+
+    if !addition.success {
+        let verify = run_command_capture("claude", &["mcp", "get", "memory-bank"])?;
+        if claude_mcp_matches(&verify, &desired_url) {
+            return Ok(());
+        }
+        return Err(addition.into_error());
+    }
+
+    let verify = run_command_capture("claude", &["mcp", "get", "memory-bank"])?;
+    if claude_mcp_matches(&verify, &desired_url) {
+        Ok(())
+    } else {
+        Err(AppError::Message(format!(
+            "Claude Code did not report the expected user-scoped HTTP MCP config for memory-bank after setup. Expected URL: {desired_url}"
+        )))
+    }
+}
+
+fn claude_mcp_matches(outcome: &CommandOutcome, desired_url: &str) -> bool {
+    outcome.success
+        && claude_mcp_scope(outcome).as_deref() == Some("user")
+        && outcome.combined_output().contains("Type: http")
+        && outcome.combined_output().contains(desired_url)
+}
+
+fn claude_mcp_scope(outcome: &CommandOutcome) -> Option<String> {
+    for line in outcome.combined_output().lines() {
+        let trimmed = line.trim();
+        if let Some(scope) = trimmed.strip_prefix("Scope:") {
+            let scope = scope.trim().to_ascii_lowercase();
+            if scope.starts_with("user") {
+                return Some("user".to_string());
+            }
+            if scope.starts_with("project") || scope.starts_with("local") {
+                return Some("project".to_string());
+            }
+            return Some(scope);
+        }
+    }
+    None
+}
+
+fn upsert_openclaw_plugin_load_path(
+    load_map: &mut Map<String, Value>,
+    desired_path: &str,
+) -> Result<(), AppError> {
+    let desired = desired_path.to_string();
+    let paths_value = load_map
+        .entry("paths".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let paths_array = array_mut(paths_value)?;
+
+    paths_array.retain(|value| {
+        let Some(path) = value.as_str() else {
+            return true;
+        };
+        !(path.ends_with("/memory-bank") && path != desired)
+    });
+
+    if !paths_array
+        .iter()
+        .any(|value| value.as_str() == Some(desired.as_str()))
+    {
+        paths_array.push(Value::String(desired));
+    }
+
+    Ok(())
+}
+
 fn default_model_for_provider(provider: &str) -> &'static str {
     match provider {
         "anthropic" => DEFAULT_ANTHROPIC_MODEL,
@@ -1687,8 +2575,154 @@ fn default_model_for_provider(provider: &str) -> &'static str {
     }
 }
 
+impl ModelCatalog {
+    fn models_for_provider(&self, provider: &str) -> Vec<&str> {
+        self.providers
+            .get(provider)
+            .map(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn from_json(contents: &str) -> Result<Self, AppError> {
+        let catalog: Self = serde_json::from_str(contents)?;
+        Ok(catalog)
+    }
+}
+
+fn refresh_model_catalog(paths: &AppPaths) -> ModelCatalog {
+    if let Ok(catalog) = fetch_remote_model_catalog(paths) {
+        return catalog;
+    }
+
+    if let Ok(catalog) = load_local_model_catalog(paths) {
+        return catalog;
+    }
+
+    ModelCatalog::default()
+}
+
+fn fetch_remote_model_catalog(paths: &AppPaths) -> Result<ModelCatalog, AppError> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(Duration::from_secs(3))
+        .timeout_write(Duration::from_secs(3))
+        .build();
+    let response = agent.get(REMOTE_MODEL_CATALOG_URL).call().map_err(|error| {
+        AppError::Message(format!("failed to fetch model catalog: {error}"))
+    })?;
+    let contents = response.into_string().map_err(|error| {
+        AppError::Message(format!("failed to read remote model catalog: {error}"))
+    })?;
+    let catalog = ModelCatalog::from_json(&contents)?;
+    paths.ensure_base_dirs()?;
+    fs::write(&paths.model_catalog_file, format!("{contents}\n"))?;
+    Ok(catalog)
+}
+
+fn load_local_model_catalog(paths: &AppPaths) -> Result<ModelCatalog, AppError> {
+    let local_path = if paths.model_catalog_file.exists() {
+        paths.model_catalog_file.clone()
+    } else {
+        find_repo_root()
+            .map(|root| root.join("config/setup-model-catalog.json"))
+            .ok_or_else(|| {
+                AppError::Message(
+                    "failed to locate a local model catalog fallback".to_string(),
+                )
+            })?
+    };
+    let contents = fs::read_to_string(&local_path)?;
+    ModelCatalog::from_json(&contents)
+}
+
+fn fetch_ollama_models_for_setup(ollama_url: &str) -> Result<Vec<String>, AppError> {
+    let tags_url = format!("{}/api/tags", ollama_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_read(Duration::from_secs(3))
+        .timeout_write(Duration::from_secs(3))
+        .build();
+    let response = agent.get(&tags_url).call().map_err(|error| {
+        AppError::Message(format!("failed to load installed Ollama models: {error}"))
+    })?;
+    let tags = response.into_json::<OllamaTagsResponse>().map_err(|error| {
+        AppError::Message(format!("failed to parse Ollama model list: {error}"))
+    })?;
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut models = Vec::new();
+    for model in tags.models {
+        let display = ollama_display_name(&model.name);
+        if seen.insert(display.clone()) {
+            models.push(display);
+        }
+    }
+
+    Ok(models)
+}
+
+fn ollama_display_name(model: &str) -> String {
+    model.strip_suffix(":latest").unwrap_or(model).to_string()
+}
+
+fn model_choices_for_provider(
+    provider: &str,
+    current: Option<&str>,
+    catalog: &ModelCatalog,
+) -> Vec<ModelChoice> {
+    model_choices_from_values(&catalog.models_for_provider(provider), current)
+}
+
+fn model_choices_from_values<S>(values: &[S], current: Option<&str>) -> Vec<ModelChoice>
+where
+    S: AsRef<str>,
+{
+    let mut choices = values
+        .iter()
+        .map(|model| ModelChoice::Preset(model.as_ref().to_string()))
+        .collect::<Vec<_>>();
+
+    if let Some(current_model) = current.filter(|value| !value.is_empty())
+        && !values.iter().any(|model| model.as_ref() == current_model)
+    {
+        choices.push(ModelChoice::Current(current_model.to_string()));
+    }
+
+    choices.push(ModelChoice::Custom);
+    choices
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
+}
+
+impl CommandOutcome {
+    fn combined_output(&self) -> String {
+        if self.stderr.is_empty() {
+            self.stdout.clone()
+        } else if self.stdout.is_empty() {
+            self.stderr.clone()
+        } else {
+            format!("{}\n{}", self.stdout, self.stderr)
+        }
+    }
+
+    fn into_error(self) -> AppError {
+        let details = if self.stderr.is_empty() {
+            self.stdout
+        } else if self.stdout.is_empty() {
+            self.stderr
+        } else {
+            format!("{}\n{}", self.stderr, self.stdout)
+        };
+        AppError::CommandFailed(format!("{} {}", self.program, self.args.join(" ")), details)
+    }
 }
 
 #[cfg(test)]
@@ -1696,6 +2730,29 @@ mod tests {
     use super::*;
     use memory_bank_app::{ServerSettings, ServiceSettings};
     use tempfile::TempDir;
+
+    fn test_model_catalog() -> ModelCatalog {
+        ModelCatalog::from_json(
+            r#"{
+  "providers": {
+    "anthropic": {
+      "models": [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5"
+      ]
+    },
+    "open-ai": {
+      "models": [
+        "gpt-5.4",
+        "gpt-5-mini"
+      ]
+    }
+  }
+}"#,
+        )
+        .expect("model catalog")
+    }
 
     #[test]
     fn launch_spec_uses_secrets_env_and_strips_ambient_keys() {
@@ -1754,5 +2811,245 @@ mod tests {
         assert!(rendered.contains("ExecStart=/bin/sh -lc"));
         assert!(rendered.contains("internal run-server"));
         assert!(rendered.contains("server.log"));
+    }
+
+    #[test]
+    fn load_json_config_accepts_comments_and_trailing_commas() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("settings.json");
+        fs::write(
+            &config_path,
+            r#"{
+  // comment
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "command": "echo hi", },
+        ],
+      },
+    ],
+  },
+}
+"#,
+        )
+        .expect("write config");
+
+        let value = load_json_config(&config_path).expect("load config");
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            Value::String("echo hi".to_string())
+        );
+    }
+
+    #[test]
+    fn load_json_config_reports_path_on_parse_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("broken.json");
+        fs::write(&config_path, "{ nope").expect("write broken config");
+
+        let error = load_json_config(&config_path).expect_err("expected parse failure");
+        let message = error.to_string();
+        assert!(message.contains("broken.json"));
+        assert!(message.contains("failed to parse"));
+    }
+
+    #[test]
+    fn claude_mcp_matches_expected_user_http_server() {
+        let outcome = CommandOutcome {
+            program: "claude".to_string(),
+            args: vec!["mcp".to_string(), "get".to_string(), "memory-bank".to_string()],
+            success: true,
+            stdout: "memory-bank:\n  Scope: User config (available in all your projects)\n  Status: ✗ Failed to connect\n  Type: http\n  URL: http://127.0.0.1:3737/mcp\n".to_string(),
+            stderr: String::new(),
+        };
+
+        assert!(claude_mcp_matches(
+            &outcome,
+            "http://127.0.0.1:3737/mcp"
+        ));
+    }
+
+    #[test]
+    fn upsert_openclaw_plugin_load_path_replaces_stale_memory_bank_paths() {
+        let mut load_map = Map::new();
+        load_map.insert(
+            "paths".to_string(),
+            json!([
+                "/tmp/something-else",
+                "/old/repo/.openclaw/extensions/memory-bank"
+            ]),
+        );
+
+        upsert_openclaw_plugin_load_path(&mut load_map, "/Users/test/.memory_bank/integrations/openclaw/memory-bank")
+            .expect("upsert load path");
+
+        assert_eq!(
+            load_map.get("paths").expect("paths"),
+            &json!([
+                "/tmp/something-else",
+                "/Users/test/.memory_bank/integrations/openclaw/memory-bank"
+            ])
+        );
+    }
+
+    #[test]
+    fn advanced_answers_default_from_settings_have_no_overrides() {
+        let settings = AppSettings::default();
+        let advanced = AdvancedAnswers::from_settings(&settings);
+
+        assert_eq!(advanced.port, DEFAULT_PORT);
+        assert_eq!(advanced.fastembed_model, DEFAULT_FASTEMBED_MODEL);
+        assert_eq!(advanced.history_window_size, 0);
+        assert_eq!(advanced.nearest_neighbor_count, 10);
+        assert!(!advanced.has_overrides());
+    }
+
+    #[test]
+    fn render_review_summary_hides_secret_value_and_omits_default_advanced() {
+        let answers = SetupAnswers {
+            namespace: Namespace::new("default"),
+            provider: "anthropic".to_string(),
+            model: DEFAULT_ANTHROPIC_MODEL.to_string(),
+            ollama_url: None,
+            autostart: true,
+            selected_agents: vec![AgentKind::ClaudeCode, AgentKind::GeminiCli],
+            secret_choice: SecretChoice::ManualEntry {
+                key: "ANTHROPIC_API_KEY",
+                value: "super-secret".to_string(),
+            },
+            advanced: AdvancedAnswers {
+                port: DEFAULT_PORT,
+                fastembed_model: DEFAULT_FASTEMBED_MODEL.to_string(),
+                history_window_size: 0,
+                nearest_neighbor_count: 10,
+            },
+        };
+
+        let summary = render_review_summary(&answers);
+        assert!(summary.contains("Store a newly entered ANTHROPIC_API_KEY"));
+        assert!(!summary.contains("super-secret"));
+        assert!(!summary.contains("Advanced overrides"));
+    }
+
+    #[test]
+    fn build_settings_for_answers_applies_advanced_overrides() {
+        let current = AppSettings::default();
+        let answers = SetupAnswers {
+            namespace: Namespace::new("work"),
+            provider: "gemini".to_string(),
+            model: "gemini-3.1-pro-preview".to_string(),
+            ollama_url: None,
+            autostart: true,
+            selected_agents: vec![AgentKind::OpenCode],
+            secret_choice: SecretChoice::NotRequired,
+            advanced: AdvancedAnswers {
+                port: 4545,
+                fastembed_model: "custom/embed-model".to_string(),
+                history_window_size: 25,
+                nearest_neighbor_count: 15,
+            },
+        };
+
+        let settings = build_settings_for_answers(&current, &answers, &[AgentKind::OpenCode]);
+        let service = settings.service.expect("service settings");
+        let server = settings.server.expect("server settings");
+        let integrations = settings.integrations.expect("integrations");
+
+        assert_eq!(settings.active_namespace.as_deref(), Some("work"));
+        assert_eq!(service.port, Some(4545));
+        assert_eq!(service.autostart, Some(true));
+        assert_eq!(server.llm_provider.as_deref(), Some("gemini"));
+        assert_eq!(server.llm_model.as_deref(), Some("gemini-3.1-pro-preview"));
+        assert_eq!(server.fastembed_model.as_deref(), Some("custom/embed-model"));
+        assert_eq!(server.history_window_size, Some(25));
+        assert_eq!(server.nearest_neighbor_count, Some(15));
+        assert_eq!(server.ollama_url, None);
+        assert_eq!(
+            integrations.opencode.as_ref().map(|state| state.configured),
+            Some(true)
+        );
+        assert_eq!(
+            integrations.claude_code.as_ref().map(|state| state.configured),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn model_choices_include_current_saved_model_and_custom_fallback() {
+        let catalog = test_model_catalog();
+        let choices =
+            model_choices_for_provider("anthropic", Some("claude-opus-custom"), &catalog);
+
+        assert_eq!(
+            choices,
+            vec![
+                ModelChoice::Preset("claude-opus-4-6".to_string()),
+                ModelChoice::Preset("claude-sonnet-4-6".to_string()),
+                ModelChoice::Preset("claude-haiku-4-5".to_string()),
+                ModelChoice::Current("claude-opus-custom".to_string()),
+                ModelChoice::Custom,
+            ]
+        );
+    }
+
+    #[test]
+    fn load_local_model_catalog_reads_installed_copy() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        paths.ensure_base_dirs().expect("base dirs");
+        fs::write(
+            &paths.model_catalog_file,
+            r#"{
+  "providers": {
+    "gemini": {
+      "models": [
+        "gemini-3.1-pro-preview",
+        "gemini-3-flash-preview"
+      ]
+    }
+  }
+}"#,
+        )
+        .expect("write model catalog");
+
+        let catalog = load_local_model_catalog(&paths).expect("load local catalog");
+
+        assert_eq!(
+            catalog.models_for_provider("gemini"),
+            vec!["gemini-3.1-pro-preview", "gemini-3-flash-preview"]
+        );
+    }
+
+    #[test]
+    fn empty_model_catalog_still_offers_custom_entry() {
+        let choices = model_choices_for_provider("ollama", None, &ModelCatalog::default());
+        assert_eq!(choices, vec![ModelChoice::Custom]);
+    }
+
+    #[test]
+    fn build_settings_for_ollama_answers_persists_non_default_url() {
+        let answers = SetupAnswers {
+            namespace: Namespace::new("default"),
+            provider: "ollama".to_string(),
+            model: "qwen3".to_string(),
+            ollama_url: Some("http://192.168.1.50:11434".to_string()),
+            autostart: false,
+            selected_agents: Vec::new(),
+            secret_choice: SecretChoice::NotRequired,
+            advanced: AdvancedAnswers::from_settings(&AppSettings::default()),
+        };
+
+        let settings = build_settings_for_answers(&AppSettings::default(), &answers, &[]);
+        let server = settings.server.expect("server settings");
+
+        assert_eq!(server.llm_provider.as_deref(), Some("ollama"));
+        assert_eq!(server.ollama_url.as_deref(), Some("http://192.168.1.50:11434"));
+    }
+
+    #[test]
+    fn ollama_display_name_strips_latest_suffix() {
+        assert_eq!(ollama_display_name("qwen3:latest"), "qwen3");
+        assert_eq!(ollama_display_name("qwen3:8b"), "qwen3:8b");
     }
 }

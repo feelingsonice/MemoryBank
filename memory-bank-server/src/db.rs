@@ -797,7 +797,7 @@ mod tests {
         upsert_model_config(&pool, "Anthropic::claude-sonnet-4-6", "FastEmbed::default")
             .await
             .expect("insert initial config");
-        upsert_model_config(&pool, "OpenAi::gpt-4o-mini", "FastEmbed::default")
+        upsert_model_config(&pool, "OpenAi::gpt-5-mini", "FastEmbed::default")
             .await
             .expect("refresh llm config");
 
@@ -806,7 +806,7 @@ mod tests {
             .expect("load updated model config")
             .expect("stored row");
 
-        assert_eq!(stored.llm_model, "OpenAi::gpt-4o-mini");
+        assert_eq!(stored.llm_model, "OpenAi::gpt-5-mini");
         assert_eq!(stored.encoder_model, "FastEmbed::default");
     }
 }

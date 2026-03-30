@@ -10,11 +10,11 @@ pub const APP_DIR_NAME: &str = ".memory_bank";
 pub const DEFAULT_NAMESPACE_NAME: &str = "default";
 pub const DEFAULT_PORT: u16 = 3737;
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
+pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3-flash-preview";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
-pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
+pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
 pub const DEFAULT_FASTEMBED_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
 
 #[derive(Debug, Error)]
@@ -88,12 +88,14 @@ pub struct AppPaths {
     pub home_dir: PathBuf,
     pub root: PathBuf,
     pub bin_dir: PathBuf,
+    pub config_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub namespaces_dir: PathBuf,
     pub integrations_dir: PathBuf,
     pub backups_dir: PathBuf,
     pub settings_file: PathBuf,
     pub secrets_file: PathBuf,
+    pub model_catalog_file: PathBuf,
     pub log_file: PathBuf,
 }
 
@@ -106,6 +108,7 @@ impl AppPaths {
     pub fn from_home_dir(home_dir: PathBuf) -> Self {
         let root = home_dir.join(APP_DIR_NAME);
         let bin_dir = root.join("bin");
+        let config_dir = root.join("config");
         let logs_dir = root.join("logs");
         let namespaces_dir = root.join("namespaces");
         let integrations_dir = root.join("integrations");
@@ -114,9 +117,11 @@ impl AppPaths {
             home_dir,
             settings_file: root.join("settings.json"),
             secrets_file: root.join("secrets.env"),
+            model_catalog_file: config_dir.join("setup-model-catalog.json"),
             log_file: logs_dir.join("server.log"),
             root,
             bin_dir,
+            config_dir,
             logs_dir,
             namespaces_dir,
             integrations_dir,
@@ -128,6 +133,7 @@ impl AppPaths {
         for path in [
             &self.root,
             &self.bin_dir,
+            &self.config_dir,
             &self.logs_dir,
             &self.namespaces_dir,
             &self.integrations_dir,
@@ -253,6 +259,8 @@ pub struct ServerSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ollama_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fastembed_model: Option<String>,
@@ -270,6 +278,7 @@ impl ServerSettings {
     pub fn is_empty(&self) -> bool {
         self.llm_provider.is_none()
             && self.llm_model.is_none()
+            && self.ollama_url.is_none()
             && self.encoder_provider.is_none()
             && self.fastembed_model.is_none()
             && self.history_window_size.is_none()
@@ -444,7 +453,7 @@ mod tests {
             }),
             server: Some(ServerSettings {
                 llm_provider: Some("anthropic".to_string()),
-                llm_model: Some("claude-sonnet-4-6".to_string()),
+                llm_model: Some(DEFAULT_ANTHROPIC_MODEL.to_string()),
                 ..ServerSettings::default()
             }),
             integrations: None,
