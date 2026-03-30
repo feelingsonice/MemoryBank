@@ -1,12 +1,13 @@
 use crate::AppError;
 use crate::assets::{ExposureCheck, inspect_cli_exposure};
-use crate::command_utils::{current_uid, run_command, shell_escape};
+use crate::command_utils::{current_uid, run_command, run_command_capture, shell_escape};
 use crate::config::{
     llm_provider_value, normalize_ollama_url, validate_encoder_provider, validate_llm_provider,
 };
 use crate::constants::{
-    HOOK_BINARY_NAME, LAUNCHD_LABEL, LOG_TAIL_LINE_COUNT, MB_BINARY_NAME, MCP_PROXY_BINARY_NAME,
-    SERVER_BINARY_NAME, SYSTEMD_UNIT_NAME,
+    HEALTH_POLL_INTERVAL, HEALTH_STARTUP_TIMEOUT, HOOK_BINARY_NAME, LAUNCHD_LABEL,
+    LOG_TAIL_LINE_COUNT, MB_BINARY_NAME, MCP_PROXY_BINARY_NAME, SERVER_BINARY_NAME,
+    SERVICE_TRANSITION_POLL_INTERVAL, SERVICE_TRANSITION_TIMEOUT, SYSTEMD_UNIT_NAME,
 };
 use memory_bank_app::{
     AppPaths, AppSettings, SecretStore, default_server_url, env_key_for_provider,
@@ -27,7 +28,13 @@ enum ManagedPlatform {
     Linux,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceManager {
+    Launchd,
+    Systemd,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub(crate) struct HealthCheck {
     pub(crate) ok: bool,
     pub(crate) namespace: String,
@@ -37,10 +44,50 @@ pub(crate) struct HealthCheck {
     pub(crate) version: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServiceStatus {
     pub(crate) installed: bool,
     pub(crate) active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceRuntimeSummary {
+    pub(crate) manager: ServiceManager,
+    pub(crate) definition_path: PathBuf,
+    pub(crate) log_path: PathBuf,
+    pub(crate) url: String,
+    pub(crate) installed: bool,
+    pub(crate) active: bool,
+    pub(crate) pid: Option<u32>,
+    pub(crate) health: Option<HealthCheck>,
+    pub(crate) health_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServiceActionKind {
+    Install,
+    Start,
+    Restart,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServiceActionReport {
+    pub(crate) action: ServiceActionKind,
+    pub(crate) manager: ServiceManager,
+    pub(crate) definition_path: PathBuf,
+    pub(crate) log_path: PathBuf,
+    pub(crate) url: String,
+    pub(crate) autostart: bool,
+    pub(crate) installed_before: bool,
+    pub(crate) active_before: bool,
+    pub(crate) installed_after: bool,
+    pub(crate) active_after: bool,
+    pub(crate) installed_during_action: bool,
+    pub(crate) fell_back_to_start: bool,
+    pub(crate) pid: Option<u32>,
+    pub(crate) health: Option<HealthCheck>,
+    pub(crate) health_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,24 +106,86 @@ impl ManagedPlatform {
             other => Err(AppError::UnsupportedPlatform(other.to_string())),
         }
     }
-}
 
-pub(crate) fn install_service(paths: &AppPaths, settings: &AppSettings) -> Result<(), AppError> {
-    paths.ensure_base_dirs()?;
-    match ManagedPlatform::detect()? {
-        ManagedPlatform::MacOs => install_launchd_service(paths, settings),
-        ManagedPlatform::Linux => install_systemd_service(paths, settings),
+    fn manager(self) -> ServiceManager {
+        match self {
+            Self::MacOs => ServiceManager::Launchd,
+            Self::Linux => ServiceManager::Systemd,
+        }
+    }
+
+    fn definition_path(self, paths: &AppPaths) -> PathBuf {
+        match self {
+            Self::MacOs => launchd_service_path(paths),
+            Self::Linux => systemd_service_path(paths),
+        }
     }
 }
 
-pub(crate) fn start_service(paths: &AppPaths) -> Result<(), AppError> {
-    match ManagedPlatform::detect()? {
+impl ServiceManager {
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Launchd => "launchd",
+            Self::Systemd => "systemd --user",
+        }
+    }
+}
+
+pub(crate) fn install_service(
+    paths: &AppPaths,
+    settings: &AppSettings,
+) -> Result<ServiceActionReport, AppError> {
+    paths.ensure_base_dirs()?;
+    let platform = ManagedPlatform::detect()?;
+    let before = service_status(paths)?;
+    match platform {
+        ManagedPlatform::MacOs => install_launchd_service(paths, settings)?,
+        ManagedPlatform::Linux => install_systemd_service(paths, settings)?,
+    }
+    let after = wait_for_service_status(
+        paths,
+        true,
+        SERVICE_TRANSITION_TIMEOUT,
+        SERVICE_TRANSITION_POLL_INTERVAL,
+    )?;
+
+    Ok(ServiceActionReport {
+        action: ServiceActionKind::Install,
+        manager: platform.manager(),
+        definition_path: platform.definition_path(paths),
+        log_path: paths.log_file.clone(),
+        url: default_server_url(settings),
+        autostart: settings.resolved_autostart(),
+        installed_before: before.installed,
+        active_before: before.active,
+        installed_after: after.installed,
+        active_after: after.active,
+        installed_during_action: !before.installed && after.installed,
+        fell_back_to_start: false,
+        pid: if after.active {
+            best_effort_service_pid(paths, platform)
+        } else {
+            None
+        },
+        health: None,
+        health_error: None,
+    })
+}
+
+pub(crate) fn start_service(
+    paths: &AppPaths,
+    settings: &AppSettings,
+) -> Result<ServiceActionReport, AppError> {
+    let platform = ManagedPlatform::detect()?;
+    let before = service_status(paths)?;
+    let installed_during_action = match platform {
         ManagedPlatform::MacOs => {
-            let settings = AppSettings::load(paths)?;
             let uid = current_uid()?;
             let service_path = launchd_service_path(paths);
+            let mut installed_during_action = false;
             if !service_path.exists() {
                 install_launchd_service(paths, &settings)?;
+                installed_during_action = true;
             }
             let domain = format!("gui/{uid}");
             let status = ProcessCommand::new("launchctl")
@@ -88,7 +197,7 @@ pub(crate) fn start_service(paths: &AppPaths) -> Result<(), AppError> {
                 run_command(
                     "launchctl",
                     &["kickstart", "-k", &format!("{domain}/{LAUNCHD_LABEL}")],
-                )
+                )?;
             } else {
                 run_command(
                     "launchctl",
@@ -101,57 +210,184 @@ pub(crate) fn start_service(paths: &AppPaths) -> Result<(), AppError> {
                 run_command(
                     "launchctl",
                     &["kickstart", "-k", &format!("{domain}/{LAUNCHD_LABEL}")],
-                )
+                )?;
             }
+            installed_during_action
         }
         ManagedPlatform::Linux => {
-            let settings = AppSettings::load(paths)?;
+            let mut installed_during_action = false;
             if !systemd_service_path(paths).exists() {
                 install_systemd_service(paths, &settings)?;
+                installed_during_action = true;
             }
-            run_command("systemctl", &["--user", "start", SYSTEMD_UNIT_NAME])
+            run_command("systemctl", &["--user", "start", SYSTEMD_UNIT_NAME])?;
+            installed_during_action
         }
-    }
+    };
+
+    let after = if before.installed && before.active {
+        wait_for_service_status(
+            paths,
+            false,
+            SERVICE_TRANSITION_TIMEOUT,
+            SERVICE_TRANSITION_POLL_INTERVAL,
+        )?
+    } else {
+        service_status(paths)?
+    };
+    let (health, health_error) = wait_for_service_health(settings, after.active);
+
+    Ok(ServiceActionReport {
+        action: ServiceActionKind::Start,
+        manager: platform.manager(),
+        definition_path: platform.definition_path(paths),
+        log_path: paths.log_file.clone(),
+        url: default_server_url(settings),
+        autostart: settings.resolved_autostart(),
+        installed_before: before.installed,
+        active_before: before.active,
+        installed_after: after.installed,
+        active_after: after.active,
+        installed_during_action,
+        fell_back_to_start: false,
+        pid: if after.active {
+            best_effort_service_pid(paths, platform)
+        } else {
+            None
+        },
+        health,
+        health_error,
+    })
 }
 
-pub(crate) fn stop_service(_paths: &AppPaths) -> Result<(), AppError> {
-    match ManagedPlatform::detect()? {
-        ManagedPlatform::MacOs => {
-            let uid = current_uid()?;
-            let _ = run_command(
-                "launchctl",
-                &["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
-            );
-            Ok(())
+pub(crate) fn stop_service(
+    paths: &AppPaths,
+    settings: &AppSettings,
+) -> Result<ServiceActionReport, AppError> {
+    let platform = ManagedPlatform::detect()?;
+    let before = service_status(paths)?;
+    let stop_error = if before.installed && before.active {
+        match platform {
+            ManagedPlatform::MacOs => {
+                let uid = current_uid()?;
+                run_command(
+                    "launchctl",
+                    &["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
+                )
+                .err()
+            }
+            ManagedPlatform::Linux => {
+                run_command("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]).err()
+            }
         }
-        ManagedPlatform::Linux => {
-            let _ = run_command("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]);
-            Ok(())
-        }
+    } else {
+        None
+    };
+    let after = wait_for_service_status(
+        paths,
+        true,
+        SERVICE_TRANSITION_TIMEOUT,
+        SERVICE_TRANSITION_POLL_INTERVAL,
+    )?;
+    if let Some(error) = stop_error
+        && after.active
+    {
+        return Err(error);
     }
+
+    Ok(ServiceActionReport {
+        action: ServiceActionKind::Stop,
+        manager: platform.manager(),
+        definition_path: platform.definition_path(paths),
+        log_path: paths.log_file.clone(),
+        url: default_server_url(settings),
+        autostart: settings.resolved_autostart(),
+        installed_before: before.installed,
+        active_before: before.active,
+        installed_after: after.installed,
+        active_after: after.active,
+        installed_during_action: false,
+        fell_back_to_start: false,
+        pid: if after.active {
+            best_effort_service_pid(paths, platform)
+        } else {
+            None
+        },
+        health: None,
+        health_error: None,
+    })
 }
 
-pub(crate) fn restart_service(paths: &AppPaths) -> Result<(), AppError> {
-    match ManagedPlatform::detect()? {
+pub(crate) fn restart_service(
+    paths: &AppPaths,
+    settings: &AppSettings,
+) -> Result<ServiceActionReport, AppError> {
+    let platform = ManagedPlatform::detect()?;
+    let before = service_status(paths)?;
+    let (installed_during_action, fell_back_to_start) = match platform {
         ManagedPlatform::MacOs => {
-            let status = service_status(paths)?;
-            if status.active {
+            if before.active {
                 let uid = current_uid()?;
                 run_command(
                     "launchctl",
                     &["kickstart", "-k", &format!("gui/{uid}/{LAUNCHD_LABEL}")],
-                )
+                )?;
+                (false, false)
             } else {
-                start_service(paths)
+                let report = start_service(paths, settings)?;
+                return Ok(ServiceActionReport {
+                    action: ServiceActionKind::Restart,
+                    fell_back_to_start: true,
+                    ..report
+                });
             }
         }
         ManagedPlatform::Linux => {
             if !systemd_service_path(paths).exists() {
-                return start_service(paths);
+                let report = start_service(paths, settings)?;
+                return Ok(ServiceActionReport {
+                    action: ServiceActionKind::Restart,
+                    fell_back_to_start: true,
+                    ..report
+                });
             }
-            run_command("systemctl", &["--user", "restart", SYSTEMD_UNIT_NAME])
+            if before.active {
+                run_command("systemctl", &["--user", "restart", SYSTEMD_UNIT_NAME])?;
+                (false, false)
+            } else {
+                let report = start_service(paths, settings)?;
+                return Ok(ServiceActionReport {
+                    action: ServiceActionKind::Restart,
+                    fell_back_to_start: true,
+                    ..report
+                });
+            }
         }
-    }
+    };
+    let after = service_status(paths)?;
+    let (health, health_error) = wait_for_service_health(settings, after.active);
+
+    Ok(ServiceActionReport {
+        action: ServiceActionKind::Restart,
+        manager: platform.manager(),
+        definition_path: platform.definition_path(paths),
+        log_path: paths.log_file.clone(),
+        url: default_server_url(settings),
+        autostart: settings.resolved_autostart(),
+        installed_before: before.installed,
+        active_before: before.active,
+        installed_after: after.installed,
+        active_after: after.active,
+        installed_during_action,
+        fell_back_to_start,
+        pid: if after.active {
+            best_effort_service_pid(paths, platform)
+        } else {
+            None
+        },
+        health,
+        health_error,
+    })
 }
 
 pub(crate) fn service_status(paths: &AppPaths) -> Result<ServiceStatus, AppError> {
@@ -176,6 +412,35 @@ pub(crate) fn service_status(paths: &AppPaths) -> Result<ServiceStatus, AppError
             Ok(ServiceStatus { installed, active })
         }
     }
+}
+
+pub(crate) fn service_runtime_summary(
+    paths: &AppPaths,
+    settings: &AppSettings,
+) -> Result<ServiceRuntimeSummary, AppError> {
+    let platform = ManagedPlatform::detect()?;
+    let status = service_status(paths)?;
+    let health_result = fetch_health(settings);
+    let (health, health_error) = match health_result {
+        Ok(health) => (Some(health), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+
+    Ok(ServiceRuntimeSummary {
+        manager: platform.manager(),
+        definition_path: platform.definition_path(paths),
+        log_path: paths.log_file.clone(),
+        url: default_server_url(settings),
+        installed: status.installed,
+        active: status.active,
+        pid: if status.active {
+            best_effort_service_pid(paths, platform)
+        } else {
+            None
+        },
+        health,
+        health_error,
+    })
 }
 
 pub(crate) fn fetch_health(settings: &AppSettings) -> Result<HealthCheck, AppError> {
@@ -219,6 +484,93 @@ pub(crate) fn wait_for_health(
     }
 }
 
+fn wait_for_service_status(
+    paths: &AppPaths,
+    desired_active: bool,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> Result<ServiceStatus, AppError> {
+    let deadline = Instant::now() + timeout;
+    let mut last = service_status(paths)?;
+    if last.active == desired_active {
+        return Ok(last);
+    }
+
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(last);
+        }
+
+        thread::sleep(poll_interval);
+        last = service_status(paths)?;
+        if last.active == desired_active {
+            return Ok(last);
+        }
+    }
+}
+
+fn wait_for_service_health(
+    settings: &AppSettings,
+    service_active: bool,
+) -> (Option<HealthCheck>, Option<String>) {
+    if !service_active {
+        return (None, None);
+    }
+
+    match wait_for_health(settings, HEALTH_STARTUP_TIMEOUT, HEALTH_POLL_INTERVAL) {
+        Ok(health) => (Some(health), None),
+        Err(error) => (None, Some(error.to_string())),
+    }
+}
+
+fn best_effort_service_pid(_paths: &AppPaths, platform: ManagedPlatform) -> Option<u32> {
+    match platform {
+        ManagedPlatform::MacOs => {
+            let uid = current_uid().ok()?;
+            let domain = format!("gui/{uid}/{LAUNCHD_LABEL}");
+            let outcome = run_command_capture("launchctl", &["print", &domain]).ok()?;
+            launchctl_pid_from_output(&outcome.combined_output())
+        }
+        ManagedPlatform::Linux => {
+            let outcome = run_command_capture(
+                "systemctl",
+                &[
+                    "--user",
+                    "show",
+                    SYSTEMD_UNIT_NAME,
+                    "--property",
+                    "MainPID",
+                    "--value",
+                ],
+            )
+            .ok()?;
+            systemd_main_pid_from_output(&outcome.combined_output())
+        }
+    }
+}
+
+fn launchctl_pid_from_output(output: &str) -> Option<u32> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("pid = ") {
+            return rest.trim().parse::<u32>().ok().filter(|pid| *pid > 0);
+        }
+        if let Some((_, rest)) = trimmed.split_once("pid = ") {
+            return rest.trim().parse::<u32>().ok().filter(|pid| *pid > 0);
+        }
+    }
+    None
+}
+
+fn systemd_main_pid_from_output(output: &str) -> Option<u32> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed == "0" {
+        None
+    } else {
+        trimmed.parse::<u32>().ok().filter(|pid| *pid > 0)
+    }
+}
+
 pub(crate) fn tail_log_file(path: &Path, follow: bool) -> Result<(), AppError> {
     if !path.exists() {
         if follow {
@@ -228,7 +580,7 @@ pub(crate) fn tail_log_file(path: &Path, follow: bool) -> Result<(), AppError> {
             fs::write(path, "")?;
         } else {
             return Err(AppError::Message(format!(
-                "log file does not exist yet: {}",
+                "log file does not exist yet: {}. The managed service may not have started yet. Try `mb service status` or `mb service start`.",
                 path.display()
             )));
         }
@@ -836,5 +1188,23 @@ mod tests {
             .expect_err("invalid nearest neighbor count");
 
         assert!(error.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn launchctl_pid_parser_extracts_pid_when_present() {
+        let output = "service = com.memory-bank.mb\n    pid = 4242\n";
+
+        assert_eq!(launchctl_pid_from_output(output), Some(4242));
+        assert_eq!(
+            launchctl_pid_from_output("service = com.memory-bank.mb"),
+            None
+        );
+    }
+
+    #[test]
+    fn systemd_pid_parser_ignores_empty_and_zero_values() {
+        assert_eq!(systemd_main_pid_from_output("4242"), Some(4242));
+        assert_eq!(systemd_main_pid_from_output("0"), None);
+        assert_eq!(systemd_main_pid_from_output(""), None);
     }
 }

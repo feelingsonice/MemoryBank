@@ -13,6 +13,10 @@ use crate::models::{
     ModelCatalog, ModelChoice, default_model_for_provider, fetch_ollama_models_for_setup,
     model_choices_for_provider, model_choices_from_values, refresh_model_catalog,
 };
+use crate::output::{
+    no_color_requested, styled_command, styled_failure, styled_section, styled_subtle,
+    styled_success, styled_title, styled_warning,
+};
 use crate::service::{HealthCheck, install_service, start_service, wait_for_health};
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 use inquire::validator::Validation;
@@ -272,47 +276,6 @@ fn setup_render_config() -> RenderConfig<'static> {
     config
 }
 
-fn no_color_requested() -> bool {
-    std::env::var_os("NO_COLOR").is_some()
-        || matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"))
-}
-
-fn paint(text: &str, code: &str) -> String {
-    if no_color_requested() {
-        text.to_string()
-    } else {
-        format!("\x1b[{code}m{text}\x1b[0m")
-    }
-}
-
-fn styled_title(text: &str) -> String {
-    paint(text, "1;36")
-}
-
-fn styled_command(text: &str) -> String {
-    paint(text, "1;36")
-}
-
-fn styled_section(text: &str) -> String {
-    paint(&format!("== {text} =="), "1;34")
-}
-
-fn styled_subtle(text: &str) -> String {
-    paint(text, "2")
-}
-
-fn styled_success(text: &str) -> String {
-    paint(text, "1;32")
-}
-
-fn styled_warning(text: &str) -> String {
-    paint(text, "1;33")
-}
-
-fn styled_failure(text: &str) -> String {
-    paint(text, "1;31")
-}
-
 fn collect_setup_answers(
     settings: &AppSettings,
     secrets: &SecretStore,
@@ -482,7 +445,7 @@ fn apply_setup_answers(
         install_service(paths, settings)
     })?;
     apply_step(5, total_steps, "Start managed service", || {
-        start_service(paths)
+        start_service(paths, settings)
     })?;
     let health = apply_step(6, total_steps, "Wait for service health", || {
         wait_for_health(settings, HEALTH_STARTUP_TIMEOUT, HEALTH_POLL_INTERVAL)

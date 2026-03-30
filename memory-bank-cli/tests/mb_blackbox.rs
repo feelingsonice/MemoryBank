@@ -1,10 +1,17 @@
 use memory_bank_app::AppPaths;
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use tempfile::TempDir;
 
 const MB_BINARY: &str = env!("CARGO_BIN_EXE_mb");
@@ -17,6 +24,12 @@ struct MbHarness {
     cwd: PathBuf,
     shim_log: PathBuf,
     path: String,
+}
+
+struct HealthzServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
 impl MbHarness {
@@ -58,6 +71,9 @@ printf '%s\n' "launchctl $*" >> '{}'
 case "$1" in
   print)
     code="${{MB_TEST_LAUNCHCTL_PRINT_EXIT:-1}}"
+    if [ "$code" -eq 0 ]; then
+      printf 'pid = %s\n' "${{MB_TEST_LAUNCHCTL_PID:-4321}}"
+    fi
     exit "$code"
     ;;
   bootstrap|kickstart|bootout)
@@ -94,6 +110,10 @@ case "$1 $2 $3" in
   "--user is-active --quiet")
     code="${{MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT:-1}}"
     exit "$code"
+    ;;
+  "--user show memory-bank.service")
+    printf '%s\n' "${{MB_TEST_SYSTEMCTL_MAINPID:-0}}"
+    exit 0
     ;;
   *)
     exit 0
@@ -173,6 +193,62 @@ esac
 
     fn read_shim_log(&self) -> String {
         fs::read_to_string(&self.shim_log).unwrap_or_default()
+    }
+}
+
+impl HealthzServer {
+    fn new(namespace: &str, provider: &str, encoder: &str, version: &str) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind health server");
+        let server_port = listener.local_addr().expect("local addr").port();
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking health listener");
+        let body = format!(
+            "{{\"ok\":true,\"namespace\":\"{namespace}\",\"port\":{server_port},\"llm_provider\":\"{provider}\",\"encoder_provider\":\"{encoder}\",\"version\":\"{version}\"}}"
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buffer = [0_u8; 1024];
+                        let _ = stream.read(&mut buffer);
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            port: server_port,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for HealthzServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -379,9 +455,27 @@ fn mb_config_round_trips_values_through_the_binary() {
         "{}",
         stderr_string(&set_namespace)
     );
+    assert_contains_all(
+        &stdout_string(&set_namespace),
+        &[
+            "Updated `active_namespace`.",
+            "Old value: default",
+            "New value: team_a_1",
+            "next time the managed service starts",
+        ],
+    );
 
     let set_port = harness.run(&["config", "set", "service.port", "4545"]);
     assert!(set_port.status.success(), "{}", stderr_string(&set_port));
+    assert_contains_all(
+        &stdout_string(&set_port),
+        &[
+            "Updated `service.port`.",
+            "Old value: 3737",
+            "New value: 4545",
+            "next time the managed service starts",
+        ],
+    );
 
     let get_namespace = harness.run(&["config", "get", "active_namespace"]);
     assert!(
@@ -409,7 +503,14 @@ fn mb_namespace_commands_manage_sanitized_names_without_starting_services() {
 
     let created = harness.run(&["namespace", "create", "team a/1"]);
     assert!(created.status.success(), "{}", stderr_string(&created));
-    assert!(stdout_string(&created).contains("Created namespace `team_a_1`."));
+    assert_contains_all(
+        &stdout_string(&created),
+        &[
+            "Created namespace `team_a_1`.",
+            "Directory:",
+            "Warning: Requested name `team a/1` was sanitized to `team_a_1`.",
+        ],
+    );
 
     let used = harness.run_with_env(
         &["namespace", "use", "team a/1"],
@@ -421,6 +522,14 @@ fn mb_namespace_commands_manage_sanitized_names_without_starting_services() {
         ],
     );
     assert!(used.status.success(), "{}", stderr_string(&used));
+    assert_contains_all(
+        &stdout_string(&used),
+        &[
+            "Active namespace is now `team_a_1`.",
+            "Warning: The managed service is not installed, so this namespace will apply on the next service start.",
+            "mb service start",
+        ],
+    );
 
     let current = harness.run(&["namespace", "current"]);
     assert!(current.status.success(), "{}", stderr_string(&current));
@@ -565,6 +674,15 @@ fn mb_service_install_writes_the_managed_service_definition() {
 
     let output = harness.run(&["service", "install"]);
     assert!(output.status.success(), "{}", stderr_string(&output));
+    assert_contains_all(
+        &stdout_string(&output),
+        &[
+            "Installing the managed service definition...",
+            "Success: Installed the managed service definition.",
+            "Autostart: yes",
+            "Log file:",
+        ],
+    );
 
     #[cfg(target_os = "macos")]
     let service_path = harness
@@ -586,7 +704,52 @@ fn mb_service_install_writes_the_managed_service_definition() {
 }
 
 #[test]
-fn mb_service_start_status_restart_and_stop_use_only_shims() {
+fn mb_service_status_shows_runtime_summary_when_health_is_available() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+    let healthz = HealthzServer::new("default", "anthropic", "fast-embed", "test");
+
+    let set_port = harness.run(&["config", "set", "service.port", &healthz.port().to_string()]);
+    assert!(set_port.status.success(), "{}", stderr_string(&set_port));
+    let install = harness.run(&["service", "install"]);
+    assert!(install.status.success(), "{}", stderr_string(&install));
+
+    let status = harness.run_with_env(
+        &["service", "status"],
+        &[
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PRINT_EXIT", "0"),
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PID", "4242"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT", "0"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_MAINPID", "4242"),
+        ],
+    );
+    assert!(status.status.success(), "{}", stderr_string(&status));
+    assert_contains_all(
+        &stdout_string(&status),
+        &[
+            "Memory Bank service",
+            "Manager:",
+            "Installed: yes",
+            "Active: yes",
+            "URL:",
+            "Log file:",
+            "PID: 4242",
+            "Health: yes",
+            "Namespace: default",
+            &format!("Port: {}", healthz.port()),
+            "Provider: anthropic",
+            "Encoder: fast-embed",
+            "Version: test",
+        ],
+    );
+}
+
+#[test]
+fn mb_service_commands_report_progress_and_outcomes() {
     let harness = MbHarness::new();
     harness.seed_service_binary_placeholders();
 
@@ -600,6 +763,14 @@ fn mb_service_start_status_restart_and_stop_use_only_shims() {
         ],
     );
     assert!(start.status.success(), "{}", stderr_string(&start));
+    assert_contains_all(
+        &stdout_string(&start),
+        &[
+            "Starting Memory Bank service...",
+            "Warning: Sent the service request, but the managed service does not appear active yet.",
+            "mb service status",
+        ],
+    );
 
     #[cfg(target_os = "macos")]
     {
@@ -616,50 +787,51 @@ fn mb_service_start_status_restart_and_stop_use_only_shims() {
         assert!(log.contains("systemctl --user start memory-bank.service"));
     }
 
-    let status = harness.run_with_env(
-        &["service", "status"],
-        &[
-            #[cfg(target_os = "macos")]
-            ("MB_TEST_LAUNCHCTL_PRINT_EXIT", "0"),
-            #[cfg(target_os = "linux")]
-            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT", "0"),
-        ],
-    );
-    assert!(status.status.success(), "{}", stderr_string(&status));
-    assert!(stdout_string(&status).contains("Installed: yes"));
-    assert!(stdout_string(&status).contains("Active: yes"));
-
     let restart = harness.run_with_env(
         &["service", "restart"],
         &[
             #[cfg(target_os = "macos")]
-            ("MB_TEST_LAUNCHCTL_PRINT_EXIT", "0"),
+            ("MB_TEST_LAUNCHCTL_PRINT_EXIT", "1"),
             #[cfg(target_os = "linux")]
-            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT", "0"),
+            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT", "1"),
         ],
     );
     assert!(restart.status.success(), "{}", stderr_string(&restart));
+    assert_contains_all(
+        &stdout_string(&restart),
+        &[
+            "Restarting Memory Bank service...",
+            "Warning: Sent the service request, but the managed service does not appear active yet.",
+        ],
+    );
 
     #[cfg(target_os = "macos")]
     {
         let log = harness.read_shim_log();
-        assert!(log.contains("launchctl kickstart -k"));
+        assert!(log.contains("launchctl bootstrap"));
     }
 
     #[cfg(target_os = "linux")]
     {
         let log = harness.read_shim_log();
-        assert!(log.contains("systemctl --user restart memory-bank.service"));
+        assert!(log.contains("systemctl --user start memory-bank.service"));
     }
 
     let stop = harness.run(&["service", "stop"]);
     assert!(stop.status.success(), "{}", stderr_string(&stop));
+    assert_contains_all(
+        &stdout_string(&stop),
+        &[
+            "Stopping Memory Bank service...",
+            "Warning: The managed service is already stopped.",
+        ],
+    );
 
     #[cfg(target_os = "macos")]
-    assert!(harness.read_shim_log().contains("launchctl bootout"));
+    assert!(!harness.read_shim_log().contains("launchctl bootout"));
     #[cfg(target_os = "linux")]
     assert!(
-        harness
+        !harness
             .read_shim_log()
             .contains("systemctl --user stop memory-bank.service")
     );
