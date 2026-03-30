@@ -114,7 +114,12 @@ fn configure_claude(paths: &AppPaths, server_url: &str) -> Result<(), AppError> 
     let mut root = load_json_config(&settings_path)?;
     let events = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
     for event in events {
-        let command = build_hook_command(&paths.binary_path(HOOK_BINARY_NAME), "claude-code", event, server_url);
+        let command = build_hook_command(
+            &paths.binary_path(HOOK_BINARY_NAME),
+            "claude-code",
+            event,
+            server_url,
+        );
         upsert_claude_hook(&mut root, event, &command)?;
     }
     write_json_config_with_backups(paths, &settings_path, &root)
@@ -144,7 +149,12 @@ fn configure_gemini(paths: &AppPaths, server_url: &str) -> Result<(), AppError> 
         ("AfterAgent", "*"),
     ];
     for (event, matcher) in hook_events {
-        let command = build_hook_command(&paths.binary_path(HOOK_BINARY_NAME), "gemini-cli", event, server_url);
+        let command = build_hook_command(
+            &paths.binary_path(HOOK_BINARY_NAME),
+            "gemini-cli",
+            event,
+            server_url,
+        );
         upsert_gemini_hook(&mut root, event, matcher, &command)?;
     }
     write_json_config_with_backups(paths, &settings_path, &root)
@@ -449,6 +459,8 @@ fn upsert_openclaw_plugin_load_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn claude_mcp_matches_expected_user_http_server() {
@@ -533,6 +545,131 @@ mod tests {
         assert_eq!(
             command,
             "'/Users/test/Memory Bank/bin/memory-bank-hook' --agent 'gemini-cli' --event 'BeforeAgent' --server-url 'http://127.0.0.1:3737'"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_hook_replaces_existing_memory_bank_command() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "old --agent claude-code --event Stop"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        upsert_claude_hook(&mut root, "Stop", "new-command").expect("upsert claude hook");
+
+        assert_eq!(
+            root["hooks"]["Stop"][0]["hooks"][0]["command"],
+            Value::String("new-command".to_string())
+        );
+    }
+
+    #[test]
+    fn configure_gemini_writes_mcp_hooks_and_backup() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings_path = paths.home_dir.join(".gemini/settings.json");
+        fs::create_dir_all(settings_path.parent().expect("parent")).expect("parent");
+        fs::write(&settings_path, r#"{ "existing": true }"#).expect("existing config");
+
+        configure_gemini(&paths, "http://127.0.0.1:4545").expect("configure gemini");
+
+        let rendered = load_json_config(&settings_path).expect("load gemini config");
+        assert_eq!(
+            rendered["mcpServers"]["memory-bank"]["httpUrl"],
+            Value::String("http://127.0.0.1:4545/mcp".to_string())
+        );
+        assert_eq!(
+            rendered["hooks"]["BeforeTool"][0]["hooks"][0]["name"],
+            Value::String("memory-bank".to_string())
+        );
+        assert!(settings_path.with_extension("json.mb_backup").exists());
+    }
+
+    #[test]
+    fn configure_opencode_copies_plugin_and_sets_remote_mcp_entry() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let plugin_source = paths.integrations_dir.join("opencode/memory-bank.js");
+        fs::create_dir_all(plugin_source.parent().expect("parent")).expect("parent");
+        fs::write(&plugin_source, "// plugin").expect("plugin source");
+
+        configure_opencode(&paths, "http://127.0.0.1:3737").expect("configure opencode");
+
+        let plugin_target = paths
+            .home_dir
+            .join(".config/opencode/plugins/memory-bank.js");
+        assert_eq!(
+            fs::read_to_string(plugin_target).expect("plugin"),
+            "// plugin"
+        );
+
+        let settings = load_json_config(&paths.home_dir.join(".config/opencode/opencode.json"))
+            .expect("load opencode config");
+        assert_eq!(
+            settings["mcp"]["memory-bank"]["url"],
+            Value::String("http://127.0.0.1:3737/mcp".to_string())
+        );
+        assert_eq!(settings["mcp"]["memory-bank"]["enabled"], Value::Bool(true));
+    }
+
+    #[test]
+    fn configure_openclaw_rewrites_plugin_load_paths_and_proxy_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings_path = paths.home_dir.join(".openclaw/openclaw.json");
+        fs::create_dir_all(settings_path.parent().expect("parent")).expect("parent");
+        fs::write(
+            &settings_path,
+            json!({
+                "plugins": {
+                    "load": {
+                        "paths": [
+                            "/tmp/other-plugin",
+                            "/old/repo/.openclaw/extensions/memory-bank"
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed config");
+
+        configure_openclaw(&paths, "http://127.0.0.1:6000").expect("configure openclaw");
+
+        let rendered = load_json_config(&settings_path).expect("load openclaw config");
+        assert_eq!(
+            rendered["mcp"]["servers"]["memory-bank"]["command"],
+            Value::String(
+                paths
+                    .binary_path(MCP_PROXY_BINARY_NAME)
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            rendered["plugins"]["entries"]["memory-bank"]["config"]["serverUrl"],
+            Value::String("http://127.0.0.1:6000".to_string())
+        );
+        assert_eq!(
+            rendered["plugins"]["load"]["paths"],
+            json!([
+                "/tmp/other-plugin",
+                paths
+                    .integrations_dir
+                    .join("openclaw/memory-bank")
+                    .to_string_lossy()
+                    .to_string()
+            ])
         );
     }
 }

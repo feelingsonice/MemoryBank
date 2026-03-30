@@ -103,8 +103,7 @@ pub(crate) fn load_local_model_catalog(paths: &AppPaths) -> Result<ModelCatalog,
         }
     }
 
-    ModelCatalog::from_json(EMBEDDED_MODEL_CATALOG)
-        .map_err(|error| last_error.unwrap_or(error))
+    ModelCatalog::from_json(EMBEDDED_MODEL_CATALOG).map_err(|error| last_error.unwrap_or(error))
 }
 
 pub(crate) fn fetch_ollama_models_for_setup(ollama_url: &str) -> Result<Vec<String>, AppError> {
@@ -294,6 +293,28 @@ mod tests {
     fn empty_model_catalog_still_offers_custom_entry() {
         let choices = model_choices_for_provider("ollama", None, &ModelCatalog::default());
         assert_eq!(choices, vec![ModelChoice::Custom]);
+    }
+
+    #[test]
+    fn model_choices_do_not_duplicate_current_when_it_is_already_present() {
+        let choices = model_choices_from_values(&["gpt-5.4", "gpt-5-mini"], Some("gpt-5-mini"));
+
+        assert_eq!(
+            choices,
+            vec![
+                ModelChoice::Preset("gpt-5.4".to_string()),
+                ModelChoice::Preset("gpt-5-mini".to_string()),
+                ModelChoice::Custom,
+            ]
+        );
+    }
+
+    #[test]
+    fn default_model_for_unknown_provider_falls_back_to_anthropic() {
+        assert_eq!(
+            default_model_for_provider("not-a-provider"),
+            memory_bank_app::DEFAULT_ANTHROPIC_MODEL
+        );
     }
 
     #[test]

@@ -566,8 +566,7 @@ fn is_runnable_file(path: &Path) -> bool {
 
     #[cfg(unix)]
     {
-        path
-            .metadata()
+        path.metadata()
             .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
     }
@@ -686,8 +685,140 @@ mod tests {
         let error =
             build_server_launch_spec(&paths, &settings, &secrets).expect_err("missing api key");
 
-        assert!(error
-            .to_string()
-            .contains("MEMORY_BANK_REMOTE_ENCODER_API_KEY"));
+        assert!(
+            error
+                .to_string()
+                .contains("MEMORY_BANK_REMOTE_ENCODER_API_KEY")
+        );
+    }
+
+    #[test]
+    fn launch_spec_requires_provider_secret_for_hosted_models() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("gemini".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let secrets = SecretStore::default();
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let error =
+            build_server_launch_spec(&paths, &settings, &secrets).expect_err("missing secret");
+
+        assert!(matches!(
+            error,
+            AppError::MissingProviderSecret("GEMINI_API_KEY")
+        ));
+    }
+
+    #[test]
+    fn launch_spec_requires_local_encoder_url_for_local_api() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("ollama".to_string()),
+                encoder_provider: Some("local-api".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let secrets = SecretStore::default();
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let error = build_server_launch_spec(&paths, &settings, &secrets).expect_err("missing url");
+
+        assert!(error.to_string().contains("server.local_encoder_url"));
+    }
+
+    #[test]
+    fn launch_spec_includes_ollama_and_remote_encoder_environment() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            service: Some(ServiceSettings {
+                port: Some(4040),
+                autostart: None,
+            }),
+            server: Some(ServerSettings {
+                llm_provider: Some("ollama".to_string()),
+                llm_model: Some("llama3.1".to_string()),
+                ollama_url: Some("http://ollama.internal:11434/".to_string()),
+                encoder_provider: Some("remote-api".to_string()),
+                remote_encoder_url: Some("https://encoder.example.com".to_string()),
+                nearest_neighbor_count: Some(15),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let mut secrets = SecretStore::default();
+        secrets.set("MEMORY_BANK_REMOTE_ENCODER_API_KEY", "remote-secret");
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let spec = build_server_launch_spec(&paths, &settings, &secrets).expect("spec");
+
+        assert_eq!(
+            spec.env.get("MEMORY_BANK_OLLAMA_MODEL").map(String::as_str),
+            Some("llama3.1")
+        );
+        assert_eq!(
+            spec.env.get("MEMORY_BANK_OLLAMA_URL").map(String::as_str),
+            Some("http://ollama.internal:11434")
+        );
+        assert_eq!(
+            spec.env
+                .get("MEMORY_BANK_REMOTE_ENCODER_API_KEY")
+                .map(String::as_str),
+            Some("remote-secret")
+        );
+        assert_eq!(
+            spec.env
+                .get("MEMORY_BANK_REMOTE_ENCODER_URL")
+                .map(String::as_str),
+            Some("https://encoder.example.com")
+        );
+        assert!(spec.args.contains(&"4040".to_string()));
+        assert!(spec.args.contains(&"15".to_string()));
+    }
+
+    #[test]
+    fn launch_spec_rejects_invalid_nearest_neighbor_count() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("ollama".to_string()),
+                nearest_neighbor_count: Some(0),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let secrets = SecretStore::default();
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let error = build_server_launch_spec(&paths, &settings, &secrets)
+            .expect_err("invalid nearest neighbor count");
+
+        assert!(error.to_string().contains("at least 1"));
     }
 }

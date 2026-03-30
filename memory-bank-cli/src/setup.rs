@@ -1112,7 +1112,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            integrations.gemini_cli.as_ref().map(|state| state.configured),
+            integrations
+                .gemini_cli
+                .as_ref()
+                .map(|state| state.configured),
             Some(true)
         );
         assert_eq!(
@@ -1122,6 +1125,86 @@ mod tests {
         assert_eq!(
             integrations.openclaw.as_ref().map(|state| state.configured),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn build_settings_for_default_answers_clear_default_provider_and_model() {
+        let answers = SetupAnswers {
+            namespace: Namespace::new("default"),
+            provider: "anthropic".to_string(),
+            model: memory_bank_app::DEFAULT_ANTHROPIC_MODEL.to_string(),
+            ollama_url: None,
+            autostart: false,
+            selected_agents: Vec::new(),
+            secret_choice: SecretChoice::NotRequired,
+            advanced: AdvancedAnswers::from_settings(&AppSettings::default()),
+        };
+
+        let settings = build_settings_for_answers(&AppSettings::default(), &answers, &[]);
+
+        assert_eq!(settings.active_namespace, None);
+        assert!(settings.server.is_none());
+        assert!(settings.service.is_none());
+    }
+
+    #[test]
+    fn build_settings_switching_from_ollama_clears_saved_ollama_url() {
+        let current = AppSettings {
+            server: Some(memory_bank_app::ServerSettings {
+                llm_provider: Some("ollama".to_string()),
+                ollama_url: Some("http://ollama.internal:11434".to_string()),
+                ..memory_bank_app::ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let answers = SetupAnswers {
+            namespace: Namespace::new("default"),
+            provider: "gemini".to_string(),
+            model: memory_bank_app::DEFAULT_GEMINI_MODEL.to_string(),
+            ollama_url: None,
+            autostart: false,
+            selected_agents: Vec::new(),
+            secret_choice: SecretChoice::NotRequired,
+            advanced: AdvancedAnswers::from_settings(&AppSettings::default()),
+        };
+
+        let settings = build_settings_for_answers(&current, &answers, &[]);
+        let server = settings.server.expect("server settings");
+
+        assert_eq!(server.llm_provider.as_deref(), Some("gemini"));
+        assert_eq!(server.ollama_url, None);
+    }
+
+    #[test]
+    fn apply_secret_choice_only_mutates_store_when_needed() {
+        let mut secrets = SecretStore::default();
+        secrets.set("ANTHROPIC_API_KEY", "stored");
+
+        apply_secret_choice(
+            &mut secrets,
+            &SecretChoice::KeepStored {
+                key: "ANTHROPIC_API_KEY",
+            },
+        );
+        assert_eq!(secrets.get("ANTHROPIC_API_KEY"), Some("stored"));
+
+        apply_secret_choice(
+            &mut secrets,
+            &SecretChoice::ReplaceWithEnvironment {
+                key: "ANTHROPIC_API_KEY",
+                value: "updated".to_string(),
+            },
+        );
+        assert_eq!(secrets.get("ANTHROPIC_API_KEY"), Some("updated"));
+    }
+
+    #[test]
+    fn render_agents_summary_handles_empty_and_multiple_values() {
+        assert_eq!(render_agents_summary(&[]), "none selected");
+        assert_eq!(
+            render_agents_summary(&[AgentKind::ClaudeCode, AgentKind::OpenClaw]),
+            "Claude Code, OpenClaw"
         );
     }
 }

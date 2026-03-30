@@ -83,3 +83,41 @@ impl CommandOutcome {
         AppError::CommandFailed(format!("{} {}", self.program, self.args.join(" ")), details)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_escape_handles_embedded_single_quotes() {
+        assert_eq!(
+            shell_escape("it's complicated"),
+            r#"'it'"'"'s complicated'"#
+        );
+    }
+
+    #[test]
+    fn combined_output_and_into_error_preserve_stdout_and_stderr() {
+        let outcome = CommandOutcome {
+            program: "tool".to_string(),
+            args: vec!["do".to_string(), "thing".to_string()],
+            success: false,
+            stdout: "stdout".to_string(),
+            stderr: "stderr".to_string(),
+        };
+
+        assert_eq!(outcome.combined_output(), "stdout\nstderr");
+        assert_eq!(
+            outcome.into_error().to_string(),
+            "command `tool do thing` failed: stderr\nstdout"
+        );
+    }
+
+    #[test]
+    fn run_command_capture_reports_missing_binary() {
+        let error = run_command_capture("memory-bank-cli-test-binary-that-does-not-exist", &[])
+            .expect_err("missing binary");
+
+        assert!(matches!(error, AppError::MissingBinary(_)));
+    }
+}

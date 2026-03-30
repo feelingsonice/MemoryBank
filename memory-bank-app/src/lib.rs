@@ -516,7 +516,36 @@ fn temp_write_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn app_paths_create_base_dirs_and_namespace_helpers() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        paths.ensure_base_dirs().expect("base dirs");
+        let namespace = Namespace::new("team a/1");
+        let namespace_dir = paths
+            .ensure_namespace_dir(&namespace)
+            .expect("namespace dir");
+
+        for dir in [
+            &paths.root,
+            &paths.bin_dir,
+            &paths.config_dir,
+            &paths.logs_dir,
+            &paths.namespaces_dir,
+            &paths.integrations_dir,
+            &paths.backups_dir,
+        ] {
+            assert!(dir.is_dir(), "expected {} to exist", dir.display());
+        }
+        assert_eq!(namespace_dir, paths.namespace_dir(&namespace));
+        assert!(namespace_dir.is_dir());
+        assert_eq!(paths.db_path(&namespace), namespace_dir.join("memory.db"));
+        assert_eq!(paths.binary_path("mb"), paths.bin_dir.join("mb"));
+    }
 
     #[test]
     fn settings_load_defaults_when_file_is_missing() {
@@ -638,6 +667,27 @@ port = 4444
     }
 
     #[test]
+    fn settings_reject_unsupported_schema_versions() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        paths.ensure_base_dirs().expect("base dirs");
+        fs::write(
+            &paths.settings_file,
+            r#"
+schema_version = 99
+"#,
+        )
+        .expect("write settings");
+
+        let error = AppSettings::load(&paths).expect_err("unsupported schema version");
+
+        assert!(matches!(
+            error,
+            AppConfigError::UnsupportedSchemaVersion(99)
+        ));
+    }
+
+    #[test]
     fn secret_store_parses_basic_env_lines() {
         let secrets = SecretStore::parse(
             r#"
@@ -698,6 +748,59 @@ export GEMINI_API_KEY='single quoted value'
             reloaded.get("OPENAI_API_KEY"),
             Some("value with $dollar and #hash")
         );
+    }
+
+    #[test]
+    fn secret_store_parses_bom_invalid_lines_and_empty_values() {
+        let secrets = SecretStore::parse(
+            "\u{feff}export OPENAI_API_KEY=abc123\nINVALID\n =oops\nEMPTY=\nSINGLE='C:\\\\Users\\\\me'\n",
+        );
+
+        assert_eq!(secrets.get("OPENAI_API_KEY"), Some("abc123"));
+        assert_eq!(secrets.get("EMPTY"), Some(""));
+        assert_eq!(secrets.get("SINGLE"), Some(r#"C:\Users\me"#));
+        assert_eq!(secrets.get("INVALID"), None);
+    }
+
+    #[test]
+    fn secret_store_save_sorts_keys_and_ends_with_newline() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let mut secrets = SecretStore::default();
+        secrets.set("Z_KEY", "last");
+        secrets.set("A_KEY", "first");
+
+        secrets.save(&paths).expect("save secrets");
+        let raw = fs::read_to_string(&paths.secrets_file).expect("secrets file");
+
+        let lines: Vec<_> = raw.lines().collect();
+        assert_eq!(lines, vec!["A_KEY=first", "Z_KEY=last"]);
+        assert!(raw.ends_with('\n'));
+    }
+
+    #[test]
+    fn write_json_file_creates_parent_directories_and_formats_output() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("nested/config.json");
+
+        write_json_file(&path, &json!({ "ok": true, "count": 2 })).expect("write json");
+
+        let raw = fs::read_to_string(&path).expect("config file");
+        assert!(path.exists());
+        assert!(raw.ends_with('\n'));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&raw).expect("parse json"),
+            json!({ "ok": true, "count": 2 })
+        );
+    }
+
+    #[test]
+    fn env_key_for_provider_maps_supported_values() {
+        assert_eq!(env_key_for_provider("anthropic"), Some("ANTHROPIC_API_KEY"));
+        assert_eq!(env_key_for_provider("gemini"), Some("GEMINI_API_KEY"));
+        assert_eq!(env_key_for_provider("open-ai"), Some("OPENAI_API_KEY"));
+        assert_eq!(env_key_for_provider("ollama"), None);
+        assert_eq!(env_key_for_provider("unknown"), None);
     }
 
     #[test]

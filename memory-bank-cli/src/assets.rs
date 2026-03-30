@@ -236,6 +236,39 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn ensure_path_entry_is_idempotent_for_current_shell_rc_file() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        ensure_path_entry(&paths).expect("first path update");
+        ensure_path_entry(&paths).expect("second path update");
+
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        let rc_path = if shell.ends_with("zsh") {
+            paths.home_dir.join(".zshrc")
+        } else if shell.ends_with("bash") {
+            paths.home_dir.join(".bashrc")
+        } else {
+            paths.home_dir.join(".profile")
+        };
+        let contents = fs::read_to_string(&rc_path).expect("rc file");
+
+        assert_eq!(contents.matches("# Memory Bank").count(), 1);
+        assert_eq!(contents.matches(".memory_bank/bin").count(), 1);
+    }
+
+    #[test]
+    fn copy_if_needed_is_a_no_op_for_same_path() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("file.txt");
+        fs::write(&path, "hello").expect("write file");
+
+        copy_if_needed(&path, &path).expect("copy");
+
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "hello");
+    }
+
+    #[test]
     fn install_embedded_assets_writes_complete_bundle() {
         let temp = TempDir::new().expect("tempdir");
         let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
@@ -252,5 +285,19 @@ mod tests {
             fs::read_to_string(paths.model_catalog_file).expect("model catalog"),
             EMBEDDED_MODEL_CATALOG
         );
+    }
+
+    #[test]
+    fn assets_are_not_reported_installed_when_bundle_is_incomplete() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        fs::create_dir_all(paths.integrations_dir.join("opencode")).expect("opencode dir");
+        fs::write(
+            paths.integrations_dir.join("opencode/memory-bank.js"),
+            "plugin",
+        )
+        .expect("plugin");
+
+        assert!(!assets_are_installed(&paths));
     }
 }

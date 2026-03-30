@@ -254,3 +254,25 @@ fn list_namespaces(paths: &AppPaths) -> Result<Vec<Namespace>, AppError> {
     namespaces.sort();
     Ok(namespaces)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn list_namespaces_returns_sorted_directories_only() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        fs::create_dir_all(paths.namespaces_dir.join("zeta")).expect("zeta");
+        fs::create_dir_all(paths.namespaces_dir.join("alpha team")).expect("alpha");
+        fs::write(paths.namespaces_dir.join("README.txt"), "ignore").expect("file");
+
+        let namespaces = list_namespaces(&paths).expect("list namespaces");
+
+        assert_eq!(
+            namespaces,
+            vec![Namespace::new("alpha team"), Namespace::new("zeta")]
+        );
+    }
+}

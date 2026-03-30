@@ -402,4 +402,67 @@ mod tests {
         assert_eq!(server.llm_model, None);
         assert_eq!(server.ollama_url, None);
     }
+
+    #[test]
+    fn config_set_default_values_clear_overrides_and_sections() {
+        let mut settings = AppSettings::default();
+
+        set_config_value(&mut settings, "active_namespace", "work").expect("set namespace");
+        set_config_value(&mut settings, "service.port", "4545").expect("set port");
+        set_config_value(&mut settings, "service.port", "3737").expect("reset port");
+        set_config_value(&mut settings, "active_namespace", " default ").expect("reset namespace");
+
+        assert_eq!(settings.active_namespace, None);
+        assert!(settings.service.is_none());
+    }
+
+    #[test]
+    fn config_set_switching_away_from_ollama_clears_saved_ollama_url() {
+        let mut settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("ollama".to_string()),
+                ollama_url: Some("http://ollama.internal:11434".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+
+        set_config_value(&mut settings, "server.llm_provider", "anthropic").expect("set provider");
+
+        assert!(settings.server.is_none());
+    }
+
+    #[test]
+    fn config_set_integration_flags_round_trip() {
+        let mut settings = AppSettings::default();
+
+        set_config_value(&mut settings, "integrations.openclaw.configured", "true")
+            .expect("set integration");
+        assert_eq!(
+            get_config_value(&settings, "integrations.openclaw.configured")
+                .expect("get integration"),
+            "true"
+        );
+
+        set_config_value(&mut settings, "integrations.openclaw.configured", "false")
+            .expect("unset integration");
+        assert_eq!(
+            get_config_value(&settings, "integrations.openclaw.configured")
+                .expect("get integration"),
+            "false"
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_invalid_bool_and_neighbor_count() {
+        let mut settings = AppSettings::default();
+
+        let bool_error = set_config_value(&mut settings, "service.autostart", "sometimes")
+            .expect_err("invalid bool");
+        assert!(bool_error.to_string().contains("provided string was not"));
+
+        let count_error = set_config_value(&mut settings, "server.nearest_neighbor_count", "0")
+            .expect_err("invalid count");
+        assert!(count_error.to_string().contains("at least 1"));
+    }
 }

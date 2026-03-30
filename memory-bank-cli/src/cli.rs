@@ -70,3 +70,45 @@ pub enum ConfigCommand {
 pub enum InternalCommand {
     RunServer,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_service_logs_follow_flag() {
+        let cli = Cli::try_parse_from(["mb", "service", "logs", "--follow"]).expect("parse cli");
+
+        assert!(matches!(
+            cli.command,
+            Command::Service {
+                command: ServiceCommand::Logs { follow: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_config_set_command() {
+        let cli = Cli::try_parse_from(["mb", "config", "set", "service.port", "4545"])
+            .expect("parse cli");
+
+        assert!(matches!(
+            cli.command,
+            Command::Config {
+                command: ConfigCommand::Set { key, value }
+            } if key == "service.port" && value == "4545"
+        ));
+    }
+
+    #[test]
+    fn parses_hidden_internal_command() {
+        let cli = Cli::try_parse_from(["mb", "internal", "run-server"]).expect("parse cli");
+
+        assert!(matches!(
+            cli.command,
+            Command::Internal {
+                command: InternalCommand::RunServer
+            }
+        ));
+    }
+}
