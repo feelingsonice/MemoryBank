@@ -14,7 +14,7 @@ use crate::models::{
     model_choices_for_provider, model_choices_from_values, refresh_model_catalog,
 };
 use crate::service::{HealthCheck, install_service, start_service, wait_for_health};
-use inquire::ui::{Color, RenderConfig, StyleSheet, Styled};
+use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, MultiSelect, Select, Text, set_global_render_config};
 use memory_bank_app::{
@@ -180,7 +180,10 @@ pub(crate) fn run_setup() -> Result<(), AppError> {
     {
         Ok(Some(answers)) => answers,
         Ok(None) | Err(AppError::SetupCanceled) => {
-            println!("Setup canceled. No changes were made.");
+            println!(
+                "{}",
+                styled_warning("Setup canceled. No changes were made.")
+            );
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -197,7 +200,10 @@ pub(crate) fn run_setup() -> Result<(), AppError> {
         )
         .prompt_skippable()?;
     if !matches!(confirm, Some(true)) {
-        println!("Setup canceled. No changes were made.");
+        println!(
+            "{}",
+            styled_warning("Setup canceled. No changes were made.")
+        );
         return Ok(());
     }
 
@@ -205,17 +211,25 @@ pub(crate) fn run_setup() -> Result<(), AppError> {
         apply_setup_answers(&paths, &mut settings, &mut secrets, &answers)?;
     println!();
     println!(
-        "Memory Bank is ready on {} using namespace `{}` and provider `{}`.",
-        memory_bank_app::default_server_url(&settings),
-        health.namespace,
-        health.llm_provider
+        "{}",
+        styled_success(&format!(
+            "Memory Bank is ready on {} using namespace `{}` and provider `{}`.",
+            memory_bank_app::default_server_url(&settings),
+            health.namespace,
+            health.llm_provider
+        ))
     );
     if !agent_outcome.warnings.is_empty() {
-        println!("Some agent integrations need attention:");
+        println!(
+            "{}",
+            styled_warning("Some agent integrations need attention:")
+        );
         for warning in agent_outcome.warnings {
             println!("  - {warning}");
         }
     }
+    println!();
+    println!("{}", render_post_setup_help());
     Ok(())
 }
 
@@ -238,13 +252,22 @@ fn setup_render_config() -> RenderConfig<'static> {
     } else {
         RenderConfig::default_colored()
     };
-    config.prompt_prefix = Styled::new("mb>");
-    config.answered_prompt_prefix = Styled::new("->");
-    config.highlighted_option_prefix = Styled::new(">");
-    config.selected_checkbox = Styled::new("[x]");
-    config.unselected_checkbox = Styled::new("[ ]");
+    config.prompt_prefix = Styled::new("mb>")
+        .with_fg(Color::LightBlue)
+        .with_attr(Attributes::BOLD);
+    config.answered_prompt_prefix = Styled::new("->")
+        .with_fg(Color::LightGreen)
+        .with_attr(Attributes::BOLD);
+    config.highlighted_option_prefix = Styled::new(">")
+        .with_fg(Color::LightCyan)
+        .with_attr(Attributes::BOLD);
+    config.selected_checkbox = Styled::new("[x]").with_fg(Color::LightGreen);
+    config.unselected_checkbox = Styled::new("[ ]").with_fg(Color::DarkGrey);
+    config.prompt = StyleSheet::new().with_attr(Attributes::BOLD);
     config.help_message = StyleSheet::new().with_fg(Color::DarkGrey);
-    config.answer = StyleSheet::new().with_fg(Color::LightCyan);
+    config.answer = StyleSheet::new()
+        .with_fg(Color::LightCyan)
+        .with_attr(Attributes::BOLD);
     config.selected_option = Some(StyleSheet::new().with_fg(Color::LightBlue));
     config
 }
@@ -252,6 +275,42 @@ fn setup_render_config() -> RenderConfig<'static> {
 fn no_color_requested() -> bool {
     std::env::var_os("NO_COLOR").is_some()
         || matches!(std::env::var("TERM").ok().as_deref(), Some("dumb"))
+}
+
+fn paint(text: &str, code: &str) -> String {
+    if no_color_requested() {
+        text.to_string()
+    } else {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    }
+}
+
+fn styled_title(text: &str) -> String {
+    paint(text, "1;36")
+}
+
+fn styled_command(text: &str) -> String {
+    paint(text, "1;36")
+}
+
+fn styled_section(text: &str) -> String {
+    paint(&format!("== {text} =="), "1;34")
+}
+
+fn styled_subtle(text: &str) -> String {
+    paint(text, "2")
+}
+
+fn styled_success(text: &str) -> String {
+    paint(text, "1;32")
+}
+
+fn styled_warning(text: &str) -> String {
+    paint(text, "1;33")
+}
+
+fn styled_failure(text: &str) -> String {
+    paint(text, "1;31")
 }
 
 fn collect_setup_answers(
@@ -319,9 +378,11 @@ fn collect_setup_answers(
         None => return Ok(None),
     };
 
-    println!();
-    println!("Agent integrations");
-    println!("Choose one or more agents to configure in this setup run.");
+    print_setup_section("Agent integrations");
+    println!(
+        "{}",
+        styled_subtle("Choose one or more agents to configure in this setup run.")
+    );
     let selected_agents = match prompt_agents(detected_agents)? {
         Some(selected_agents) => selected_agents,
         None => return Ok(None),
@@ -329,8 +390,7 @@ fn collect_setup_answers(
 
     let mut advanced = AdvancedAnswers::from_settings(settings);
     let has_existing_advanced = advanced.has_overrides();
-    println!();
-    println!("Advanced settings");
+    print_setup_section("Advanced settings");
     let configure_advanced = match Confirm::new("Configure advanced settings?")
         .with_default(has_existing_advanced)
         .with_help_message(
@@ -362,14 +422,22 @@ fn collect_setup_answers(
 }
 
 fn print_setup_intro() {
-    println!("Memory Bank Setup");
-    println!("Configure the local Memory Bank service and any detected agent integrations.");
-    println!("You will review everything before any changes are applied.");
+    println!("{}", styled_title("Memory Bank Setup"));
+    println!(
+        "{}",
+        styled_subtle(
+            "Configure the local Memory Bank service and any detected agent integrations."
+        )
+    );
+    println!(
+        "{}",
+        styled_subtle("You will review everything before any changes are applied.")
+    );
 }
 
 fn print_setup_section(title: &str) {
     println!();
-    println!("{title}");
+    println!("{}", styled_section(title));
 }
 
 fn apply_setup_answers(
@@ -392,11 +460,11 @@ fn apply_setup_answers(
         let outcome =
             configure_selected_agents(paths, &preview_settings, &answers.selected_agents)?;
         if answers.selected_agents.is_empty() {
-            println!("done (no agents selected)");
+            println!("{}", styled_subtle("skipped (no agents selected)"));
         } else if outcome.warnings.is_empty() {
-            println!("done");
+            println!("{}", styled_success("done"));
         } else {
-            println!("done with warnings");
+            println!("{}", styled_warning("done with warnings"));
         }
         outcome
     };
@@ -425,7 +493,10 @@ fn apply_setup_answers(
 }
 
 fn print_step_start(index: usize, total: usize, label: &str) -> Result<(), AppError> {
-    print!("[{index}/{total}] {label}... ");
+    print!(
+        "{} {label}... ",
+        styled_subtle(&format!("[{index}/{total}]"))
+    );
     io::stdout().flush()?;
     Ok(())
 }
@@ -437,11 +508,11 @@ where
     print_step_start(index, total, label)?;
     match action() {
         Ok(value) => {
-            println!("done");
+            println!("{}", styled_success("done"));
             Ok(value)
         }
         Err(error) => {
-            println!("failed");
+            println!("{}", styled_failure("failed"));
             Err(error)
         }
     }
@@ -586,13 +657,19 @@ fn prompt_ollama_model(
         }
         Ok(_) => {
             println!(
-                "No local Ollama models were detected at {}.",
-                ollama_url.trim_end_matches('/')
+                "{}",
+                styled_warning(&format!(
+                    "No local Ollama models were detected at {}.",
+                    ollama_url.trim_end_matches('/')
+                ))
             );
             prompt_custom_ollama_model(current, catalog)
         }
         Err(error) => {
-            println!("Could not query Ollama at {ollama_url}: {error}");
+            println!(
+                "{}",
+                styled_warning(&format!("Could not query Ollama at {ollama_url}: {error}"))
+            );
             prompt_custom_ollama_model(current, catalog)
         }
     }
@@ -634,7 +711,10 @@ fn prompt_autostart(current: Option<bool>) -> Result<Option<bool>, AppError> {
 fn prompt_agents(detected: &[AgentKind]) -> Result<Option<Vec<AgentKind>>, AppError> {
     if detected.is_empty() {
         println!(
-            "No supported agents were detected on PATH. You can rerun `mb setup` later after installing Claude Code, Gemini CLI, OpenCode, or OpenClaw."
+            "{}",
+            styled_warning(
+                "No supported agents were detected on PATH. You can rerun `mb setup` later after installing Claude Code, Gemini CLI, OpenCode, or OpenClaw."
+            )
         );
         return Ok(Some(Vec::new()));
     }
@@ -933,34 +1013,72 @@ fn apply_secret_choice(secrets: &mut SecretStore, choice: &SecretChoice) {
 
 fn render_review_summary(answers: &SetupAnswers) -> String {
     let mut lines = vec![
-        "Setup review".to_string(),
-        format!("  Namespace: {}", answers.namespace),
+        styled_section("Setup review"),
+        "  Basic".to_string(),
+        format!("    Namespace: {}", answers.namespace),
+        String::new(),
+        "  LLM configuration".to_string(),
         format!(
-            "  Provider: {}",
+            "    Provider: {}",
             ProviderChoice::from_config_value(Some(&answers.provider))
         ),
-        format!("  Model: {}", answers.model),
-        format!("  Autostart: {}", yes_no(answers.autostart)),
+        format!("    Model: {}", answers.model),
+        format!("    Secret: {}", answers.secret_choice.summary()),
+        String::new(),
+        "  Preferences".to_string(),
+        format!("    Autostart: {}", yes_no(answers.autostart)),
+        String::new(),
+        "  Agent integrations".to_string(),
         format!(
-            "  Agents: {}",
+            "    Selected: {}",
             render_agents_summary(&answers.selected_agents)
         ),
-        format!("  Secret: {}", answers.secret_choice.summary()),
     ];
 
     if let Some(url) = answers.ollama_url.as_deref() {
-        lines.push(format!("  Ollama URL: {url}"));
+        lines.insert(6, format!("    Ollama URL: {url}"));
     }
 
     let overrides = answers.advanced.override_lines();
-    if !overrides.is_empty() {
-        lines.push("  Advanced overrides:".to_string());
+    lines.push(String::new());
+    lines.push("  Advanced settings".to_string());
+    if overrides.is_empty() {
+        lines.push("    Using defaults".to_string());
+    } else {
         for line in overrides {
             lines.push(format!("    {line}"));
         }
     }
 
     lines.join("\n")
+}
+
+fn render_post_setup_help() -> String {
+    [
+        styled_section("What's next"),
+        "A few useful commands after setup:".to_string(),
+        // format!(
+        //     "  {}  Check service health, namespace, and provider",
+        //     styled_command("mb status")
+        // ),
+        // format!(
+        //     "  {}  Watch the managed service logs live",
+        //     styled_command("mb logs -f")
+        // ),
+        format!(
+            "  {}  Review the saved configuration",
+            styled_command("mb config show")
+        ),
+        format!(
+            "  {}  Run the guided setup again any time",
+            styled_command("mb setup")
+        ),
+        format!(
+            "  {}  Check for common install or config issues",
+            styled_command("mb doctor")
+        ),
+    ]
+    .join("\n")
 }
 
 fn render_agents_summary(agents: &[AgentKind]) -> String {
@@ -1019,6 +1137,17 @@ mod tests {
         assert!(summary.contains("Store a newly entered ANTHROPIC_API_KEY"));
         assert!(!summary.contains("super-secret"));
         assert!(!summary.contains("Advanced overrides"));
+    }
+
+    #[test]
+    fn render_post_setup_help_mentions_key_commands() {
+        let help = render_post_setup_help();
+
+        assert!(help.contains("mb status"));
+        assert!(help.contains("mb logs -f"));
+        assert!(help.contains("mb config show"));
+        assert!(help.contains("mb setup"));
+        assert!(help.contains("mb doctor"));
     }
 
     #[test]
