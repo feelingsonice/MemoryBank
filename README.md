@@ -378,6 +378,7 @@ The exact setup steps and examples for those files live in [`/docs`](./docs).
 Memory Bank stores data under your home directory in a top-level `.memory_bank` folder.
 
 - App root: `{home_dir}/.memory_bank/`
+- App settings: `{home_dir}/.memory_bank/settings.toml`
 - Namespaces: `{home_dir}/.memory_bank/namespaces/<namespace>/`
 - Database: `{home_dir}/.memory_bank/namespaces/<namespace>/memory.db`
 - Model cache: `{home_dir}/.memory_bank/models/`

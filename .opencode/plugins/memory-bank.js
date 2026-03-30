@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 const LOG_SERVICE = "memory-bank-opencode";
 const DEFAULT_AGENT = "opencode";
 const APP_ROOT_DIR_NAME = ".memory_bank";
+const APP_SETTINGS_FILE_NAME = "settings.toml";
 const DEFAULT_SERVER_URL = "http://127.0.0.1:3737";
 const DEDUPE_CACHE_LIMIT = 2048;
 const IMMEDIATE_ASSISTANT_RETRY_ATTEMPTS = 4;
@@ -888,17 +889,85 @@ function loadAppSettings(platform) {
     return null;
   }
 
-  const settingsPath = path.join(appRoot, "settings.json");
+  const settingsPath = path.join(appRoot, APP_SETTINGS_FILE_NAME);
   if (!platform.fileExists(settingsPath)) {
     return null;
   }
 
   try {
     const contents = platform.readFile(settingsPath);
-    return JSON.parse(contents);
+    return parseAppSettingsToml(contents);
   } catch {
     return null;
   }
+}
+
+function parseAppSettingsToml(contents) {
+  let currentSection = null;
+  let port = null;
+
+  for (const rawLine of String(contents).replace(/^\uFEFF/, "").split(/\r?\n/u)) {
+    const line = stripTomlLineComment(rawLine).trim();
+    if (!line) {
+      continue;
+    }
+
+    const sectionMatch = line.match(/^\[(.+)\]$/u);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1].trim();
+      continue;
+    }
+
+    if (currentSection !== "service") {
+      continue;
+    }
+
+    const portMatch = line.match(/^port\s*=\s*(\d+)\s*$/u);
+    if (!portMatch) {
+      continue;
+    }
+
+    const parsed = Number.parseInt(portMatch[1], 10);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 65535) {
+      port = parsed;
+    }
+  }
+
+  return port === null ? null : { service: { port } };
+}
+
+function stripTomlLineComment(line) {
+  let inDoubleQuote = false;
+  let escaped = false;
+  let result = "";
+
+  for (const char of line) {
+    if (inDoubleQuote) {
+      result += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inDoubleQuote = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inDoubleQuote = true;
+      result += char;
+      continue;
+    }
+
+    if (char === "#") {
+      break;
+    }
+
+    result += char;
+  }
+
+  return result;
 }
 
 function resolveServerUrlFromSettings(appSettings) {
