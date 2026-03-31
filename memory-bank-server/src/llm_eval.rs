@@ -1,5 +1,5 @@
 use crate::actor::process_turn_for_real_clients;
-use crate::config::{EncoderProviderConfig, LlmProviderConfig};
+use crate::config::{EncoderProviderConfig, LlmProviderConfig, LlmProviderType};
 use crate::db::MemoryDb;
 use crate::encoder::{self, EmbeddingInput, EncoderClient};
 use crate::llm::{self, LlmClient};
@@ -7,17 +7,19 @@ use crate::memory_window::{MemoryProjection, MemoryStep, ProjectedConversationWi
 use crate::retrieval_eval::real_eval_lock;
 use chrono::Utc;
 use memory_bank_app::{
-    AppPaths, DEFAULT_FASTEMBED_MODEL, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL,
+    AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL, DEFAULT_GEMINI_MODEL,
+    DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL,
 };
 use serde::Serialize;
 use sqlx::Row;
 use std::collections::HashMap;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
-const OLLAMA_EVAL_ENV: &str = "MEMORY_BANK_OLLAMA_EVALS";
-const OLLAMA_EVAL_MODEL_ENV: &str = "MEMORY_BANK_OLLAMA_EVAL_MODEL";
+const LLM_EVAL_ENV: &str = "MEMORY_BANK_LLM_EVALS";
+const LLM_EVAL_MODEL_ENV: &str = "MEMORY_BANK_LLM_EVAL_MODEL";
 const NOTE_TIMESTAMP: &str = "2026-03-30T00:00:00Z";
 const QUORUM_RUNS: usize = 3;
 const QUORUM_REQUIRED: usize = 2;
@@ -52,7 +54,7 @@ struct FixtureExpectation {
 }
 
 #[derive(Debug, Clone)]
-struct OllamaFixture {
+struct LlmFixture {
     name: &'static str,
     description: &'static str,
     notes: Vec<SeedNote>,
@@ -61,8 +63,9 @@ struct OllamaFixture {
 }
 
 #[derive(Debug, Serialize)]
-struct OllamaEvalReport {
+struct LlmEvalReport {
     suite: &'static str,
+    provider_name: String,
     encoder_model_id: String,
     model_id: String,
     nearest_neighbor_count: i32,
@@ -100,15 +103,16 @@ struct FixtureRunReport {
 struct RealHarness {
     encoder_model_id: String,
     encoder_client: EncoderClient,
+    llm_provider_name: String,
     llm_model_id: String,
     llm_client: LlmClient,
 }
 
 fn evals_enabled(test_name: &str) -> bool {
-    if env::var(OLLAMA_EVAL_ENV).ok().as_deref() == Some("1") {
+    if env::var(LLM_EVAL_ENV).ok().as_deref() == Some("1") {
         true
     } else {
-        eprintln!("skipping {test_name} because {OLLAMA_EVAL_ENV}=1 is not set");
+        eprintln!("skipping {test_name} because {LLM_EVAL_ENV}=1 is not set");
         false
     }
 }
@@ -133,23 +137,136 @@ fn initialize_real_harness() -> RealHarness {
     )
     .expect("initialize real fastembed encoder");
 
-    let ollama_model = env::var(OLLAMA_EVAL_MODEL_ENV)
-        .or_else(|_| env::var("MEMORY_BANK_OLLAMA_MODEL"))
-        .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
-    let ollama_url =
-        env::var("MEMORY_BANK_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string());
-    let llm = llm::initialize(LlmProviderConfig::Ollama {
-        url: ollama_url,
-        model: ollama_model,
-    })
-    .expect("initialize real ollama llm");
+    let base_llm_config =
+        resolve_current_llm_provider_config().expect("resolve configured llm provider");
+    let llm_config = match resolve_eval_model_override() {
+        Some(model) => base_llm_config.with_model_override(model),
+        None => base_llm_config,
+    };
+    let llm_provider_name = llm_config.provider_name().to_string();
+    let llm = llm::initialize(llm_config).expect("initialize real llm provider");
 
     RealHarness {
         encoder_model_id: encoder.model_id,
         encoder_client: encoder.client,
+        llm_provider_name,
         llm_model_id: llm.model_id,
         llm_client: llm.client,
     }
+}
+
+fn resolve_current_llm_provider_config() -> Result<LlmProviderConfig, crate::error::AppError> {
+    let app_paths = AppPaths::from_system()
+        .map_err(|error| crate::error::AppError::Config(error.to_string()))?;
+    let settings = AppSettings::load(&app_paths)
+        .map_err(|error| crate::error::AppError::Config(error.to_string()))?;
+    let server_settings = settings.server.as_ref();
+    let env_provider = env::var("MEMORY_BANK_LLM_PROVIDER").ok();
+    let env_provider = parse_optional_value(env_provider.as_deref())?;
+    let settings_provider =
+        parse_optional_value(server_settings.and_then(|value| value.llm_provider.as_deref()))?;
+    let provider = env_provider
+        .or(settings_provider)
+        .unwrap_or(LlmProviderType::Anthropic);
+
+    resolve_llm_provider_config(provider, server_settings)
+}
+
+fn resolve_llm_provider_config(
+    provider: LlmProviderType,
+    settings: Option<&memory_bank_app::ServerSettings>,
+) -> Result<LlmProviderConfig, crate::error::AppError> {
+    match provider {
+        LlmProviderType::Gemini => Ok(LlmProviderConfig::Gemini {
+            api_key: require_env("GEMINI_API_KEY")?,
+            model: env_setting_or_default(
+                "MEMORY_BANK_LLM_MODEL",
+                settings.and_then(|value| value.llm_model.as_deref()),
+                DEFAULT_GEMINI_MODEL,
+            ),
+        }),
+        LlmProviderType::Anthropic => Ok(LlmProviderConfig::Anthropic {
+            api_key: require_env("ANTHROPIC_API_KEY")?,
+            model: env_setting_or_default(
+                "MEMORY_BANK_LLM_MODEL",
+                settings.and_then(|value| value.llm_model.as_deref()),
+                DEFAULT_ANTHROPIC_MODEL,
+            ),
+        }),
+        LlmProviderType::OpenAi => Ok(LlmProviderConfig::OpenAi {
+            api_key: require_env("OPENAI_API_KEY")?,
+            model: env_setting_or_default(
+                "MEMORY_BANK_LLM_MODEL",
+                settings.and_then(|value| value.llm_model.as_deref()),
+                DEFAULT_OPENAI_MODEL,
+            ),
+        }),
+        LlmProviderType::Ollama => Ok(LlmProviderConfig::Ollama {
+            url: env_setting_or_default(
+                "MEMORY_BANK_OLLAMA_URL",
+                settings.and_then(|value| value.ollama_url.as_deref()),
+                DEFAULT_OLLAMA_URL,
+            ),
+            model: env_setting_or_default(
+                "MEMORY_BANK_OLLAMA_MODEL",
+                settings.and_then(|value| value.llm_model.as_deref()),
+                DEFAULT_OLLAMA_MODEL,
+            ),
+        }),
+    }
+}
+
+fn parse_optional_value<T>(value: Option<&str>) -> Result<Option<T>, crate::error::AppError>
+where
+    T: std::str::FromStr,
+    T::Err: fmt::Display,
+{
+    match value {
+        Some(value) => value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|error| crate::error::AppError::Config(error.to_string())),
+        None => Ok(None),
+    }
+}
+
+fn require_env(name: &str) -> Result<String, crate::error::AppError> {
+    env::var(name).map_err(|_| crate::error::AppError::Config(format!("{name} must be set")))
+}
+
+fn env_setting_or_default(name: &str, setting: Option<&str>, default: &str) -> String {
+    env::var(name)
+        .ok()
+        .or_else(|| setting.map(str::to_owned))
+        .unwrap_or_else(|| default.to_string())
+}
+
+trait TestLlmConfigExt {
+    fn with_model_override(self, model: String) -> Self;
+}
+
+impl TestLlmConfigExt for LlmProviderConfig {
+    fn with_model_override(self, model: String) -> Self {
+        match self {
+            LlmProviderConfig::Gemini { api_key, .. } => {
+                LlmProviderConfig::Gemini { api_key, model }
+            }
+            LlmProviderConfig::Anthropic { api_key, .. } => {
+                LlmProviderConfig::Anthropic { api_key, model }
+            }
+            LlmProviderConfig::OpenAi { api_key, .. } => {
+                LlmProviderConfig::OpenAi { api_key, model }
+            }
+            LlmProviderConfig::Ollama { url, .. } => LlmProviderConfig::Ollama { url, model },
+        }
+    }
+}
+
+fn resolve_eval_model_override() -> Option<String> {
+    env::var(LLM_EVAL_MODEL_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn seed_fixture_db(
@@ -262,9 +379,9 @@ fn build_window(
     }
 }
 
-fn build_fixtures() -> Vec<OllamaFixture> {
+fn build_fixtures() -> Vec<LlmFixture> {
     vec![
-        OllamaFixture {
+        LlmFixture {
             name: "links_obvious_related_memory",
             description: "Links a paraphrased follow-up to the clearly related existing memory only.",
             notes: vec![
@@ -299,7 +416,7 @@ fn build_fixtures() -> Vec<OllamaFixture> {
                 forbidden_links: vec!["http-distractor", "cache-distractor"],
             },
         },
-        OllamaFixture {
+        LlmFixture {
             name: "avoids_bogus_links_for_shared_infra_words",
             description: "Avoids linking notes that only share broad infrastructure vocabulary.",
             notes: vec![
@@ -334,7 +451,7 @@ fn build_fixtures() -> Vec<OllamaFixture> {
                 forbidden_links: vec!["queue-neighbor", "cache-neighbor", "storage-neighbor"],
             },
         },
-        OllamaFixture {
+        LlmFixture {
             name: "links_followup_decision_across_rewording",
             description: "Links a reworded follow-up back to the prior decision memory only.",
             notes: vec![
@@ -373,7 +490,7 @@ fn build_fixtures() -> Vec<OllamaFixture> {
 }
 
 async fn run_fixture_once(
-    fixture: &OllamaFixture,
+    fixture: &LlmFixture,
     run_index: usize,
     harness: &RealHarness,
 ) -> FixtureRunReport {
@@ -556,7 +673,7 @@ async fn compute_updated_neighbor_slugs(
     updated
 }
 
-async fn run_fixture(fixture: &OllamaFixture, harness: &RealHarness) -> FixtureReport {
+async fn run_fixture(fixture: &LlmFixture, harness: &RealHarness) -> FixtureReport {
     let mut runs = Vec::with_capacity(QUORUM_RUNS);
     let mut passed_runs = 0;
 
@@ -577,7 +694,7 @@ async fn run_fixture(fixture: &OllamaFixture, harness: &RealHarness) -> FixtureR
     }
 }
 
-async fn run_ollama_eval(harness: &RealHarness) -> OllamaEvalReport {
+async fn run_llm_eval(harness: &RealHarness) -> LlmEvalReport {
     let fixtures = build_fixtures();
     let mut reports = Vec::with_capacity(fixtures.len());
 
@@ -585,8 +702,9 @@ async fn run_ollama_eval(harness: &RealHarness) -> OllamaEvalReport {
         reports.push(run_fixture(fixture, harness).await);
     }
 
-    OllamaEvalReport {
-        suite: "ollama",
+    LlmEvalReport {
+        suite: "llm",
+        provider_name: harness.llm_provider_name.clone(),
         encoder_model_id: harness.encoder_model_id.clone(),
         model_id: harness.llm_model_id.clone(),
         nearest_neighbor_count: NEAREST_NEIGHBOR_COUNT,
@@ -598,15 +716,15 @@ async fn run_ollama_eval(harness: &RealHarness) -> OllamaEvalReport {
 
 #[tokio::test]
 #[ignore]
-async fn real_ollama_functional_eval() {
-    if !evals_enabled("real_ollama_functional_eval") {
+async fn real_llm_functional_eval() {
+    if !evals_enabled("real_llm_functional_eval") {
         return;
     }
 
     let _guard = real_eval_lock().lock().await;
     let harness = initialize_real_harness();
-    let report = run_ollama_eval(&harness).await;
-    let pretty = serde_json::to_string_pretty(&report).expect("serialize ollama eval report");
+    let report = run_llm_eval(&harness).await;
+    let pretty = serde_json::to_string_pretty(&report).expect("serialize llm eval report");
     println!("{pretty}");
 
     for fixture in &report.fixtures {

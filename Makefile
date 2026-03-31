@@ -1,6 +1,21 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help fmt fmt-check check build build-release test test-ci test-cli test-cli-blackbox test-cli-real test-cli-all test-server-retrieval-evals test-server-ollama-evals validate install-from-source
+.PHONY: help fmt fmt-check check build build-release test test-ci test-cli test-cli-blackbox test-cli-real test-cli-all test-server-retrieval-evals test-server-llm-evals validate install-from-source
+
+ifneq ($(filter test-server-llm-evals,$(firstword $(MAKECMDGOALS))),)
+LLM_EVAL_PROVIDER_ARG := $(word 2,$(MAKECMDGOALS))
+LLM_EVAL_MODEL_ARG := $(word 3,$(MAKECMDGOALS))
+
+ifneq ($(strip $(LLM_EVAL_PROVIDER_ARG)),)
+export MEMORY_BANK_LLM_PROVIDER := $(LLM_EVAL_PROVIDER_ARG)
+$(eval $(LLM_EVAL_PROVIDER_ARG):;@:)
+endif
+
+ifneq ($(strip $(LLM_EVAL_MODEL_ARG)),)
+export MEMORY_BANK_LLM_EVAL_MODEL := $(LLM_EVAL_MODEL_ARG)
+$(eval $(subst :,\:,$(LLM_EVAL_MODEL_ARG)):;@:)
+endif
+endif
 
 help:
 	@printf "%s\n" \
@@ -18,7 +33,7 @@ help:
 		"  make test-cli-real     Run opt-in real installed-CLI tests for memory-bank-cli" \
 		"  make test-cli-all      Run all memory-bank-cli tests, including real installed-CLI tests" \
 		"  make test-server-retrieval-evals  Run opt-in real-encoder retrieval evals for memory-bank-server" \
-		"  make test-server-ollama-evals  Run opt-in real Ollama functional evals for memory-bank-server" \
+		"  make test-server-llm-evals [provider] [model]  Run opt-in real LLM functional evals for memory-bank-server" \
 		"  make validate          Run fmt-check, check, and test-ci" \
 		"  make install-from-source  Build and install this checkout into ~/.memory_bank"
 
@@ -59,8 +74,8 @@ test-cli-all:
 test-server-retrieval-evals:
 	MEMORY_BANK_RETRIEVAL_EVALS=1 cargo test -p memory-bank-server retrieval_eval:: -- --ignored --nocapture
 
-test-server-ollama-evals:
-	MEMORY_BANK_OLLAMA_EVALS=1 cargo test -p memory-bank-server ollama_eval:: -- --ignored --nocapture
+test-server-llm-evals:
+	MEMORY_BANK_LLM_EVALS=1 cargo test -p memory-bank-server llm_eval:: -- --ignored --nocapture
 
 validate: fmt-check check test-ci
 

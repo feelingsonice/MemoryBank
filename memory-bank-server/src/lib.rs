@@ -6,11 +6,11 @@ pub mod error;
 mod http_server;
 mod ingest;
 mod llm;
+#[cfg(test)]
+mod llm_eval;
 mod logging;
 mod mcp_server;
 mod memory_window;
-#[cfg(test)]
-mod ollama_eval;
 #[cfg(test)]
 mod retrieval_eval;
 mod startup_state;
