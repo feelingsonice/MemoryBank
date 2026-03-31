@@ -18,6 +18,22 @@ pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
 pub const DEFAULT_FASTEMBED_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
+pub const SERVER_STARTUP_STATE_FILE_NAME: &str = "server-startup.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerStartupPhase {
+    Reindexing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerStartupState {
+    pub pid: u32,
+    pub namespace: String,
+    pub phase: ServerStartupPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_count: Option<usize>,
+}
 
 #[derive(Debug, Error)]
 pub enum AppConfigError {
@@ -163,6 +179,11 @@ impl AppPaths {
 
     pub fn db_path(&self, namespace: &Namespace) -> PathBuf {
         self.namespace_dir(namespace).join("memory.db")
+    }
+
+    pub fn server_startup_state_path(&self, namespace: &Namespace) -> PathBuf {
+        self.namespace_dir(namespace)
+            .join(SERVER_STARTUP_STATE_FILE_NAME)
     }
 
     pub fn models_dir(&self) -> PathBuf {

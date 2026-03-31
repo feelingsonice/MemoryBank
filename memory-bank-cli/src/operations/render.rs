@@ -5,6 +5,7 @@ use crate::output::{
 };
 use crate::service::{HealthCheck, ServiceActionKind, ServiceActionReport, ServiceRuntimeSummary};
 use memory_bank_app::AppSettings;
+use memory_bank_app::ServerStartupPhase;
 
 pub(super) fn runtime_mismatch_fields<'a>(
     settings: &'a AppSettings,
@@ -29,6 +30,20 @@ pub(super) fn runtime_mismatch_fields<'a>(
 }
 
 pub(super) fn runtime_health_warning(runtime: &ServiceRuntimeSummary) -> Option<String> {
+    if runtime.active
+        && runtime.health.is_none()
+        && let Some(state) = runtime.startup_state.as_ref()
+        && state.phase == ServerStartupPhase::Reindexing
+    {
+        return Some(match state.memory_count {
+            Some(memory_count) => format!(
+                "The service process is running, but Memory Bank is not up yet because it is rebuilding the vector index and re-encoding {memory_count} stored memor{}.",
+                if memory_count == 1 { "y" } else { "ies" }
+            ),
+            None => "The service process is running, but Memory Bank is not up yet because it is rebuilding the vector index and re-encoding stored memories.".to_string(),
+        });
+    }
+
     match (runtime.active, runtime.health.is_some()) {
         (true, false) => Some(
             "The service manager reports the service as active, but `/healthz` is unavailable. It may still be starting or it may be unhealthy."
@@ -71,7 +86,22 @@ pub(super) fn print_live_runtime_section(runtime: &ServiceRuntimeSummary) {
             if let Some(error) = runtime.health_error.as_ref() {
                 print_key_value("Detail", error);
             }
+            if let Some(state) = runtime.startup_state.as_ref() {
+                print_key_value("Startup", startup_phase_label(state));
+            }
         }
+    }
+}
+
+fn startup_phase_label(state: &memory_bank_app::ServerStartupState) -> String {
+    match state.phase {
+        ServerStartupPhase::Reindexing => match state.memory_count {
+            Some(memory_count) => format!(
+                "reindexing {memory_count} stored memor{}",
+                if memory_count == 1 { "y" } else { "ies" }
+            ),
+            None => "reindexing stored memories".to_string(),
+        },
     }
 }
 
@@ -284,5 +314,38 @@ pub(super) fn describe_start_attempt(report: &ServiceActionReport) -> String {
         )
     } else {
         "Tried to start the managed service, but it does not appear active yet.".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::{ServiceManager, ServiceRuntimeSummary};
+    use std::path::PathBuf;
+
+    #[test]
+    fn runtime_health_warning_mentions_reindexing_when_startup_state_says_so() {
+        let runtime = ServiceRuntimeSummary {
+            manager: ServiceManager::Launchd,
+            definition_path: PathBuf::from("/tmp/service.plist"),
+            log_path: PathBuf::from("/tmp/server.log"),
+            url: "http://127.0.0.1:3737".to_string(),
+            installed: true,
+            active: true,
+            pid: Some(4242),
+            health: None,
+            health_error: Some("health check failed".to_string()),
+            startup_state: Some(memory_bank_app::ServerStartupState {
+                pid: 4242,
+                namespace: "default".to_string(),
+                phase: ServerStartupPhase::Reindexing,
+                memory_count: Some(12),
+            }),
+        };
+
+        let warning = runtime_health_warning(&runtime).expect("warning");
+
+        assert!(warning.contains("not up yet"));
+        assert!(warning.contains("re-encoding 12 stored memories"));
     }
 }

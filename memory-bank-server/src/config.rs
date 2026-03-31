@@ -13,6 +13,7 @@ pub struct Dirs {
     pub data: PathBuf,
     pub db: PathBuf,
     pub models: PathBuf,
+    pub startup_state: PathBuf,
 }
 
 impl Dirs {
@@ -23,6 +24,7 @@ impl Dirs {
         Ok(Self {
             db: data.join("memory.db"),
             models,
+            startup_state: paths.server_startup_state_path(namespace),
             data,
         })
     }

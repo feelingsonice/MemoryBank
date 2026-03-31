@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::encoder::{EmbeddingInput, EncoderClient, embedding_to_bytes, validate_embedding_count};
 use crate::error::AppError;
+use crate::startup_state::StartupStateTracker;
 
 // --- Public helpers and row types ---
 
@@ -48,12 +49,20 @@ impl MemoryDb {
         llm_model_id: &str,
         encoder_model_id: &str,
         encoder: &EncoderClient,
+        startup_state: Option<&StartupStateTracker>,
     ) -> Result<Self, AppError> {
         register_sqlite_vec();
 
         let pool = create_pool(db_path).await?;
         create_schema(&pool).await?;
-        ensure_vec_table(&pool, llm_model_id, encoder_model_id, encoder).await?;
+        ensure_vec_table(
+            &pool,
+            llm_model_id,
+            encoder_model_id,
+            encoder,
+            startup_state,
+        )
+        .await?;
 
         info!(
             db_path = %db_path.display(),
@@ -320,12 +329,20 @@ async fn ensure_vec_table(
     llm_model_id: &str,
     encoder_model_id: &str,
     encoder: &EncoderClient,
+    startup_state: Option<&StartupStateTracker>,
 ) -> Result<(), AppError> {
     let plan = VecTablePlan::build(pool, llm_model_id, encoder_model_id, encoder).await?;
 
     match plan.mode {
         VecTableMode::Rebuild => {
-            rebuild_vec_table(pool, plan.vec_table_exists, plan.dimension, encoder).await?;
+            rebuild_vec_table(
+                pool,
+                plan.vec_table_exists,
+                plan.dimension,
+                encoder,
+                startup_state,
+            )
+            .await?;
         }
         VecTableMode::EnsureExists => {
             create_vec_table(pool, plan.dimension).await?;
@@ -447,6 +464,7 @@ async fn rebuild_vec_table(
     vec_table_exists: bool,
     dimension: usize,
     encoder: &EncoderClient,
+    startup_state: Option<&StartupStateTracker>,
 ) -> Result<(), AppError> {
     if vec_table_exists {
         info!(dimension, "Dropping stale vector index before rebuild");
@@ -454,7 +472,7 @@ async fn rebuild_vec_table(
     }
 
     create_vec_table(pool, dimension).await?;
-    migrate_embeddings(pool, encoder).await?;
+    migrate_embeddings(pool, encoder, startup_state).await?;
 
     Ok(())
 }
@@ -472,12 +490,20 @@ async fn create_vec_table(pool: &SqlitePool, dimension: usize) -> Result<(), App
     Ok(())
 }
 
-async fn migrate_embeddings(pool: &SqlitePool, encoder: &EncoderClient) -> Result<(), AppError> {
+async fn migrate_embeddings(
+    pool: &SqlitePool,
+    encoder: &EncoderClient,
+    startup_state: Option<&StartupStateTracker>,
+) -> Result<(), AppError> {
     let memories = load_memories_for_migration(pool).await?;
     if memories.is_empty() {
         info!("Vector index ready with no existing memories to migrate");
         return Ok(());
     }
+
+    let _reindex_guard = startup_state
+        .map(|state| state.begin_reindex(memories.len()))
+        .transpose()?;
 
     info!(
         memory_count = memories.len(),

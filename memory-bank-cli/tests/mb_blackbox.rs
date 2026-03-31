@@ -269,6 +269,19 @@ esac
         fs::write(&self.paths.log_file, contents).expect("log file");
     }
 
+    fn write_startup_state(&self, state: &memory_bank_app::ServerStartupState) {
+        let namespace = memory_bank_app::Namespace::new(&state.namespace);
+        let path = self.paths.server_startup_state_path(&namespace);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("startup state dir");
+        }
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(state).expect("startup state json"),
+        )
+        .expect("startup state file");
+    }
+
     fn read_shim_log(&self) -> String {
         fs::read_to_string(&self.shim_log).unwrap_or_default()
     }
@@ -892,6 +905,46 @@ fn mb_service_status_shows_runtime_summary_when_health_is_available() {
             "Provider: anthropic",
             "Encoder: fast-embed",
             "Version: test",
+        ],
+    );
+}
+
+#[test]
+fn mb_status_reports_reindexing_when_service_is_active_but_not_healthy() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+
+    let install = harness.run(&["service", "install"]);
+    assert!(install.status.success(), "{}", stderr_string(&install));
+    harness.write_startup_state(&memory_bank_app::ServerStartupState {
+        pid: 4242,
+        namespace: "default".to_string(),
+        phase: memory_bank_app::ServerStartupPhase::Reindexing,
+        memory_count: Some(12),
+    });
+
+    let status = harness.run_with_env(
+        &["status"],
+        &[
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PRINT_EXIT", "0"),
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PID", "4242"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT", "0"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_MAINPID", "4242"),
+        ],
+    );
+    assert!(status.status.success(), "{}", stderr_string(&status));
+    assert_contains_all(
+        &stdout_string(&status),
+        &[
+            "Memory Bank",
+            "Active: yes",
+            "Health: unavailable",
+            "Startup: reindexing 12 stored memories",
+            "rebuilding the vector index and re-encoding 12 stored memories",
         ],
     );
 }

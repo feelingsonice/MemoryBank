@@ -11,11 +11,13 @@ mod mcp_server;
 mod memory_window;
 #[cfg(test)]
 mod retrieval_eval;
+mod startup_state;
 
 use crate::actor::MemoryActor;
 use crate::config::ServeConfig;
 use crate::http_server::{HealthResponse, HttpServer};
 use crate::ingest::IngestService;
+use crate::startup_state::StartupStateTracker;
 use tracing::info;
 
 pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
@@ -62,8 +64,15 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
         encoder_model = %encoder.model_id,
         "Opening memory database",
     );
-    let db =
-        db::MemoryDb::open(&dirs.db, &llm.model_id, &encoder.model_id, &encoder.client).await?;
+    let startup_state = StartupStateTracker::new(dirs.startup_state.clone(), namespace.to_string());
+    let db = db::MemoryDb::open(
+        &dirs.db,
+        &llm.model_id,
+        &encoder.model_id,
+        &encoder.client,
+        Some(&startup_state),
+    )
+    .await?;
 
     let llm_provider_name = llm.provider_name().to_string();
     let encoder_provider_name = encoder.provider_name().to_string();

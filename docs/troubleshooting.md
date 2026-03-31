@@ -64,6 +64,7 @@ That is expected. The CLI now asks you to confirm this change before saving it.
 Useful checks:
 
 - `mb config get server.fastembed_model`
+- `mb status`
 - `mb service restart`
 - `mb logs -f`
 

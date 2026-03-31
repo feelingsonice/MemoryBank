@@ -7,7 +7,7 @@ use crate::constants::{
     HEALTH_POLL_INTERVAL, HEALTH_STARTUP_TIMEOUT, LAUNCHD_LABEL, LOG_TAIL_LINE_COUNT,
     SERVICE_TRANSITION_POLL_INTERVAL, SERVICE_TRANSITION_TIMEOUT, SYSTEMD_UNIT_NAME,
 };
-use memory_bank_app::{AppPaths, AppSettings, default_server_url};
+use memory_bank_app::{AppPaths, AppSettings, ServerStartupState, default_server_url};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -62,6 +62,7 @@ pub(crate) struct ServiceRuntimeSummary {
     pub(crate) pid: Option<u32>,
     pub(crate) health: Option<HealthCheck>,
     pub(crate) health_error: Option<String>,
+    pub(crate) startup_state: Option<ServerStartupState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -431,11 +432,17 @@ pub(crate) fn service_runtime_summary(
 ) -> Result<ServiceRuntimeSummary, AppError> {
     let platform = ManagedPlatform::detect()?;
     let status = service_status(paths)?;
+    let pid = if status.active {
+        best_effort_service_pid(paths, platform)
+    } else {
+        None
+    };
     let health_result = fetch_health(settings);
     let (health, health_error) = match health_result {
         Ok(health) => (Some(health), None),
         Err(error) => (None, Some(error.to_string())),
     };
+    let startup_state = load_server_startup_state(paths, settings, status.active, pid);
 
     Ok(ServiceRuntimeSummary {
         manager: platform.manager(),
@@ -444,13 +451,10 @@ pub(crate) fn service_runtime_summary(
         url: default_server_url(settings),
         installed: status.installed,
         active: status.active,
-        pid: if status.active {
-            best_effort_service_pid(paths, platform)
-        } else {
-            None
-        },
+        pid,
         health,
         health_error,
+        startup_state,
     })
 }
 
@@ -594,6 +598,32 @@ fn best_effort_service_pid(_paths: &AppPaths, platform: ManagedPlatform) -> Opti
             systemd_main_pid_from_output(&outcome.combined_output())
         }
     }
+}
+
+fn load_server_startup_state(
+    paths: &AppPaths,
+    settings: &AppSettings,
+    service_active: bool,
+    pid: Option<u32>,
+) -> Option<ServerStartupState> {
+    if !service_active {
+        return None;
+    }
+
+    let path = paths.server_startup_state_path(&settings.active_namespace());
+    let contents = fs::read_to_string(path).ok()?;
+    let state = serde_json::from_str::<ServerStartupState>(&contents).ok()?;
+    if state.namespace != settings.active_namespace().to_string() {
+        return None;
+    }
+
+    if let Some(pid) = pid
+        && state.pid != pid
+    {
+        return None;
+    }
+
+    Some(state)
 }
 
 fn launchctl_pid_from_output(output: &str) -> Option<u32> {
@@ -944,5 +974,53 @@ mod tests {
         assert_eq!(systemd_main_pid_from_output("4242"), Some(4242));
         assert_eq!(systemd_main_pid_from_output("0"), None);
         assert_eq!(systemd_main_pid_from_output(""), None);
+    }
+
+    #[test]
+    fn load_server_startup_state_uses_matching_pid_and_namespace() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings::default();
+        let namespace = settings.active_namespace();
+        fs::create_dir_all(paths.namespace_dir(&namespace)).expect("namespace dir");
+        let startup_state = memory_bank_app::ServerStartupState {
+            pid: 4242,
+            namespace: namespace.to_string(),
+            phase: memory_bank_app::ServerStartupPhase::Reindexing,
+            memory_count: Some(12),
+        };
+        fs::write(
+            paths.server_startup_state_path(&namespace),
+            serde_json::to_vec_pretty(&startup_state).expect("startup state json"),
+        )
+        .expect("startup state file");
+
+        let loaded = load_server_startup_state(&paths, &settings, true, Some(4242));
+
+        assert_eq!(loaded, Some(startup_state));
+    }
+
+    #[test]
+    fn load_server_startup_state_ignores_pid_mismatch() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings::default();
+        let namespace = settings.active_namespace();
+        fs::create_dir_all(paths.namespace_dir(&namespace)).expect("namespace dir");
+        let startup_state = memory_bank_app::ServerStartupState {
+            pid: 1111,
+            namespace: namespace.to_string(),
+            phase: memory_bank_app::ServerStartupPhase::Reindexing,
+            memory_count: Some(12),
+        };
+        fs::write(
+            paths.server_startup_state_path(&namespace),
+            serde_json::to_vec_pretty(&startup_state).expect("startup state json"),
+        )
+        .expect("startup state file");
+
+        let loaded = load_server_startup_state(&paths, &settings, true, Some(4242));
+
+        assert_eq!(loaded, None);
     }
 }
