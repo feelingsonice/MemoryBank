@@ -456,7 +456,11 @@ fn ensure_source_block(path: &Path) -> Result<(), AppError> {
     }
 
     let block = render_source_block();
-    let existing = fs::read_to_string(path).unwrap_or_default();
+    let existing = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(AppError::Io(error)),
+    };
     if existing.contains(&block) {
         return Ok(());
     }
@@ -547,9 +551,12 @@ mod tests {
         fs::write(paths.binary_path(MB_BINARY_NAME), "#!/bin/sh\n").expect("write mb");
         set_mode(&paths.binary_path(MB_BINARY_NAME), 0o755).expect("chmod");
 
-        let outcome =
-            ensure_cli_exposure_with_context(&paths, &[paths.bin_dir.clone()], "/bin/zsh")
-                .expect("direct exposure");
+        let outcome = ensure_cli_exposure_with_context(
+            &paths,
+            std::slice::from_ref(&paths.bin_dir),
+            "/bin/zsh",
+        )
+        .expect("direct exposure");
 
         assert_eq!(outcome.mode, ExposureMode::Direct);
         assert!(outcome.bare_command_works_now);
@@ -635,6 +642,18 @@ mod tests {
 
         assert_eq!(bashrc.matches(RC_BLOCK_START).count(), 1);
         assert_eq!(bash_profile.matches(RC_BLOCK_START).count(), 1);
+    }
+
+    #[test]
+    fn ensure_source_block_errors_instead_of_clobbering_unreadable_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(".profile");
+        fs::create_dir_all(&path).expect("directory placeholder");
+
+        let error = ensure_source_block(&path).expect_err("expected read failure");
+
+        assert!(matches!(error, AppError::Io(_)));
+        assert!(path.is_dir());
     }
 
     #[test]

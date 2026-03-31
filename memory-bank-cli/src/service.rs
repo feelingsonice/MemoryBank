@@ -142,12 +142,7 @@ pub(crate) fn install_service(
         ManagedPlatform::MacOs => install_launchd_service(paths, settings)?,
         ManagedPlatform::Linux => install_systemd_service(paths, settings)?,
     }
-    let after = wait_for_service_status(
-        paths,
-        true,
-        SERVICE_TRANSITION_TIMEOUT,
-        SERVICE_TRANSITION_POLL_INTERVAL,
-    )?;
+    let after = service_status(paths)?;
 
     Ok(ServiceActionReport {
         action: ServiceActionKind::Install,
@@ -184,7 +179,7 @@ pub(crate) fn start_service(
             let service_path = launchd_service_path(paths);
             let mut installed_during_action = false;
             if !service_path.exists() {
-                install_launchd_service(paths, &settings)?;
+                install_launchd_service(paths, settings)?;
                 installed_during_action = true;
             }
             let domain = format!("gui/{uid}");
@@ -217,7 +212,7 @@ pub(crate) fn start_service(
         ManagedPlatform::Linux => {
             let mut installed_during_action = false;
             if !systemd_service_path(paths).exists() {
-                install_systemd_service(paths, &settings)?;
+                install_systemd_service(paths, settings)?;
                 installed_during_action = true;
             }
             run_command("systemctl", &["--user", "start", SYSTEMD_UNIT_NAME])?;
@@ -225,16 +220,12 @@ pub(crate) fn start_service(
         }
     };
 
-    let after = if before.installed && before.active {
-        wait_for_service_status(
-            paths,
-            false,
-            SERVICE_TRANSITION_TIMEOUT,
-            SERVICE_TRANSITION_POLL_INTERVAL,
-        )?
-    } else {
-        service_status(paths)?
-    };
+    let after = wait_for_service_status(
+        paths,
+        true,
+        SERVICE_TRANSITION_TIMEOUT,
+        SERVICE_TRANSITION_POLL_INTERVAL,
+    )?;
     let (health, health_error) = wait_for_service_health(settings, after.active);
 
     Ok(ServiceActionReport {
@@ -364,7 +355,12 @@ pub(crate) fn restart_service(
             }
         }
     };
-    let after = service_status(paths)?;
+    let after = wait_for_service_status(
+        paths,
+        true,
+        SERVICE_TRANSITION_TIMEOUT,
+        SERVICE_TRANSITION_POLL_INTERVAL,
+    )?;
     let (health, health_error) = wait_for_service_health(settings, after.active);
 
     Ok(ServiceActionReport {
@@ -670,14 +666,12 @@ pub(crate) fn build_server_launch_spec(
 
     let mut env = BTreeMap::new();
     if let Some(secret_key) = env_key_for_provider(provider) {
-        let secret = secrets
-            .get(secret_key)
+        let secret = require_non_empty_secret(secrets, secret_key)
             .ok_or(AppError::MissingProviderSecret(secret_key))?;
         env.insert(secret_key.to_string(), secret.to_string());
     }
     if encoder_provider == "remote-api" {
-        let secret = secrets
-            .get("MEMORY_BANK_REMOTE_ENCODER_API_KEY")
+        let secret = require_non_empty_secret(secrets, "MEMORY_BANK_REMOTE_ENCODER_API_KEY")
             .ok_or(AppError::Message(
                 "missing required remote encoder secret `MEMORY_BANK_REMOTE_ENCODER_API_KEY` in ~/.memory_bank/secrets.env"
                     .to_string(),
@@ -783,7 +777,7 @@ pub(crate) fn collect_doctor_issues(
     }
 
     if let Some(env_key) = env_key_for_provider(llm_provider_value(settings))
-        && secrets.get(env_key).is_none()
+        && require_non_empty_secret(&secrets, env_key).is_none()
     {
         issues.push(format!("missing {env_key} in ~/.memory_bank/secrets.env"));
     }
@@ -817,7 +811,7 @@ pub(crate) fn collect_doctor_issues(
             {
                 issues.push("server.remote_encoder_url must be set for remote-api".to_string());
             }
-            if secrets.get("MEMORY_BANK_REMOTE_ENCODER_API_KEY").is_none() {
+            if require_non_empty_secret(&secrets, "MEMORY_BANK_REMOTE_ENCODER_API_KEY").is_none() {
                 issues.push(
                     "missing MEMORY_BANK_REMOTE_ENCODER_API_KEY in ~/.memory_bank/secrets.env"
                         .to_string(),
@@ -925,6 +919,10 @@ fn systemd_service_path(paths: &AppPaths) -> PathBuf {
 
 fn normalized_non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn require_non_empty_secret<'a>(secrets: &'a SecretStore, key: &str) -> Option<&'a str> {
+    secrets.get(key).filter(|value| !value.trim().is_empty())
 }
 
 fn is_runnable_file(path: &Path) -> bool {
@@ -1080,6 +1078,34 @@ mod tests {
 
         let error =
             build_server_launch_spec(&paths, &settings, &secrets).expect_err("missing secret");
+
+        assert!(matches!(
+            error,
+            AppError::MissingProviderSecret("GEMINI_API_KEY")
+        ));
+    }
+
+    #[test]
+    fn launch_spec_rejects_blank_provider_secret_values() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("gemini".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let mut secrets = SecretStore::default();
+        secrets.set("GEMINI_API_KEY", "   ");
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let error =
+            build_server_launch_spec(&paths, &settings, &secrets).expect_err("blank secret");
 
         assert!(matches!(
             error,

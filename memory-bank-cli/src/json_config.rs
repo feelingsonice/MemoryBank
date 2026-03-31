@@ -12,7 +12,7 @@ pub(crate) fn load_json_config(path: &Path) -> Result<Value, AppError> {
     }
 
     let contents = fs::read_to_string(path)?;
-    parse_json_config(&contents, path)
+    parse_json_config(strip_utf8_bom(&contents), path)
 }
 
 pub(crate) fn write_json_config_with_backups(
@@ -66,6 +66,10 @@ fn parse_json_config(contents: &str, path: &Path) -> Result<Value, AppError> {
             ))),
         },
     }
+}
+
+fn strip_utf8_bom(contents: &str) -> &str {
+    contents.strip_prefix('\u{feff}').unwrap_or(contents)
 }
 
 fn backup_existing_file(paths: &AppPaths, original_path: &Path) -> Result<(), AppError> {
@@ -132,6 +136,17 @@ mod tests {
             value["hooks"]["Stop"][0]["hooks"][0]["command"],
             Value::String("echo hi".to_string())
         );
+    }
+
+    #[test]
+    fn load_json_config_accepts_utf8_bom() {
+        let temp = TempDir::new().expect("tempdir");
+        let config_path = temp.path().join("bom.json");
+        fs::write(&config_path, "\u{feff}{\"ok\":true}").expect("write config");
+
+        let value = load_json_config(&config_path).expect("load config");
+
+        assert_eq!(value["ok"], Value::Bool(true));
     }
 
     #[test]

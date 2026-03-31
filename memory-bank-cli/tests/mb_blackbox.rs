@@ -279,6 +279,10 @@ fn assert_contains_all(haystack: &str, needles: &[&str]) {
     }
 }
 
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
 #[test]
 fn mb_top_level_help_describes_commands_and_quick_start() {
     let harness = MbHarness::new();
@@ -704,6 +708,27 @@ fn mb_service_install_writes_the_managed_service_definition() {
 }
 
 #[test]
+fn mb_service_install_does_not_poll_for_activation() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+
+    let output = harness.run(&["service", "install"]);
+    assert!(output.status.success(), "{}", stderr_string(&output));
+
+    let log = harness.read_shim_log();
+    #[cfg(target_os = "macos")]
+    assert!(count_occurrences(&log, "launchctl print") <= 2, "{log}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        count_occurrences(
+            &log,
+            "systemctl --user is-active --quiet memory-bank.service"
+        ) <= 2,
+        "{log}"
+    );
+}
+
+#[test]
 fn mb_service_status_shows_runtime_summary_when_health_is_available() {
     let harness = MbHarness::new();
     harness.seed_service_binary_placeholders();
@@ -834,5 +859,53 @@ fn mb_service_commands_report_progress_and_outcomes() {
         !harness
             .read_shim_log()
             .contains("systemctl --user stop memory-bank.service")
+    );
+}
+
+#[test]
+fn mb_service_start_when_already_active_avoids_transition_poll_loops() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+    let healthz = HealthzServer::new("default", "anthropic", "fast-embed", "test");
+
+    let set_port = harness.run(&["config", "set", "service.port", &healthz.port().to_string()]);
+    assert!(set_port.status.success(), "{}", stderr_string(&set_port));
+    let install = harness.run(&["service", "install"]);
+    assert!(install.status.success(), "{}", stderr_string(&install));
+    fs::write(&harness.shim_log, "").expect("clear shim log");
+
+    let output = harness.run_with_env(
+        &["service", "start"],
+        &[
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PRINT_EXIT", "0"),
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PID", "4242"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT", "0"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_MAINPID", "4242"),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr_string(&output));
+    assert_contains_all(
+        &stdout_string(&output),
+        &[
+            "Starting Memory Bank service...",
+            "Success: Memory Bank service was already active and is still running.",
+            "Health: yes",
+        ],
+    );
+
+    let log = harness.read_shim_log();
+    #[cfg(target_os = "macos")]
+    assert!(count_occurrences(&log, "launchctl print") <= 4, "{log}");
+    #[cfg(target_os = "linux")]
+    assert!(
+        count_occurrences(
+            &log,
+            "systemctl --user is-active --quiet memory-bank.service"
+        ) <= 4,
+        "{log}"
     );
 }

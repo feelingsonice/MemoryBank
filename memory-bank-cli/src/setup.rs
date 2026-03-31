@@ -748,7 +748,10 @@ fn secret_prompt_plan(
         return SecretPromptPlan::NotRequired;
     };
 
-    match (env_value, stored_value) {
+    match (
+        env_value.filter(|value| !value.trim().is_empty()),
+        stored_value.filter(|value| !value.trim().is_empty()),
+    ) {
         (Some(value), _) => SecretPromptPlan::OfferEnvironment {
             key: secret_key,
             value,
@@ -1156,6 +1159,18 @@ mod tests {
             plan,
             SecretPromptPlan::ManualEntry {
                 key: "OPENAI_API_KEY"
+            }
+        );
+    }
+
+    #[test]
+    fn secret_prompt_plan_ignores_blank_shell_and_stored_values() {
+        let plan = secret_prompt_plan("gemini", Some("   ".to_string()), Some(String::new()));
+
+        assert_eq!(
+            plan,
+            SecretPromptPlan::ManualEntry {
+                key: "GEMINI_API_KEY"
             }
         );
     }

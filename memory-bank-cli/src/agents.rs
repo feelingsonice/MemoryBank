@@ -156,15 +156,7 @@ fn configure_gemini(paths: &AppPaths, server_url: &str) -> Result<(), AppError> 
     let settings_path = paths.home_dir.join(".gemini/settings.json");
     let mut root = load_json_config(&settings_path)?;
     ensure_object(&mut root);
-    object_mut(&mut root)?
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| json!({}));
-    object_mut(
-        object_mut(&mut root)?
-            .get_mut("mcpServers")
-            .expect("mcpServers"),
-    )?
-    .insert(
+    ensure_child_object(object_mut(&mut root)?, "mcpServers")?.insert(
         "memory-bank".to_string(),
         json!({ "httpUrl": format!("{server_url}/mcp") }),
     );
@@ -199,10 +191,7 @@ fn configure_opencode(paths: &AppPaths, server_url: &str) -> Result<(), AppError
     let settings_path = paths.home_dir.join(".config/opencode/opencode.json");
     let mut root = load_json_config(&settings_path)?;
     ensure_object(&mut root);
-    object_mut(&mut root)?
-        .entry("mcp".to_string())
-        .or_insert_with(|| json!({}));
-    object_mut(object_mut(&mut root)?.get_mut("mcp").expect("mcp"))?.insert(
+    ensure_child_object(object_mut(&mut root)?, "mcp")?.insert(
         "memory-bank".to_string(),
         json!({
             "type": "remote",
@@ -218,19 +207,9 @@ fn configure_openclaw(paths: &AppPaths, server_url: &str) -> Result<(), AppError
     let settings_path = paths.home_dir.join(".openclaw/openclaw.json");
     let mut root = load_json_config(&settings_path)?;
     ensure_object(&mut root);
-    {
-        let root_map = object_mut(&mut root)?;
-        root_map
-            .entry("mcp".to_string())
-            .or_insert_with(|| json!({}));
-        root_map
-            .entry("plugins".to_string())
-            .or_insert_with(|| json!({}));
-    }
-    let mcp = object_mut(object_mut(&mut root)?.get_mut("mcp").expect("mcp"))?;
-    mcp.entry("servers".to_string())
-        .or_insert_with(|| json!({}));
-    object_mut(mcp.get_mut("servers").expect("servers"))?.insert(
+    let root_map = object_mut(&mut root)?;
+    let mcp = ensure_child_object(root_map, "mcp")?;
+    ensure_child_object(mcp, "servers")?.insert(
         "memory-bank".to_string(),
         json!({
             "command": paths.binary_path(MCP_PROXY_BINARY_NAME),
@@ -238,18 +217,12 @@ fn configure_openclaw(paths: &AppPaths, server_url: &str) -> Result<(), AppError
         }),
     );
 
-    let plugins = object_mut(object_mut(&mut root)?.get_mut("plugins").expect("plugins"))?;
-    plugins
-        .entry("load".to_string())
-        .or_insert_with(|| json!({}));
+    let plugins = ensure_child_object(root_map, "plugins")?;
     upsert_openclaw_plugin_load_path(
-        object_mut(plugins.get_mut("load").expect("load"))?,
+        ensure_child_object(plugins, "load")?,
         extension_path.to_string_lossy().as_ref(),
     )?;
-    plugins
-        .entry("entries".to_string())
-        .or_insert_with(|| json!({}));
-    object_mut(plugins.get_mut("entries").expect("entries"))?.insert(
+    ensure_child_object(plugins, "entries")?.insert(
         "memory-bank".to_string(),
         json!({
             "enabled": true,
@@ -259,10 +232,7 @@ fn configure_openclaw(paths: &AppPaths, server_url: &str) -> Result<(), AppError
             }
         }),
     );
-    plugins
-        .entry("slots".to_string())
-        .or_insert_with(|| json!({}));
-    object_mut(plugins.get_mut("slots").expect("slots"))?
+    ensure_child_object(plugins, "slots")?
         .insert("memory".to_string(), Value::String("none".to_string()));
 
     write_json_config_with_backups(paths, &settings_path, &root)
@@ -367,14 +337,8 @@ fn build_hook_command(
 fn upsert_claude_hook(root: &mut Value, event: &str, command: &str) -> Result<(), AppError> {
     ensure_object(root);
     let root_map = object_mut(root)?;
-    let hooks = root_map
-        .entry("hooks".to_string())
-        .or_insert_with(|| json!({}));
-    let hooks_map = object_mut(hooks)?;
-    let groups = hooks_map
-        .entry(event.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let groups_array = array_mut(groups)?;
+    let hooks_map = ensure_child_object(root_map, "hooks")?;
+    let groups_array = ensure_child_array(hooks_map, event)?;
     let marker = format!("--agent claude-code --event {event}");
     let desired = json!({
         "type": "command",
@@ -408,14 +372,8 @@ fn upsert_gemini_hook(
 ) -> Result<(), AppError> {
     ensure_object(root);
     let root_map = object_mut(root)?;
-    let hooks = root_map
-        .entry("hooks".to_string())
-        .or_insert_with(|| json!({}));
-    let hooks_map = object_mut(hooks)?;
-    let groups = hooks_map
-        .entry(event.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let groups_array = array_mut(groups)?;
+    let hooks_map = ensure_child_object(root_map, "hooks")?;
+    let groups_array = ensure_child_array(hooks_map, event)?;
     let desired_hook = json!({
         "name": "memory-bank",
         "type": "command",
@@ -484,6 +442,30 @@ fn upsert_openclaw_plugin_load_path(
     }
 
     Ok(())
+}
+
+fn ensure_child_object<'a>(
+    parent: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Map<String, Value>, AppError> {
+    let child = parent
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    ensure_object(child);
+    object_mut(child)
+}
+
+fn ensure_child_array<'a>(
+    parent: &'a mut Map<String, Value>,
+    key: &str,
+) -> Result<&'a mut Vec<Value>, AppError> {
+    let child = parent
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !child.is_array() {
+        *child = Value::Array(Vec::new());
+    }
+    array_mut(child)
 }
 
 #[cfg(test)]
@@ -630,6 +612,36 @@ mod tests {
     }
 
     #[test]
+    fn configure_gemini_repairs_malformed_sections() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings_path = paths.home_dir.join(".gemini/settings.json");
+        fs::create_dir_all(settings_path.parent().expect("parent")).expect("parent");
+        fs::write(
+            &settings_path,
+            r#"{
+  "mcpServers": [],
+  "hooks": {
+    "BeforeTool": {}
+  }
+}"#,
+        )
+        .expect("seed config");
+
+        configure_gemini(&paths, "http://127.0.0.1:4545").expect("configure gemini");
+
+        let rendered = load_json_config(&settings_path).expect("load gemini config");
+        assert_eq!(
+            rendered["mcpServers"]["memory-bank"]["httpUrl"],
+            Value::String("http://127.0.0.1:4545/mcp".to_string())
+        );
+        assert_eq!(
+            rendered["hooks"]["BeforeTool"][0]["hooks"][0]["name"],
+            Value::String("memory-bank".to_string())
+        );
+    }
+
+    #[test]
     fn configure_opencode_copies_plugin_and_sets_remote_mcp_entry() {
         let temp = TempDir::new().expect("tempdir");
         let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
@@ -704,6 +716,38 @@ mod tests {
                     .to_string_lossy()
                     .to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn configure_openclaw_repairs_malformed_sections() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings_path = paths.home_dir.join(".openclaw/openclaw.json");
+        fs::create_dir_all(settings_path.parent().expect("parent")).expect("parent");
+        fs::write(
+            &settings_path,
+            r#"{
+  "mcp": [],
+  "plugins": {
+    "load": [],
+    "entries": [],
+    "slots": []
+  }
+}"#,
+        )
+        .expect("seed config");
+
+        configure_openclaw(&paths, "http://127.0.0.1:6000").expect("configure openclaw");
+
+        let rendered = load_json_config(&settings_path).expect("load openclaw config");
+        assert_eq!(
+            rendered["mcp"]["servers"]["memory-bank"]["args"],
+            json!(["--server-url", "http://127.0.0.1:6000"])
+        );
+        assert_eq!(
+            rendered["plugins"]["slots"]["memory"],
+            Value::String("none".to_string())
         );
     }
 
