@@ -1,4 +1,5 @@
 use crate::AppError;
+use shlex::try_quote;
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::io;
@@ -145,6 +146,7 @@ pub(crate) fn run_command_capture_with_options(
 }
 
 pub(crate) fn shell_escape(value: &str) -> String {
+    let _ = try_quote(value).expect("shell_quote should reject only invalid shell values");
     format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 

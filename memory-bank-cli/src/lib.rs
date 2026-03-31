@@ -1,9 +1,11 @@
 mod agents;
 mod assets;
 mod cli;
+mod cli_help;
 mod command_utils;
 mod config;
 mod constants;
+mod domain;
 mod error;
 mod json_config;
 mod models;

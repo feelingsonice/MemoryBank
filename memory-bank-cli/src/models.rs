@@ -1,9 +1,9 @@
 use crate::AppError;
 use crate::assets::find_repo_root;
 use crate::constants::{EMBEDDED_MODEL_CATALOG, REMOTE_MODEL_CATALOG_URL};
+use crate::domain::ProviderId;
 use memory_bank_app::{
-    AppPaths, DEFAULT_ANTHROPIC_MODEL, DEFAULT_GEMINI_MODEL, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OPENAI_MODEL,
+    AppPaths,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,13 +61,7 @@ impl fmt::Display for ModelChoice {
 }
 
 pub(crate) fn default_model_for_provider(provider: &str) -> &'static str {
-    match provider {
-        "anthropic" => DEFAULT_ANTHROPIC_MODEL,
-        "gemini" => DEFAULT_GEMINI_MODEL,
-        "open-ai" => DEFAULT_OPENAI_MODEL,
-        "ollama" => DEFAULT_OLLAMA_MODEL,
-        _ => DEFAULT_ANTHROPIC_MODEL,
-    }
+    ProviderId::from_config_value(Some(provider)).default_model()
 }
 
 pub(crate) fn refresh_model_catalog(paths: &AppPaths) -> ModelCatalog {

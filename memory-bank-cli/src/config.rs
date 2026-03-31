@@ -1,10 +1,13 @@
 use crate::AppError;
 use crate::agents::AgentKind;
 use crate::constants::{DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_NEAREST_NEIGHBOR_COUNT};
+use crate::domain::{
+    EncoderProviderId, ProviderId, integration_configured, set_integration_configured,
+};
 use crate::models::default_model_for_provider;
 use memory_bank_app::{
     AppSettings, DEFAULT_FASTEMBED_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_OLLAMA_URL,
-    IntegrationState, IntegrationsSettings, Namespace, ServerSettings, ServiceSettings,
+    IntegrationsSettings, Namespace, ServerSettings, ServiceSettings,
 };
 use std::str::FromStr;
 
@@ -75,11 +78,7 @@ pub(crate) fn get_config_value(settings: &AppSettings, key: &str) -> Result<Stri
                 .as_ref()
                 .and_then(|server| server.ollama_url.as_deref()),
         )),
-        ConfigKey::ServerEncoderProvider => Ok(settings
-            .server
-            .as_ref()
-            .and_then(|server| server.encoder_provider.clone())
-            .unwrap_or_else(|| "fast-embed".to_string())),
+        ConfigKey::ServerEncoderProvider => Ok(resolved_encoder_provider(settings).to_string()),
         ConfigKey::ServerFastembedModel => Ok(settings
             .server
             .as_ref()
@@ -107,18 +106,9 @@ pub(crate) fn get_config_value(settings: &AppSettings, key: &str) -> Result<Stri
             .as_ref()
             .and_then(|server| server.remote_encoder_url.clone())
             .unwrap_or_default()),
-        ConfigKey::IntegrationConfigured(agent) => Ok(settings
-            .integrations
-            .as_ref()
-            .and_then(|integrations| match agent {
-                AgentKind::ClaudeCode => integrations.claude_code.as_ref(),
-                AgentKind::GeminiCli => integrations.gemini_cli.as_ref(),
-                AgentKind::OpenCode => integrations.opencode.as_ref(),
-                AgentKind::OpenClaw => integrations.openclaw.as_ref(),
-            })
-            .map(|state| state.configured)
-            .unwrap_or(false)
-            .to_string()),
+        ConfigKey::IntegrationConfigured(agent) => Ok(
+            integration_configured(settings.integrations.as_ref(), agent).to_string(),
+        ),
     }
 }
 
@@ -160,12 +150,12 @@ pub(crate) fn set_config_value(
         ConfigKey::ServerLlmProvider => {
             let provider = validate_llm_provider(value.trim(), key)?;
             let mut server = settings.server.clone().unwrap_or_default();
-            server.llm_provider = if provider == "anthropic" {
+            server.llm_provider = if provider == ProviderId::Anthropic {
                 None
             } else {
-                Some(provider.to_string())
+                Some(provider.as_str().to_string())
             };
-            if provider != "ollama" {
+            if provider != ProviderId::Ollama {
                 server.ollama_url = None;
             }
             set_server(settings, server);
@@ -197,10 +187,10 @@ pub(crate) fn set_config_value(
         ConfigKey::ServerEncoderProvider => {
             let provider = validate_encoder_provider(value.trim(), key)?;
             let mut server = settings.server.clone().unwrap_or_default();
-            server.encoder_provider = if provider == "fast-embed" {
+            server.encoder_provider = if provider == EncoderProviderId::FastEmbed {
                 None
             } else {
-                Some(provider.to_string())
+                Some(provider.as_str().to_string())
             };
             set_server(settings, server);
         }
@@ -251,13 +241,7 @@ pub(crate) fn set_config_value(
         ConfigKey::IntegrationConfigured(agent) => {
             let configured = parse_bool(value, key)?;
             let mut integrations = settings.integrations.clone().unwrap_or_default();
-            let state = Some(IntegrationState { configured });
-            match agent {
-                AgentKind::ClaudeCode => integrations.claude_code = state,
-                AgentKind::GeminiCli => integrations.gemini_cli = state,
-                AgentKind::OpenCode => integrations.opencode = state,
-                AgentKind::OpenClaw => integrations.openclaw = state,
-            }
+            set_integration_configured(&mut integrations, agent, configured);
             set_integrations(settings, integrations);
         }
     }
@@ -266,11 +250,29 @@ pub(crate) fn set_config_value(
 }
 
 pub(crate) fn llm_provider_value(settings: &AppSettings) -> &str {
-    settings
-        .server
-        .as_ref()
-        .and_then(|server| server.llm_provider.as_deref())
-        .unwrap_or("anthropic")
+    llm_provider(settings).as_str()
+}
+
+pub(crate) fn llm_provider(settings: &AppSettings) -> ProviderId {
+    ProviderId::from_config_value(
+        settings
+            .server
+            .as_ref()
+            .and_then(|server| server.llm_provider.as_deref()),
+    )
+}
+
+pub(crate) fn resolved_encoder_provider(settings: &AppSettings) -> &str {
+    encoder_provider(settings).as_str()
+}
+
+pub(crate) fn encoder_provider(settings: &AppSettings) -> EncoderProviderId {
+    EncoderProviderId::from_config_value(
+        settings
+            .server
+            .as_ref()
+            .and_then(|server| server.encoder_provider.as_deref()),
+    )
 }
 
 pub(crate) fn resolved_llm_model(settings: &AppSettings) -> String {
@@ -305,27 +307,15 @@ pub(crate) fn normalize_optional_string(value: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn validate_llm_provider<'a>(value: &'a str, key: &str) -> Result<&'a str, AppError> {
-    match value {
-        "anthropic" | "gemini" | "open-ai" | "ollama" => Ok(value),
-        _ => Err(AppError::InvalidConfigValue(
-            key.to_string(),
-            "expected one of: anthropic, gemini, open-ai, ollama".to_string(),
-        )),
-    }
+pub(crate) fn validate_llm_provider(value: &str, key: &str) -> Result<ProviderId, AppError> {
+    ProviderId::parse(value, key)
 }
 
-pub(crate) fn validate_encoder_provider<'a>(
-    value: &'a str,
+pub(crate) fn validate_encoder_provider(
+    value: &str,
     key: &str,
-) -> Result<&'a str, AppError> {
-    match value {
-        "fast-embed" | "local-api" | "remote-api" => Ok(value),
-        _ => Err(AppError::InvalidConfigValue(
-            key.to_string(),
-            "expected one of: fast-embed, local-api, remote-api".to_string(),
-        )),
-    }
+) -> Result<EncoderProviderId, AppError> {
+    EncoderProviderId::parse(value, key)
 }
 
 pub(crate) fn set_service(settings: &mut AppSettings, service: ServiceSettings) {

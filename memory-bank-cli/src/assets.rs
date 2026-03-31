@@ -79,7 +79,7 @@ pub(crate) fn inspect_cli_exposure(paths: &AppPaths) -> Result<ExposureCheck, Ap
 }
 
 pub(crate) fn find_on_path(binary: &str) -> Option<PathBuf> {
-    find_on_entries(&current_path_entries(), binary)
+    which::which(binary).ok()
 }
 
 pub(crate) fn find_repo_root() -> Option<PathBuf> {

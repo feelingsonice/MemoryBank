@@ -69,10 +69,45 @@ exit 0
                     r#"#!/bin/sh
 printf '%s\n' "launchctl $*" >> '{}'
 case "$1" in
-  print)
-    code="${{MB_TEST_LAUNCHCTL_PRINT_EXIT:-1}}"
+    print)
+    state_file="{}"
+    if [ -n "${{MB_TEST_LAUNCHCTL_PRINT_SEQUENCE:-}}" ]; then
+      if [ ! -f "$state_file" ]; then
+        printf '%s' "${{MB_TEST_LAUNCHCTL_PRINT_SEQUENCE}}" > "$state_file"
+      fi
+      sequence="$(cat "$state_file")"
+      case "$sequence" in
+        *,*)
+          code="${{sequence%%,*}}"
+          printf '%s' "${{sequence#*,}}" > "$state_file"
+          ;;
+        *)
+          code="$sequence"
+          ;;
+      esac
+    else
+      code="${{MB_TEST_LAUNCHCTL_PRINT_EXIT:-1}}"
+    fi
     if [ "$code" -eq 0 ]; then
-      printf 'pid = %s\n' "${{MB_TEST_LAUNCHCTL_PID:-4321}}"
+      pid_state_file="{}"
+      if [ -n "${{MB_TEST_LAUNCHCTL_PID_SEQUENCE:-}}" ]; then
+        if [ ! -f "$pid_state_file" ]; then
+          printf '%s' "${{MB_TEST_LAUNCHCTL_PID_SEQUENCE}}" > "$pid_state_file"
+        fi
+        pid_sequence="$(cat "$pid_state_file")"
+        case "$pid_sequence" in
+          *,*)
+            pid="${{pid_sequence%%,*}}"
+            printf '%s' "${{pid_sequence#*,}}" > "$pid_state_file"
+            ;;
+          *)
+            pid="$pid_sequence"
+            ;;
+        esac
+      else
+        pid="${{MB_TEST_LAUNCHCTL_PID:-4321}}"
+      fi
+      printf 'pid = %s\n' "$pid"
     fi
     exit "$code"
     ;;
@@ -84,7 +119,9 @@ case "$1" in
     ;;
 esac
 "#,
-                    shim_log.display()
+                    shim_log.display(),
+                    home.path().join("launchctl-print-sequence-state").display(),
+                    home.path().join("launchctl-pid-sequence-state").display()
                 ),
             );
             write_shim(
@@ -108,11 +145,46 @@ printf '%s\n' "${{MB_TEST_UID:-501}}"
 printf '%s\n' "systemctl $*" >> '{}'
 case "$1 $2 $3" in
   "--user is-active --quiet")
-    code="${{MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT:-1}}"
+    state_file="{}"
+    if [ -n "${{MB_TEST_SYSTEMCTL_IS_ACTIVE_SEQUENCE:-}}" ]; then
+      if [ ! -f "$state_file" ]; then
+        printf '%s' "${{MB_TEST_SYSTEMCTL_IS_ACTIVE_SEQUENCE}}" > "$state_file"
+      fi
+      sequence="$(cat "$state_file")"
+      case "$sequence" in
+        *,*)
+          code="${{sequence%%,*}}"
+          printf '%s' "${{sequence#*,}}" > "$state_file"
+          ;;
+        *)
+          code="$sequence"
+          ;;
+      esac
+    else
+      code="${{MB_TEST_SYSTEMCTL_IS_ACTIVE_EXIT:-1}}"
+    fi
     exit "$code"
     ;;
   "--user show memory-bank.service")
-    printf '%s\n' "${{MB_TEST_SYSTEMCTL_MAINPID:-0}}"
+    state_file="{}"
+    if [ -n "${{MB_TEST_SYSTEMCTL_MAINPID_SEQUENCE:-}}" ]; then
+      if [ ! -f "$state_file" ]; then
+        printf '%s' "${{MB_TEST_SYSTEMCTL_MAINPID_SEQUENCE}}" > "$state_file"
+      fi
+      sequence="$(cat "$state_file")"
+      case "$sequence" in
+        *,*)
+          pid="${{sequence%%,*}}"
+          printf '%s' "${{sequence#*,}}" > "$state_file"
+          ;;
+        *)
+          pid="$sequence"
+          ;;
+      esac
+    else
+      pid="${{MB_TEST_SYSTEMCTL_MAINPID:-0}}"
+    fi
+    printf '%s\n' "$pid"
     exit 0
     ;;
   *)
@@ -120,7 +192,9 @@ case "$1 $2 $3" in
     ;;
 esac
 "#,
-                    shim_log.display()
+                    shim_log.display(),
+                    home.path().join("systemctl-is-active-sequence-state").display(),
+                    home.path().join("systemctl-mainpid-sequence-state").display()
                 ),
             );
         }
@@ -863,6 +937,50 @@ fn mb_service_commands_report_progress_and_outcomes() {
 }
 
 #[test]
+fn mb_service_stop_waits_for_inactive_transition() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+
+    let install = harness.run(&["service", "install"]);
+    assert!(install.status.success(), "{}", stderr_string(&install));
+    fs::write(&harness.shim_log, "").expect("clear shim log");
+
+    let stop = harness.run_with_env(
+        &["service", "stop"],
+        &[
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PRINT_SEQUENCE", "0,1"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_SEQUENCE", "0,1"),
+        ],
+    );
+    assert!(stop.status.success(), "{}", stderr_string(&stop));
+    let output = stdout_string(&stop);
+    assert_contains_all(
+        &output,
+        &[
+            "Stopping Memory Bank service...",
+            "Success: Stopped Memory Bank service.",
+            "Installed: yes",
+            "Active: no",
+        ],
+    );
+    assert!(
+        !output.contains("still appears active"),
+        "unexpected stop warning:\n{output}"
+    );
+
+    #[cfg(target_os = "macos")]
+    assert!(harness.read_shim_log().contains("launchctl bootout"));
+    #[cfg(target_os = "linux")]
+    assert!(
+        harness
+            .read_shim_log()
+            .contains("systemctl --user stop memory-bank.service")
+    );
+}
+
+#[test]
 fn mb_service_start_when_already_active_avoids_transition_poll_loops() {
     let harness = MbHarness::new();
     harness.seed_service_binary_placeholders();
@@ -907,5 +1025,56 @@ fn mb_service_start_when_already_active_avoids_transition_poll_loops() {
             "systemctl --user is-active --quiet memory-bank.service"
         ) <= 4,
         "{log}"
+    );
+}
+
+#[test]
+fn mb_service_restart_waits_for_process_rollover() {
+    let harness = MbHarness::new();
+    harness.seed_service_binary_placeholders();
+    let healthz = HealthzServer::new("default", "anthropic", "fast-embed", "test");
+
+    let set_port = harness.run(&["config", "set", "service.port", &healthz.port().to_string()]);
+    assert!(set_port.status.success(), "{}", stderr_string(&set_port));
+    let install = harness.run(&["service", "install"]);
+    assert!(install.status.success(), "{}", stderr_string(&install));
+    fs::write(&harness.shim_log, "").expect("clear shim log");
+
+    let restart = harness.run_with_env(
+        &["service", "restart"],
+        &[
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PRINT_SEQUENCE", "0,0,0,0"),
+            #[cfg(target_os = "macos")]
+            ("MB_TEST_LAUNCHCTL_PID_SEQUENCE", "4242,4242,9001,9001"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_IS_ACTIVE_SEQUENCE", "0,0,0"),
+            #[cfg(target_os = "linux")]
+            ("MB_TEST_SYSTEMCTL_MAINPID_SEQUENCE", "4242,9001,9001"),
+        ],
+    );
+    assert!(restart.status.success(), "{}", stderr_string(&restart));
+    assert_contains_all(
+        &stdout_string(&restart),
+        &[
+            "Restarting Memory Bank service...",
+            "Success: Restarted Memory Bank service.",
+            "Health: yes",
+        ],
+    );
+
+    let log = harness.read_shim_log();
+    #[cfg(target_os = "macos")]
+    assert!(
+        count_occurrences(&log, "launchctl print") >= 3,
+        "expected restart rollover polling, log was:\n{log}"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        count_occurrences(
+            &log,
+            "systemctl --user show memory-bank.service --property MainPID --value"
+        ) >= 2,
+        "expected pid recheck, log was:\n{log}"
     );
 }

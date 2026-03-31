@@ -1,13 +1,18 @@
+mod claude;
+mod gemini;
+mod openclaw;
+mod opencode;
+mod shared;
+
 use crate::AppError;
-use crate::assets::{copy_if_needed, find_on_path};
-use crate::command_utils::{CommandOutcome, run_command_capture, shell_escape};
+use crate::assets::find_on_path;
 #[cfg(test)]
-use crate::command_utils::{CommandRunOptions, run_command_capture_with_options};
-use crate::constants::{HOOK_BINARY_NAME, MCP_PROXY_BINARY_NAME};
-use crate::json_config::{
-    array_mut, ensure_object, load_json_config, object_mut, write_json_config_with_backups,
-};
+use crate::command_utils::CommandOutcome;
+#[cfg(test)]
+use crate::command_utils::CommandRunOptions;
+use crate::domain::integration_configured as integration_configured_for_settings;
 use memory_bank_app::{AppPaths, AppSettings, default_server_url};
+#[cfg(test)]
 use serde_json::{Map, Value, json};
 use std::fmt;
 
@@ -96,35 +101,11 @@ pub(crate) fn configure_selected_agents(
 }
 
 pub(crate) fn integration_configured(settings: &AppSettings, agent: AgentKind) -> bool {
-    settings
-        .integrations
-        .as_ref()
-        .and_then(|integrations| match agent {
-            AgentKind::ClaudeCode => integrations.claude_code.as_ref(),
-            AgentKind::GeminiCli => integrations.gemini_cli.as_ref(),
-            AgentKind::OpenCode => integrations.opencode.as_ref(),
-            AgentKind::OpenClaw => integrations.openclaw.as_ref(),
-        })
-        .map(|state| state.configured)
-        .unwrap_or(false)
+    integration_configured_for_settings(settings.integrations.as_ref(), agent)
 }
 
 fn configure_claude(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
-    ensure_claude_user_mcp(server_url)?;
-
-    let settings_path = paths.home_dir.join(".claude/settings.json");
-    let mut root = load_json_config(&settings_path)?;
-    let events = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
-    for event in events {
-        let command = build_hook_command(
-            &paths.binary_path(HOOK_BINARY_NAME),
-            "claude-code",
-            event,
-            server_url,
-        );
-        upsert_claude_hook(&mut root, event, &command)?;
-    }
-    write_json_config_with_backups(paths, &settings_path, &root)
+    claude::configure(paths, server_url)
 }
 
 #[cfg(test)]
@@ -133,344 +114,72 @@ fn configure_claude_with_options(
     server_url: &str,
     options: &CommandRunOptions,
 ) -> Result<(), AppError> {
-    ensure_claude_user_mcp_with_runner(server_url, |args| {
-        run_command_capture_with_options("claude", args, options)
-    })?;
-
-    let settings_path = paths.home_dir.join(".claude/settings.json");
-    let mut root = load_json_config(&settings_path)?;
-    let events = ["UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"];
-    for event in events {
-        let command = build_hook_command(
-            &paths.binary_path(HOOK_BINARY_NAME),
-            "claude-code",
-            event,
-            server_url,
-        );
-        upsert_claude_hook(&mut root, event, &command)?;
-    }
-    write_json_config_with_backups(paths, &settings_path, &root)
+    claude::configure_with_options(paths, server_url, options)
 }
 
 fn configure_gemini(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
-    let settings_path = paths.home_dir.join(".gemini/settings.json");
-    let mut root = load_json_config(&settings_path)?;
-    ensure_object(&mut root);
-    ensure_child_object(object_mut(&mut root)?, "mcpServers")?.insert(
-        "memory-bank".to_string(),
-        json!({ "httpUrl": format!("{server_url}/mcp") }),
-    );
-
-    let hook_events = [
-        ("BeforeAgent", "*"),
-        ("BeforeTool", ".*"),
-        ("AfterTool", ".*"),
-        ("AfterAgent", "*"),
-    ];
-    for (event, matcher) in hook_events {
-        let command = build_hook_command(
-            &paths.binary_path(HOOK_BINARY_NAME),
-            "gemini-cli",
-            event,
-            server_url,
-        );
-        upsert_gemini_hook(&mut root, event, matcher, &command)?;
-    }
-    write_json_config_with_backups(paths, &settings_path, &root)
+    gemini::configure(paths, server_url)
 }
 
 fn configure_opencode(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
-    let plugin_target = paths
-        .home_dir
-        .join(".config/opencode/plugins/memory-bank.js");
-    copy_if_needed(
-        &paths.integrations_dir.join("opencode/memory-bank.js"),
-        &plugin_target,
-    )?;
-
-    let settings_path = paths.home_dir.join(".config/opencode/opencode.json");
-    let mut root = load_json_config(&settings_path)?;
-    ensure_object(&mut root);
-    ensure_child_object(object_mut(&mut root)?, "mcp")?.insert(
-        "memory-bank".to_string(),
-        json!({
-            "type": "remote",
-            "url": format!("{server_url}/mcp"),
-            "enabled": true
-        }),
-    );
-    write_json_config_with_backups(paths, &settings_path, &root)
+    opencode::configure(paths, server_url)
 }
 
 fn configure_openclaw(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
-    let extension_path = paths.integrations_dir.join("openclaw/memory-bank");
-    let settings_path = paths.home_dir.join(".openclaw/openclaw.json");
-    let mut root = load_json_config(&settings_path)?;
-    ensure_object(&mut root);
-    let root_map = object_mut(&mut root)?;
-    let mcp = ensure_child_object(root_map, "mcp")?;
-    ensure_child_object(mcp, "servers")?.insert(
-        "memory-bank".to_string(),
-        json!({
-            "command": paths.binary_path(MCP_PROXY_BINARY_NAME),
-            "args": ["--server-url", server_url]
-        }),
-    );
-
-    let plugins = ensure_child_object(root_map, "plugins")?;
-    upsert_openclaw_plugin_load_path(
-        ensure_child_object(plugins, "load")?,
-        extension_path.to_string_lossy().as_ref(),
-    )?;
-    ensure_child_object(plugins, "entries")?.insert(
-        "memory-bank".to_string(),
-        json!({
-            "enabled": true,
-            "config": {
-                "hookBinary": paths.binary_path(HOOK_BINARY_NAME),
-                "serverUrl": server_url
-            }
-        }),
-    );
-    ensure_child_object(plugins, "slots")?
-        .insert("memory".to_string(), Value::String("none".to_string()));
-
-    write_json_config_with_backups(paths, &settings_path, &root)
+    openclaw::configure(paths, server_url)
 }
 
-fn ensure_claude_user_mcp(server_url: &str) -> Result<(), AppError> {
-    ensure_claude_user_mcp_with_runner(server_url, |args| run_command_capture("claude", args))
-}
-
+#[cfg(test)]
 fn ensure_claude_user_mcp_with_runner<F>(server_url: &str, mut run: F) -> Result<(), AppError>
 where
     F: FnMut(&[&str]) -> Result<CommandOutcome, AppError>,
 {
-    let desired_url = format!("{server_url}/mcp");
-    let current = run(&["mcp", "get", "memory-bank"])?;
-
-    if claude_mcp_matches(&current, &desired_url) {
-        return Ok(());
-    }
-
-    if current.success {
-        if claude_mcp_scope(&current).as_deref() == Some("user") {
-            let removal = run(&["mcp", "remove", "memory-bank", "-s", "user"])?;
-            if !removal.success {
-                return Err(removal.into_error());
-            }
-        } else {
-            return Err(AppError::Message(
-                "Claude Code already has a conflicting `memory-bank` MCP server outside user scope; remove or rename that entry before rerunning setup".to_string(),
-            ));
-        }
-    }
-
-    let addition = run(&[
-        "mcp",
-        "add",
-        "--transport",
-        "http",
-        "--scope",
-        "user",
-        "memory-bank",
-        &desired_url,
-    ])?;
-
-    if !addition.success {
-        let verify = run(&["mcp", "get", "memory-bank"])?;
-        if claude_mcp_matches(&verify, &desired_url) {
-            return Ok(());
-        }
-        return Err(addition.into_error());
-    }
-
-    let verify = run(&["mcp", "get", "memory-bank"])?;
-    if claude_mcp_matches(&verify, &desired_url) {
-        Ok(())
-    } else {
-        Err(AppError::Message(format!(
-            "Claude Code did not report the expected user-scoped HTTP MCP config for memory-bank after setup. Expected URL: {desired_url}"
-        )))
-    }
+    claude::ensure_user_mcp_with_runner(server_url, &mut run)
 }
 
+#[cfg(test)]
 fn claude_mcp_matches(outcome: &CommandOutcome, desired_url: &str) -> bool {
-    outcome.success
-        && claude_mcp_scope(outcome).as_deref() == Some("user")
-        && outcome.combined_output().contains("Type: http")
-        && outcome.combined_output().contains(desired_url)
+    claude::mcp_matches(outcome, desired_url)
 }
 
-fn claude_mcp_scope(outcome: &CommandOutcome) -> Option<String> {
-    for line in outcome.combined_output().lines() {
-        let trimmed = line.trim();
-        if let Some(scope) = trimmed.strip_prefix("Scope:") {
-            let scope = scope.trim().to_ascii_lowercase();
-            if scope.starts_with("user") {
-                return Some("user".to_string());
-            }
-            if scope.starts_with("project") || scope.starts_with("local") {
-                return Some("project".to_string());
-            }
-            return Some(scope);
-        }
-    }
-    None
-}
-
+#[cfg(test)]
 fn build_hook_command(
     hook_binary: &std::path::Path,
     agent: &str,
     event: &str,
     server_url: &str,
 ) -> String {
-    format!(
-        "{} --agent {} --event {} --server-url {}",
-        shell_escape(hook_binary.to_string_lossy().as_ref()),
-        shell_escape(agent),
-        shell_escape(event),
-        shell_escape(server_url)
-    )
+    shared::build_hook_command(hook_binary, agent, event, server_url)
 }
 
+#[cfg(test)]
 fn upsert_claude_hook(root: &mut Value, event: &str, command: &str) -> Result<(), AppError> {
-    ensure_object(root);
-    let root_map = object_mut(root)?;
-    let hooks_map = ensure_child_object(root_map, "hooks")?;
-    let groups_array = ensure_child_array(hooks_map, event)?;
-    let marker = format!("--agent claude-code --event {event}");
-    let desired = json!({
-        "type": "command",
-        "command": command,
-    });
-    if let Some(existing) = groups_array.iter_mut().find_map(|group| {
-        group
-            .get_mut("hooks")
-            .and_then(Value::as_array_mut)
-            .and_then(|hooks| {
-                hooks.iter_mut().find(|hook| {
-                    hook.get("command")
-                        .and_then(Value::as_str)
-                        .map(|value| value.contains(&marker))
-                        .unwrap_or(false)
-                })
-            })
-    }) {
-        *existing = desired;
-    } else {
-        groups_array.push(json!({ "hooks": [desired] }));
-    }
-    Ok(())
+    claude::upsert_hook(root, event, command)
 }
 
+#[cfg(test)]
 fn upsert_gemini_hook(
     root: &mut Value,
     event: &str,
     matcher: &str,
     command: &str,
 ) -> Result<(), AppError> {
-    ensure_object(root);
-    let root_map = object_mut(root)?;
-    let hooks_map = ensure_child_object(root_map, "hooks")?;
-    let groups_array = ensure_child_array(hooks_map, event)?;
-    let desired_hook = json!({
-        "name": "memory-bank",
-        "type": "command",
-        "command": command,
-    });
-    if let Some(existing_group) = groups_array.iter_mut().find(|group| {
-        group
-            .get("hooks")
-            .and_then(Value::as_array)
-            .map(|hooks| {
-                hooks.iter().any(|hook| {
-                    hook.get("name")
-                        .and_then(Value::as_str)
-                        .map(|value| value == "memory-bank")
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-    }) {
-        existing_group["matcher"] = Value::String(matcher.to_string());
-        existing_group["sequential"] = Value::Bool(true);
-        if let Some(hooks) = existing_group
-            .get_mut("hooks")
-            .and_then(Value::as_array_mut)
-            && let Some(existing_hook) = hooks.iter_mut().find(|hook| {
-                hook.get("name")
-                    .and_then(Value::as_str)
-                    .map(|value| value == "memory-bank")
-                    .unwrap_or(false)
-            })
-        {
-            *existing_hook = desired_hook;
-        }
-    } else {
-        groups_array.push(json!({
-            "matcher": matcher,
-            "sequential": true,
-            "hooks": [desired_hook],
-        }));
-    }
-    Ok(())
+    gemini::upsert_hook(root, event, matcher, command)
 }
 
+#[cfg(test)]
 fn upsert_openclaw_plugin_load_path(
     load_map: &mut Map<String, Value>,
     desired_path: &str,
 ) -> Result<(), AppError> {
-    let desired = desired_path.to_string();
-    let paths_value = load_map
-        .entry("paths".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let paths_array = array_mut(paths_value)?;
-
-    paths_array.retain(|value| {
-        let Some(path) = value.as_str() else {
-            return true;
-        };
-        !(path.ends_with("/memory-bank") && path != desired)
-    });
-
-    if !paths_array
-        .iter()
-        .any(|value| value.as_str() == Some(desired.as_str()))
-    {
-        paths_array.push(Value::String(desired));
-    }
-
-    Ok(())
-}
-
-fn ensure_child_object<'a>(
-    parent: &'a mut Map<String, Value>,
-    key: &str,
-) -> Result<&'a mut Map<String, Value>, AppError> {
-    let child = parent
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    ensure_object(child);
-    object_mut(child)
-}
-
-fn ensure_child_array<'a>(
-    parent: &'a mut Map<String, Value>,
-    key: &str,
-) -> Result<&'a mut Vec<Value>, AppError> {
-    let child = parent
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if !child.is_array() {
-        *child = Value::Array(Vec::new());
-    }
-    array_mut(child)
+    openclaw::upsert_plugin_load_path(load_map, desired_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::MCP_PROXY_BINARY_NAME;
+    use crate::json_config::load_json_config;
     use crate::real_binary_tests::RealBinaryTestEnv;
     use std::cell::RefCell;
     use std::collections::VecDeque;
