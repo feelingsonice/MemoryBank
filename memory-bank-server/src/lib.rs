@@ -9,6 +9,8 @@ mod llm;
 mod logging;
 mod mcp_server;
 mod memory_window;
+#[cfg(test)]
+mod retrieval_eval;
 
 use crate::actor::MemoryActor;
 use crate::config::ServeConfig;

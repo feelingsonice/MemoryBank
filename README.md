@@ -52,6 +52,8 @@ mb status
 
 If the installer finished in a non-interactive shell and skipped setup, just run `mb setup` afterward. If `mb` is not available in the current shell yet, use `~/.memory_bank/bin/mb setup` or open a new shell.
 
+If you later change `server.fastembed_model` with `mb config set`, the CLI will ask you to confirm it. The next service start will rebuild the vector index for the active namespace and re-encode any existing memories with the new embedding model.
+
 ### Smoke Test
 
 In a fresh agent session, ask it to remember something memorable and do at least one tool call:

@@ -6,8 +6,8 @@ use crate::assets::{ExposureMode, materialize_and_expose_cli, materialize_instal
 use crate::cli::{ConfigCommand, NamespaceCommand, ServiceCommand};
 use crate::command_utils::yes_no;
 use crate::config::{
-    get_config_value, llm_provider_value, resolved_encoder_provider, resolved_llm_model,
-    resolved_ollama_url, set_config_value,
+    FastEmbedReindexChange, fastembed_reindex_change, get_config_value, llm_provider_value,
+    resolved_encoder_provider, resolved_llm_model, resolved_ollama_url, set_config_value,
 };
 use crate::output::{
     print_action_start, print_key_value, styled_command, styled_failure, styled_section,
@@ -20,14 +20,15 @@ use crate::service::{
 };
 use memory_bank_app::{AppPaths, AppSettings, DEFAULT_NAMESPACE_NAME, Namespace, SecretStore};
 use std::fs;
+use std::io::{self, IsTerminal};
 use std::os::unix::process::CommandExt;
 use std::process::Command as ProcessCommand;
 
 use self::render::{
-    describe_cli_exposure, describe_install_attempt, describe_start_attempt,
-    print_install_result, print_live_runtime_section, print_namespace_apply_result,
-    print_service_section, print_start_or_restart_result, print_stop_result,
-    runtime_health_warning, runtime_mismatch_fields,
+    describe_cli_exposure, describe_install_attempt, describe_start_attempt, print_install_result,
+    print_live_runtime_section, print_namespace_apply_result, print_service_section,
+    print_start_or_restart_result, print_stop_result, runtime_health_warning,
+    runtime_mismatch_fields,
 };
 
 pub(crate) fn run_status() -> Result<(), AppError> {
@@ -423,9 +424,24 @@ pub(crate) fn run_config(command: ConfigCommand) -> Result<(), AppError> {
             println!("{value}");
             Ok(())
         }
-        ConfigCommand::Set { key, value } => {
+        ConfigCommand::Set { key, value, yes } => {
+            let previous_settings = settings.clone();
             let previous = get_config_value(&settings, &key)?;
             set_config_value(&mut settings, &key, &value)?;
+            let reindex_change = if key == "server.fastembed_model" {
+                fastembed_reindex_change(&previous_settings, &settings)
+            } else {
+                None
+            };
+            if let Some(change) = reindex_change.as_ref()
+                && !confirm_fastembed_reindex_change(change, yes)?
+            {
+                println!(
+                    "{}",
+                    styled_warning("Config update canceled. No changes were made.")
+                );
+                return Ok(());
+            }
             settings.save(&paths)?;
             let current = get_config_value(&settings, &key)?;
             let service = service_status(&paths)?;
@@ -433,6 +449,15 @@ pub(crate) fn run_config(command: ConfigCommand) -> Result<(), AppError> {
             println!("{}", styled_success(&format!("Updated `{key}`.")));
             print_key_value("Old value", &previous);
             print_key_value("New value", &current);
+            if let Some(change) = reindex_change {
+                println!(
+                    "{}",
+                    styled_warning(&format!(
+                        "Warning: Changing the FastEmbed model from `{}` to `{}` means the next service start will rebuild the vector index and re-encode existing memories for this namespace.",
+                        change.previous_model, change.new_model
+                    ))
+                );
+            }
             if previous == current {
                 println!(
                     "{}",
@@ -449,6 +474,33 @@ pub(crate) fn run_config(command: ConfigCommand) -> Result<(), AppError> {
             Ok(())
         }
     }
+}
+
+fn confirm_fastembed_reindex_change(
+    change: &FastEmbedReindexChange,
+    assume_yes: bool,
+) -> Result<bool, AppError> {
+    if assume_yes {
+        return Ok(true);
+    }
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(AppError::Message(
+            "Changing the FastEmbed model will rebuild the vector index on startup and re-encode existing memories for this namespace. Re-run this command in an interactive terminal to confirm, or pass `--yes` to accept it.".to_string(),
+        ));
+    }
+
+    let prompt = format!(
+        "Changing the FastEmbed model from `{}` to `{}` will rebuild the vector index on startup and re-encode existing memories for this namespace. Are you sure?",
+        change.previous_model, change.new_model
+    );
+    let confirmed = inquire::Confirm::new(&prompt)
+        .with_default(false)
+        .with_help_message(
+            "The saved config changes immediately. The vector re-index happens the next time the service starts with this model.",
+        )
+        .prompt_skippable()?;
+    Ok(matches!(confirmed, Some(true)))
 }
 
 pub(crate) fn run_internal_server() -> Result<(), AppError> {

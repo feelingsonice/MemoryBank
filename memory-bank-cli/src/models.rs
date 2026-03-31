@@ -2,9 +2,7 @@ use crate::AppError;
 use crate::assets::find_repo_root;
 use crate::constants::{EMBEDDED_MODEL_CATALOG, REMOTE_MODEL_CATALOG_URL};
 use crate::domain::ProviderId;
-use memory_bank_app::{
-    AppPaths,
-};
+use memory_bank_app::AppPaths;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

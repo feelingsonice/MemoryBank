@@ -1,6 +1,8 @@
 use crate::AppError;
 use crate::constants::{HOOK_BINARY_NAME, MCP_PROXY_BINARY_NAME};
-use crate::json_config::{array_mut, ensure_object, load_json_config, object_mut, write_json_config_with_backups};
+use crate::json_config::{
+    array_mut, ensure_object, load_json_config, object_mut, write_json_config_with_backups,
+};
 use memory_bank_app::AppPaths;
 use serde_json::{Map, Value, json};
 

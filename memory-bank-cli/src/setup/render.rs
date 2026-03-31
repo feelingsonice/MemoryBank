@@ -97,10 +97,10 @@ pub(super) fn render_agents_summary(agents: &[AgentKind]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::plan::{AdvancedSettings, SecretChoice};
     use super::*;
     use crate::assets::ExposureMode;
     use crate::domain::ProviderId;
-    use super::super::plan::{AdvancedSettings, SecretChoice};
     use memory_bank_app::{AppSettings, Namespace};
 
     #[test]

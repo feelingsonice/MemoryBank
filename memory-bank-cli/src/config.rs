@@ -29,6 +29,12 @@ enum ConfigKey {
     IntegrationConfigured(AgentKind),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FastEmbedReindexChange {
+    pub(crate) previous_model: String,
+    pub(crate) new_model: String,
+}
+
 impl FromStr for ConfigKey {
     type Err = AppError;
 
@@ -106,9 +112,9 @@ pub(crate) fn get_config_value(settings: &AppSettings, key: &str) -> Result<Stri
             .as_ref()
             .and_then(|server| server.remote_encoder_url.clone())
             .unwrap_or_default()),
-        ConfigKey::IntegrationConfigured(agent) => Ok(
-            integration_configured(settings.integrations.as_ref(), agent).to_string(),
-        ),
+        ConfigKey::IntegrationConfigured(agent) => {
+            Ok(integration_configured(settings.integrations.as_ref(), agent).to_string())
+        }
     }
 }
 
@@ -283,6 +289,34 @@ pub(crate) fn resolved_llm_model(settings: &AppSettings) -> String {
         .unwrap_or_else(|| default_model_for_provider(llm_provider_value(settings)).to_string())
 }
 
+pub(crate) fn resolved_fastembed_model(settings: &AppSettings) -> String {
+    settings
+        .server
+        .as_ref()
+        .and_then(|server| server.fastembed_model.clone())
+        .unwrap_or_else(|| DEFAULT_FASTEMBED_MODEL.to_string())
+}
+
+pub(crate) fn fastembed_reindex_change(
+    current: &AppSettings,
+    updated: &AppSettings,
+) -> Option<FastEmbedReindexChange> {
+    if resolved_encoder_provider(updated) != EncoderProviderId::FastEmbed.as_str() {
+        return None;
+    }
+
+    let previous_model = resolved_fastembed_model(current);
+    let new_model = resolved_fastembed_model(updated);
+    if previous_model == new_model {
+        None
+    } else {
+        Some(FastEmbedReindexChange {
+            previous_model,
+            new_model,
+        })
+    }
+}
+
 pub(crate) fn resolved_ollama_url(current: Option<&str>) -> String {
     current
         .map(normalize_ollama_url)
@@ -355,6 +389,55 @@ mod tests {
         let model = get_config_value(&settings, "server.llm_model").expect("model value");
 
         assert_eq!(model, memory_bank_app::DEFAULT_GEMINI_MODEL);
+    }
+
+    #[test]
+    fn fastembed_reindex_change_detects_saved_model_change() {
+        let current = AppSettings::default();
+        let updated = AppSettings {
+            server: Some(ServerSettings {
+                fastembed_model: Some("custom/embed-model".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+
+        assert_eq!(
+            fastembed_reindex_change(&current, &updated),
+            Some(FastEmbedReindexChange {
+                previous_model: DEFAULT_FASTEMBED_MODEL.to_string(),
+                new_model: "custom/embed-model".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn fastembed_reindex_change_ignores_unchanged_effective_model() {
+        let current = AppSettings::default();
+        let updated = AppSettings {
+            server: Some(ServerSettings {
+                fastembed_model: Some(DEFAULT_FASTEMBED_MODEL.to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+
+        assert_eq!(fastembed_reindex_change(&current, &updated), None);
+    }
+
+    #[test]
+    fn fastembed_reindex_change_ignores_non_fastembed_provider() {
+        let current = AppSettings::default();
+        let updated = AppSettings {
+            server: Some(ServerSettings {
+                encoder_provider: Some("local-api".to_string()),
+                fastembed_model: Some("custom/embed-model".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+
+        assert_eq!(fastembed_reindex_change(&current, &updated), None);
     }
 
     #[test]

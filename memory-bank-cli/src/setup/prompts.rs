@@ -10,9 +10,7 @@ use crate::output::{no_color_requested, styled_subtle, styled_warning};
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, MultiSelect, Select, Text, set_global_render_config};
-use memory_bank_app::{
-    AppSettings, DEFAULT_OLLAMA_URL, Namespace, SecretStore,
-};
+use memory_bank_app::{AppSettings, DEFAULT_OLLAMA_URL, Namespace, SecretStore};
 use std::io::{self, IsTerminal};
 
 use super::plan::{AdvancedSettings, SecretChoice, SetupPlan};
@@ -96,7 +94,8 @@ pub(super) fn collect_setup_plan(
     print_setup_intro();
 
     print_setup_section("Basic");
-    let namespace = prompt_namespace(settings.active_namespace()).and_then(WizardStep::into_result)?;
+    let namespace =
+        prompt_namespace(settings.active_namespace()).and_then(WizardStep::into_result)?;
 
     print_setup_section("LLM configuration");
     let provider = prompt_provider(
@@ -128,8 +127,13 @@ pub(super) fn collect_setup_plan(
         collect_secret_choice(provider, secrets).and_then(WizardStep::into_result)?;
 
     print_setup_section("Preferences");
-    let autostart = prompt_autostart(settings.service.as_ref().and_then(|service| service.autostart))
-        .and_then(WizardStep::into_result)?;
+    let autostart = prompt_autostart(
+        settings
+            .service
+            .as_ref()
+            .and_then(|service| service.autostart),
+    )
+    .and_then(WizardStep::into_result)?;
 
     print_setup_section("Agent integrations");
     println!(
@@ -248,9 +252,7 @@ fn prompt_model(
     };
 
     match selection {
-        ModelChoice::Preset(model) | ModelChoice::Current(model) => {
-            Ok(WizardStep::Continue(model))
-        }
+        ModelChoice::Preset(model) | ModelChoice::Current(model) => Ok(WizardStep::Continue(model)),
         ModelChoice::Custom => Ok(WizardStep::from_option(
             Text::new("Custom model string")
                 .with_default(current.unwrap_or(provider.default_model()))
@@ -391,7 +393,9 @@ fn collect_secret_choice(
 ) -> Result<WizardStep<SecretChoice>, AppError> {
     let plan = secret_prompt_plan(
         provider,
-        provider.secret_env_key().and_then(|key| std::env::var(key).ok()),
+        provider
+            .secret_env_key()
+            .and_then(|key| std::env::var(key).ok()),
         provider
             .secret_env_key()
             .and_then(|key| secrets.get(key).map(str::to_owned)),
@@ -489,8 +493,9 @@ fn manual_secret_choice(secret_key: &'static str) -> Result<WizardStep<SecretCho
     }
 }
 
-fn prompt_advanced_settings(settings: &AppSettings) -> Result<WizardStep<AdvancedSettings>, AppError>
-{
+fn prompt_advanced_settings(
+    settings: &AppSettings,
+) -> Result<WizardStep<AdvancedSettings>, AppError> {
     let current = AdvancedSettings::from_settings(settings);
 
     let port = WizardStep::from_option(

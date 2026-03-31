@@ -1,12 +1,9 @@
 use crate::command_utils::yes_no;
 use crate::constants::HEALTH_STARTUP_TIMEOUT;
 use crate::output::{
-    print_key_value, styled_command, styled_section, styled_subtle, styled_success,
-    styled_warning,
+    print_key_value, styled_command, styled_section, styled_subtle, styled_success, styled_warning,
 };
-use crate::service::{
-    HealthCheck, ServiceActionKind, ServiceActionReport, ServiceRuntimeSummary,
-};
+use crate::service::{HealthCheck, ServiceActionKind, ServiceActionReport, ServiceRuntimeSummary};
 use memory_bank_app::AppSettings;
 
 pub(super) fn runtime_mismatch_fields<'a>(
@@ -248,7 +245,9 @@ pub(super) fn print_namespace_apply_result(report: &ServiceActionReport) {
 
 pub(super) fn describe_cli_exposure(mode: crate::assets::ExposureMode) -> String {
     match mode {
-        crate::assets::ExposureMode::Direct => "`mb` is available directly in this shell.".to_string(),
+        crate::assets::ExposureMode::Direct => {
+            "`mb` is available directly in this shell.".to_string()
+        }
         crate::assets::ExposureMode::Launcher => {
             "Installed or refreshed the managed `mb` launcher on PATH.".to_string()
         }

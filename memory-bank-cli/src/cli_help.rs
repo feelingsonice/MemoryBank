@@ -134,7 +134,8 @@ Examples:
   mb config show
   mb config get server.llm_provider
   mb config set service.port 4545
-  mb config set server.llm_provider gemini";
+  mb config set server.llm_provider gemini
+  mb config set --yes server.fastembed_model custom/embed-model";
 
 pub(crate) const CONFIG_SET_AFTER_HELP: &str = "\
 Supported keys:
@@ -164,9 +165,14 @@ Examples:
   mb config set server.llm_provider gemini
   mb config set active_namespace work-project
   mb config set server.llm_model \"\"
+  mb config set --yes server.fastembed_model custom/embed-model
 
 Use an empty string to clear optional string overrides such as
-`server.llm_model` or `server.ollama_url`.";
+`server.llm_model` or `server.ollama_url`.
+
+Changing `server.fastembed_model` requires confirmation because the next server
+start will rebuild the vector index and re-encode existing memories for that
+namespace. Use `--yes` in automation.";
 
 #[cfg(test)]
 mod tests {
@@ -175,7 +181,9 @@ mod tests {
     #[test]
     fn config_help_catalog_mentions_supported_keys_and_examples() {
         assert!(CONFIG_AFTER_HELP.contains("server.llm_provider"));
+        assert!(CONFIG_AFTER_HELP.contains("server.fastembed_model"));
         assert!(CONFIG_AFTER_HELP.contains("integrations.openclaw.configured"));
         assert!(CONFIG_SET_AFTER_HELP.contains("mb config set service.port 4545"));
+        assert!(CONFIG_SET_AFTER_HELP.contains("Use `--yes` in automation."));
     }
 }

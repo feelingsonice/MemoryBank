@@ -55,6 +55,18 @@ Check:
 
 Also remember that the first startup can take longer than later runs because the embedding model may need to download and warm its local cache under `~/.memory_bank/models/`.
 
+## Startup Is Slow After Changing The FastEmbed Model
+
+If you change `server.fastembed_model`, Memory Bank will rebuild the vector index and re-encode existing memories the next time the service starts for that namespace.
+
+That is expected. The CLI now asks you to confirm this change before saving it.
+
+Useful checks:
+
+- `mb config get server.fastembed_model`
+- `mb service restart`
+- `mb logs -f`
+
 ## Missing Provider Secret Or Invalid Provider Config
 
 Hosted providers need a saved secret so the background service can start on its own.

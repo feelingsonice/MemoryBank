@@ -5,6 +5,7 @@ mod render;
 use crate::AppError;
 use crate::agents::{AgentSetupOutcome, configure_selected_agents, detect_installed_agents};
 use crate::assets::{ExposureOutcome, materialize_and_expose_cli};
+use crate::config::fastembed_reindex_change;
 use crate::constants::{HEALTH_POLL_INTERVAL, HEALTH_STARTUP_TIMEOUT};
 use crate::output::{styled_failure, styled_subtle, styled_success, styled_warning};
 use crate::service::{HealthCheck, install_service, start_service, wait_for_health};
@@ -38,6 +39,17 @@ pub(crate) fn run_setup() -> Result<(), AppError> {
 
     println!();
     println!("{}", render_review_summary(&plan));
+    let preview_settings = build_settings_for_plan(&settings, &plan, &[]);
+    if let Some(change) = fastembed_reindex_change(&settings, &preview_settings) {
+        println!();
+        println!(
+            "{}",
+            styled_warning(&format!(
+                "Warning: Changing the FastEmbed model from `{}` to `{}` means the next service start will rebuild the vector index and re-encode existing memories for this namespace.",
+                change.previous_model, change.new_model
+            ))
+        );
+    }
     println!();
 
     let confirm = inquire::Confirm::new("Apply these changes now?")
@@ -96,8 +108,7 @@ fn apply_setup_plan(
 
     let agent_outcome = {
         print_step_start(2, total_steps, "Configure selected agents")?;
-        let outcome =
-            configure_selected_agents(paths, &preview_settings, &plan.selected_agents)?;
+        let outcome = configure_selected_agents(paths, &preview_settings, &plan.selected_agents)?;
         if plan.selected_agents.is_empty() {
             println!("{}", styled_subtle("skipped (no agents selected)"));
         } else if outcome.warnings.is_empty() {

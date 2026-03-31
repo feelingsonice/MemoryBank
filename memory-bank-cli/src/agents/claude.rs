@@ -3,7 +3,9 @@ use crate::command_utils::{CommandOutcome, run_command_capture};
 #[cfg(test)]
 use crate::command_utils::{CommandRunOptions, run_command_capture_with_options};
 use crate::constants::HOOK_BINARY_NAME;
-use crate::json_config::{ensure_object, load_json_config, object_mut, write_json_config_with_backups};
+use crate::json_config::{
+    ensure_object, load_json_config, object_mut, write_json_config_with_backups,
+};
 use memory_bank_app::AppPaths;
 use serde_json::{Value, json};
 

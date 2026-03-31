@@ -173,6 +173,12 @@ pub enum ConfigCommand {
             help = "New value for the selected key. Use an empty string to clear optional string overrides"
         )]
         value: String,
+        #[arg(
+            short = 'y',
+            long,
+            help = "Skip confirmation prompts for changes that trigger follow-up work on the next service start"
+        )]
+        yes: bool,
     },
 }
 
@@ -206,7 +212,20 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Config {
-                command: ConfigCommand::Set { key, value }
+                command: ConfigCommand::Set { key, value, yes: false }
+            } if key == "service.port" && value == "4545"
+        ));
+    }
+
+    #[test]
+    fn parses_config_set_yes_flag() {
+        let cli = Cli::try_parse_from(["mb", "config", "set", "--yes", "service.port", "4545"])
+            .expect("parse cli");
+
+        assert!(matches!(
+            cli.command,
+            Command::Config {
+                command: ConfigCommand::Set { key, value, yes: true }
             } if key == "service.port" && value == "4545"
         ));
     }

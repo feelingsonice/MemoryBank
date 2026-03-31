@@ -190,8 +190,8 @@ pub(crate) fn collect_doctor_issues(
         }
     }
 
-    if let Some(env_key) = ProviderId::from_config_value(Some(llm_provider_value(settings)))
-        .secret_env_key()
+    if let Some(env_key) =
+        ProviderId::from_config_value(Some(llm_provider_value(settings))).secret_env_key()
         && require_non_empty_secret(&secrets, env_key).is_none()
     {
         issues.push(format!("missing {env_key} in ~/.memory_bank/secrets.env"));

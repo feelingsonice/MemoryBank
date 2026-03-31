@@ -3,8 +3,8 @@ use crate::config::{set_integrations, set_server, set_service};
 use crate::constants::{DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_NEAREST_NEIGHBOR_COUNT};
 use crate::domain::{ProviderId, integration_configured, set_integration_configured};
 use memory_bank_app::{
-    AppSettings, DEFAULT_FASTEMBED_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_OLLAMA_URL,
-    DEFAULT_PORT, Namespace, SecretStore, SETTINGS_SCHEMA_VERSION,
+    AppSettings, DEFAULT_FASTEMBED_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_OLLAMA_URL, DEFAULT_PORT,
+    Namespace, SETTINGS_SCHEMA_VERSION, SecretStore,
 };
 
 #[derive(Debug, Clone)]
@@ -141,9 +141,9 @@ pub(super) fn build_settings_for_plan(
     };
     server.history_window_size = (plan.advanced.history_window_size != DEFAULT_HISTORY_WINDOW_SIZE)
         .then_some(plan.advanced.history_window_size);
-    server.nearest_neighbor_count =
-        (plan.advanced.nearest_neighbor_count != DEFAULT_NEAREST_NEIGHBOR_COUNT)
-            .then_some(plan.advanced.nearest_neighbor_count);
+    server.nearest_neighbor_count = (plan.advanced.nearest_neighbor_count
+        != DEFAULT_NEAREST_NEIGHBOR_COUNT)
+        .then_some(plan.advanced.nearest_neighbor_count);
     set_server(&mut settings, server);
 
     let mut integrations = current.integrations.clone().unwrap_or_default();

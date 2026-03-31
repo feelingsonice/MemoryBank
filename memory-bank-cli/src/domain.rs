@@ -186,8 +186,7 @@ mod tests {
             DEFAULT_OLLAMA_MODEL
         );
 
-        let error =
-            ProviderId::parse("wat", "server.llm_provider").expect_err("invalid provider");
+        let error = ProviderId::parse("wat", "server.llm_provider").expect_err("invalid provider");
         assert!(error.to_string().contains(ProviderId::allowed_values()));
     }
 
@@ -210,7 +209,11 @@ mod tests {
 
         let error = EncoderProviderId::parse("wat", "server.encoder_provider")
             .expect_err("invalid encoder");
-        assert!(error.to_string().contains(EncoderProviderId::allowed_values()));
+        assert!(
+            error
+                .to_string()
+                .contains(EncoderProviderId::allowed_values())
+        );
     }
 
     #[test]
@@ -219,7 +222,10 @@ mod tests {
 
         set_integration_configured(&mut integrations, AgentKind::OpenClaw, true);
 
-        assert!(integration_configured(Some(&integrations), AgentKind::OpenClaw));
+        assert!(integration_configured(
+            Some(&integrations),
+            AgentKind::OpenClaw
+        ));
         assert!(!integration_configured(
             Some(&integrations),
             AgentKind::ClaudeCode

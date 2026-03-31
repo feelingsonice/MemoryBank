@@ -193,8 +193,12 @@ case "$1 $2 $3" in
 esac
 "#,
                     shim_log.display(),
-                    home.path().join("systemctl-is-active-sequence-state").display(),
-                    home.path().join("systemctl-mainpid-sequence-state").display()
+                    home.path()
+                        .join("systemctl-is-active-sequence-state")
+                        .display(),
+                    home.path()
+                        .join("systemctl-mainpid-sequence-state")
+                        .display()
                 ),
             );
         }
@@ -573,6 +577,51 @@ fn mb_config_round_trips_values_through_the_binary() {
     assert!(rendered.contains("active_namespace = \"team_a_1\""));
     assert!(rendered.contains("[service]"));
     assert!(rendered.contains("port = 4545"));
+}
+
+#[test]
+fn mb_config_set_fastembed_model_requires_confirmation_without_yes() {
+    let harness = MbHarness::new();
+
+    let output = harness.run(&[
+        "config",
+        "set",
+        "server.fastembed_model",
+        "custom/embed-model",
+    ]);
+
+    assert!(!output.status.success());
+    assert_contains_all(
+        &stderr_string(&output),
+        &[
+            "Changing the FastEmbed model will rebuild the vector index on startup and re-encode existing memories for this namespace.",
+            "pass `--yes` to accept it",
+        ],
+    );
+}
+
+#[test]
+fn mb_config_set_fastembed_model_accepts_yes_flag() {
+    let harness = MbHarness::new();
+
+    let output = harness.run(&[
+        "config",
+        "set",
+        "--yes",
+        "server.fastembed_model",
+        "custom/embed-model",
+    ]);
+
+    assert!(output.status.success(), "{}", stderr_string(&output));
+    assert_contains_all(
+        &stdout_string(&output),
+        &[
+            "Updated `server.fastembed_model`.",
+            "Old value: jinaai/jina-embeddings-v2-base-code",
+            "New value: custom/embed-model",
+            "rebuild the vector index and re-encode existing memories",
+        ],
+    );
 }
 
 #[test]

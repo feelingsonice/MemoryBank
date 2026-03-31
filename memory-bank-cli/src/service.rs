@@ -2,11 +2,11 @@ mod definitions;
 mod launch;
 
 use crate::AppError;
+use crate::command_utils::{current_uid, run_command, run_command_capture};
 use crate::constants::{
     HEALTH_POLL_INTERVAL, HEALTH_STARTUP_TIMEOUT, LAUNCHD_LABEL, LOG_TAIL_LINE_COUNT,
     SERVICE_TRANSITION_POLL_INTERVAL, SERVICE_TRANSITION_TIMEOUT, SYSTEMD_UNIT_NAME,
 };
-use crate::command_utils::{current_uid, run_command, run_command_capture};
 use memory_bank_app::{AppPaths, AppSettings, default_server_url};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -19,9 +19,9 @@ use std::time::{Duration, Instant};
 use self::definitions::{
     install_launchd_service, install_systemd_service, launchd_service_path, systemd_service_path,
 };
-pub(crate) use self::launch::{build_server_launch_spec, collect_doctor_issues};
 #[cfg(test)]
 use self::definitions::{render_launchd_plist, render_systemd_unit};
+pub(crate) use self::launch::{build_server_launch_spec, collect_doctor_issues};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManagedPlatform {
@@ -655,8 +655,8 @@ pub(crate) fn tail_log_file(path: &Path, follow: bool) -> Result<(), AppError> {
 mod tests {
     use super::*;
     use crate::constants::{MB_BINARY_NAME, SERVER_BINARY_NAME};
-    use memory_bank_app::{ServerSettings, ServiceSettings};
     use memory_bank_app::SecretStore;
+    use memory_bank_app::{ServerSettings, ServiceSettings};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;

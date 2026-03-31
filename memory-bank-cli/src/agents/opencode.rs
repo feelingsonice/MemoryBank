@@ -1,13 +1,17 @@
 use crate::AppError;
 use crate::assets::copy_if_needed;
-use crate::json_config::{ensure_object, load_json_config, object_mut, write_json_config_with_backups};
+use crate::json_config::{
+    ensure_object, load_json_config, object_mut, write_json_config_with_backups,
+};
 use memory_bank_app::AppPaths;
 use serde_json::json;
 
 use super::shared::ensure_child_object;
 
 pub(super) fn configure(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
-    let plugin_target = paths.home_dir.join(".config/opencode/plugins/memory-bank.js");
+    let plugin_target = paths
+        .home_dir
+        .join(".config/opencode/plugins/memory-bank.js");
     copy_if_needed(
         &paths.integrations_dir.join("opencode/memory-bank.js"),
         &plugin_target,
