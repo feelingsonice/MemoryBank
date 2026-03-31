@@ -10,6 +10,8 @@ mod logging;
 mod mcp_server;
 mod memory_window;
 #[cfg(test)]
+mod ollama_eval;
+#[cfg(test)]
 mod retrieval_eval;
 mod startup_state;
 

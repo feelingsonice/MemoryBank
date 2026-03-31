@@ -285,7 +285,7 @@ const GOLD_FAMILY_SPECS: &[GoldFamilySpec] = &[
     },
 ];
 
-fn eval_lock() -> &'static Mutex<()> {
+pub(crate) fn real_eval_lock() -> &'static Mutex<()> {
     static EVAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     EVAL_LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -732,7 +732,7 @@ async fn real_encoder_gold_retrieval_eval() {
         return;
     }
 
-    let _guard = eval_lock().lock().await;
+    let _guard = real_eval_lock().lock().await;
     let initialized = initialize_real_encoder();
     let report = run_gold_eval(initialized.model_id.clone(), &initialized.client).await;
     let pretty = serde_json::to_string_pretty(&report).expect("serialize gold report");

@@ -799,6 +799,28 @@ where
     persist_prepared_turn(db, turn_id, prepared_turn).await
 }
 
+#[cfg(test)]
+pub(crate) async fn process_turn_for_real_clients(
+    db: &MemoryDb,
+    llm: &LlmClient,
+    encoder: &EncoderClient,
+    nearest_neighbor_count: i32,
+    turn_id: i64,
+    window: ProjectedConversationWindow,
+    timestamp: DateTime<Utc>,
+) -> Result<(), ProcessTurnError> {
+    process_turn_with_clients(
+        db,
+        llm,
+        encoder,
+        nearest_neighbor_count,
+        turn_id,
+        window,
+        timestamp,
+    )
+    .await
+}
+
 async fn prepare_neighbor_writes<E>(
     encoder: &E,
     neighbor_updates: &[NeighborUpdate],
