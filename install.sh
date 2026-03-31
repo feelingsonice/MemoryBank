@@ -5,6 +5,47 @@ REPO_OWNER="feelingsonice"
 REPO_NAME="MemoryBank"
 RELEASE_BASE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download"
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+REPO_ROOT="${SCRIPT_DIR}"
+APP_ROOT="${HOME}/.memory_bank"
+BIN_DIR="${APP_ROOT}/bin"
+CONFIG_DIR="${APP_ROOT}/config"
+INTEGRATIONS_DIR="${APP_ROOT}/integrations"
+OPENCODE_INSTALL_DIR="${INTEGRATIONS_DIR}/opencode"
+OPENCLAW_INSTALL_DIR="${INTEGRATIONS_DIR}/openclaw"
+FROM_SOURCE=0
+
+usage() {
+  cat <<'EOF'
+Usage: ./install.sh [--from-source] [--help]
+
+Options:
+  --from-source  Build the workspace locally and install from this checkout
+                 into ~/.memory_bank using the same layout as a GitHub Release.
+  --help         Show this help text.
+EOF
+}
+
+parse_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --from-source)
+        FROM_SOURCE=1
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+    shift
+  done
+}
+
 detect_target() {
   os="$(uname -s)"
   arch="$(uname -m)"
@@ -14,7 +55,7 @@ detect_target() {
       case "${arch}" in
         x86_64)
           echo "Intel macOS release binaries are not available yet because the current FastEmbed/ONNX Runtime dependency does not publish a supported x86_64-apple-darwin artifact." >&2
-          echo "For now, please build from source on Intel macOS." >&2
+          echo "For now, please build from source with ./install.sh --from-source on Intel macOS." >&2
           exit 1
           ;;
         arm64|aarch64) printf '%s\n' "aarch64-apple-darwin" ;;
@@ -67,50 +108,145 @@ verify_checksum() {
   fi
 }
 
-TARGET="$(detect_target)"
-ARCHIVE_NAME="memory-bank-${TARGET}.tar.gz"
-CHECKSUM_NAME="SHA256SUMS"
-
-APP_ROOT="${HOME}/.memory_bank"
-TMP_DIR="$(mktemp -d)"
-ARCHIVE_PATH="${TMP_DIR}/${ARCHIVE_NAME}"
-CHECKSUM_PATH="${TMP_DIR}/${CHECKSUM_NAME}"
-
-cleanup() {
-  rm -rf "${TMP_DIR}"
+require_file() {
+  path="$1"
+  if [ ! -f "${path}" ]; then
+    echo "Required file is missing: ${path}" >&2
+    exit 1
+  fi
 }
-trap cleanup EXIT INT TERM
 
-mkdir -p "${APP_ROOT}"
+copy_executable() {
+  source_path="$1"
+  target_path="$2"
+  require_file "${source_path}"
+  mkdir -p "$(dirname "${target_path}")"
+  cp "${source_path}" "${target_path}"
+  chmod 755 "${target_path}"
+}
 
-curl -fsSL "${RELEASE_BASE_URL}/${ARCHIVE_NAME}" -o "${ARCHIVE_PATH}"
-curl -fsSL "${RELEASE_BASE_URL}/${CHECKSUM_NAME}" -o "${CHECKSUM_PATH}"
-verify_checksum "${ARCHIVE_NAME}" "${ARCHIVE_PATH}" "${CHECKSUM_PATH}"
-tar -xzf "${ARCHIVE_PATH}" -C "${APP_ROOT}"
+install_source_assets() {
+  mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${OPENCODE_INSTALL_DIR}" "${OPENCLAW_INSTALL_DIR}"
 
-BIN_DIR="${APP_ROOT}/bin"
+  copy_executable "${REPO_ROOT}/target/release/mb" "${BIN_DIR}/mb"
+  copy_executable "${REPO_ROOT}/target/release/memory-bank-server" "${BIN_DIR}/memory-bank-server"
+  copy_executable "${REPO_ROOT}/target/release/memory-bank-hook" "${BIN_DIR}/memory-bank-hook"
+  copy_executable "${REPO_ROOT}/target/release/memory-bank-mcp-proxy" "${BIN_DIR}/memory-bank-mcp-proxy"
 
-case "${SHELL:-}" in
-  */zsh)
-    SHELL_RC="${HOME}/.zshrc"
-    ;;
-  */bash)
-    SHELL_RC="${HOME}/.bashrc"
-    ;;
-  *)
-    SHELL_RC="${HOME}/.profile"
-    ;;
-esac
+  require_file "${REPO_ROOT}/config/setup-model-catalog.json"
+  cp "${REPO_ROOT}/config/setup-model-catalog.json" "${CONFIG_DIR}/setup-model-catalog.json"
 
-if [ ! -f "${SHELL_RC}" ]; then
-  touch "${SHELL_RC}"
-fi
+  require_file "${REPO_ROOT}/.opencode/plugins/memory-bank.js"
+  cp "${REPO_ROOT}/.opencode/plugins/memory-bank.js" "${OPENCODE_INSTALL_DIR}/memory-bank.js"
 
-if ! grep -q '\.memory_bank/bin' "${SHELL_RC}"; then
-  {
-    printf '\n# Memory Bank\n'
-    printf 'export PATH="$HOME/.memory_bank/bin:$PATH"\n'
-  } >> "${SHELL_RC}"
-fi
+  if [ -d "${OPENCLAW_INSTALL_DIR}/memory-bank" ]; then
+    rm -rf "${OPENCLAW_INSTALL_DIR}/memory-bank"
+  fi
+  mkdir -p "${OPENCLAW_INSTALL_DIR}"
+  cp -R "${REPO_ROOT}/.openclaw/extensions/memory-bank" "${OPENCLAW_INSTALL_DIR}/memory-bank"
+}
 
-"${BIN_DIR}/mb" setup
+install_from_source() {
+  require_file "${REPO_ROOT}/Cargo.toml"
+  require_file "${REPO_ROOT}/config/setup-model-catalog.json"
+  require_file "${REPO_ROOT}/.opencode/plugins/memory-bank.js"
+  require_file "${REPO_ROOT}/.openclaw/extensions/memory-bank/index.js"
+
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo is required for --from-source installs." >&2
+    exit 1
+  fi
+
+  echo "Building Memory Bank from source..."
+  cargo build --manifest-path "${REPO_ROOT}/Cargo.toml" --workspace --release
+
+  echo "Installing locally built artifacts into ${APP_ROOT}..."
+  mkdir -p "${APP_ROOT}"
+  install_source_assets
+}
+
+install_from_release() {
+  TARGET="$(detect_target)"
+  ARCHIVE_NAME="memory-bank-${TARGET}.tar.gz"
+  CHECKSUM_NAME="SHA256SUMS"
+
+  TMP_DIR="$(mktemp -d)"
+  ARCHIVE_PATH="${TMP_DIR}/${ARCHIVE_NAME}"
+  CHECKSUM_PATH="${TMP_DIR}/${CHECKSUM_NAME}"
+
+  cleanup() {
+    rm -rf "${TMP_DIR}"
+  }
+  trap cleanup EXIT INT TERM
+
+  mkdir -p "${APP_ROOT}"
+
+  curl -fsSL "${RELEASE_BASE_URL}/${ARCHIVE_NAME}" -o "${ARCHIVE_PATH}"
+  curl -fsSL "${RELEASE_BASE_URL}/${CHECKSUM_NAME}" -o "${CHECKSUM_PATH}"
+  verify_checksum "${ARCHIVE_NAME}" "${ARCHIVE_PATH}" "${CHECKSUM_PATH}"
+  tar -xzf "${ARCHIVE_PATH}" -C "${APP_ROOT}"
+}
+
+bootstrap_install() {
+  "${BIN_DIR}/mb" internal bootstrap-install
+}
+
+tty_available() {
+  [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+current_session_setup_command() {
+  if command -v mb >/dev/null 2>&1; then
+    printf '%s\n' "mb setup"
+  else
+    printf '%s\n' "${BIN_DIR}/mb setup"
+  fi
+}
+
+print_deferred_setup_notice() {
+  SETUP_COMMAND="$(current_session_setup_command)"
+  echo "Skipping guided setup for now."
+  echo "Run \`${SETUP_COMMAND}\` to finish configuring Memory Bank."
+  if ! command -v mb >/dev/null 2>&1; then
+    echo "Bare \`mb\` will work in a new shell after your shell startup files reload."
+  fi
+}
+
+run_setup() {
+  "${BIN_DIR}/mb" setup
+}
+
+run_setup_via_tty() {
+  "${BIN_DIR}/mb" setup </dev/tty >/dev/tty 2>&1
+}
+
+main() {
+  parse_args "$@"
+
+  if [ "${FROM_SOURCE}" -eq 1 ]; then
+    install_from_source
+  else
+    install_from_release
+  fi
+
+  bootstrap_install
+
+  if [ "${NONINTERACTIVE:-0}" = "1" ]; then
+    print_deferred_setup_notice
+    return
+  fi
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    run_setup
+    return
+  fi
+
+  if tty_available; then
+    run_setup_via_tty
+    return
+  fi
+
+  print_deferred_setup_notice
+}
+
+main "$@"

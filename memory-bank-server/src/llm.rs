@@ -425,7 +425,11 @@ fn verify_ollama_model(base_url: &str, model: &str) -> Result<(), AppError> {
         ))
     })?;
 
-    if tags.models.iter().any(|candidate| candidate.name == model) {
+    if tags
+        .models
+        .iter()
+        .any(|candidate| ollama_model_matches(model, &candidate.name))
+    {
         return Ok(());
     }
 
@@ -446,6 +450,11 @@ fn verify_ollama_model(base_url: &str, model: &str) -> Result<(), AppError> {
     )))
 }
 
+fn ollama_model_matches(requested: &str, available: &str) -> bool {
+    available == requested
+        || (!requested.contains(':') && available == format!("{requested}:latest"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -463,7 +472,7 @@ mod tests {
     #[test]
     fn anthropic_prompt_caching_is_enabled() {
         let client = Client::new("test-key").expect("anthropic client");
-        let model = anthropic_completion_model(&client, "claude-sonnet-4");
+        let model = anthropic_completion_model(&client, "claude-sonnet-4-6");
 
         assert!(model.prompt_caching);
     }
@@ -471,8 +480,8 @@ mod tests {
     #[tokio::test]
     async fn structured_agents_use_zero_temperature() {
         let client = Client::new("test-key").expect("anthropic client");
-        let model = anthropic_completion_model(&client, "claude-sonnet-4");
-        let llm = super::build_rig_structured_llm(model, "Anthropic::claude-sonnet-4");
+        let model = anthropic_completion_model(&client, "claude-sonnet-4-6");
+        let llm = super::build_rig_structured_llm(model, "Anthropic::claude-sonnet-4-6");
 
         assert_eq!(llm.analysis_agent.temperature, Some(0.0));
         assert_eq!(llm.evolve_agent.temperature, Some(0.0));
@@ -543,7 +552,7 @@ mod tests {
         assert!(matches!(
             llm_client_from_config(LlmProviderConfig::Gemini {
                 api_key: "test-key".to_string(),
-                model: "gemini-2.5-flash".to_string(),
+                model: "gemini-3-flash-preview".to_string(),
             })
             .expect("gemini client"),
             LlmClient::Gemini(_)
@@ -561,7 +570,7 @@ mod tests {
         assert!(matches!(
             llm_client_from_config(LlmProviderConfig::OpenAi {
                 api_key: "test-key".to_string(),
-                model: "gpt-4o-mini".to_string(),
+                model: "gpt-5-mini".to_string(),
             })
             .expect("openai client"),
             LlmClient::OpenAi(_)
@@ -572,12 +581,12 @@ mod tests {
     async fn initialize_preserves_model_ids_for_remote_providers() {
         let InitializedLlm { client, model_id } = super::initialize(LlmProviderConfig::OpenAi {
             api_key: "test-key".to_string(),
-            model: "gpt-4o-mini".to_string(),
+            model: "gpt-5-mini".to_string(),
         })
         .expect("initialize openai");
 
         assert!(matches!(client, LlmClient::OpenAi(_)));
-        assert_eq!(model_id, "OpenAi::gpt-4o-mini");
+        assert_eq!(model_id, "OpenAi::gpt-5-mini");
     }
 
     #[test]
@@ -614,14 +623,14 @@ mod tests {
             200,
             serde_json::to_string(&serde_json::json!({
                 "models": [
-                    { "name": "qwen3:4b" },
+                    { "name": "qwen3:latest" },
                     { "name": "llama3.2" }
                 ]
             }))
             .expect("mock response"),
         );
 
-        verify_ollama_model(&mock.base_url, "qwen3:4b").expect("verified model");
+        verify_ollama_model(&mock.base_url, "qwen3").expect("verified model");
         mock.join();
     }
 
@@ -636,10 +645,10 @@ mod tests {
         );
 
         let error =
-            verify_ollama_model(&mock.base_url, "qwen3:4b").expect_err("missing model should fail");
+            verify_ollama_model(&mock.base_url, "qwen3").expect_err("missing model should fail");
         mock.join();
 
-        assert!(error.to_string().contains("ollama pull qwen3:4b"));
+        assert!(error.to_string().contains("ollama pull qwen3"));
         assert!(error.to_string().contains("llama3.2"));
     }
 
@@ -649,7 +658,7 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
 
-        let error = verify_ollama_model(&format!("http://127.0.0.1:{port}"), "qwen3:4b")
+        let error = verify_ollama_model(&format!("http://127.0.0.1:{port}"), "qwen3")
             .expect_err("unreachable daemon should fail");
 
         assert!(error.to_string().contains("Unable to reach Ollama"));
@@ -661,7 +670,7 @@ mod tests {
             200,
             serde_json::to_string(&OllamaTagsResponse {
                 models: vec![super::OllamaModel {
-                    name: "qwen3:4b".to_string(),
+                    name: "qwen3:latest".to_string(),
                 }],
             })
             .expect("mock response"),
@@ -669,14 +678,14 @@ mod tests {
 
         let InitializedLlm { client, model_id } = super::initialize(LlmProviderConfig::Ollama {
             url: mock.base_url.clone(),
-            model: "qwen3:4b".to_string(),
+            model: "qwen3".to_string(),
         })
         .expect("initialize ollama");
         let base_url = mock.base_url.clone();
         mock.join();
 
         assert!(matches!(client, LlmClient::Ollama(_)));
-        assert_eq!(model_id, format!("Ollama::qwen3:4b@{}", base_url));
+        assert_eq!(model_id, format!("Ollama::qwen3@{}", base_url));
     }
 
     struct MockOllamaServer {

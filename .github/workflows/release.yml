@@ -47,13 +47,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --all -- --check
+        run: make fmt-check
 
       - name: Cargo check
-        run: cargo check --workspace
+        run: make check
 
-      - name: Cargo test
-        run: cargo test --workspace
+      - name: Validate test suite
+        run: make test-ci
 
   build:
     name: Build ${{ matrix.target }}
@@ -93,11 +93,12 @@ jobs:
           set -eu
           STAGE_DIR="dist/memory-bank"
           BIN_DIR="${STAGE_DIR}/bin"
+          CONFIG_DIR="${STAGE_DIR}/config"
           OPENCODE_DIR="${STAGE_DIR}/integrations/opencode"
           OPENCLAW_DIR="${STAGE_DIR}/integrations/openclaw"
 
           rm -rf dist
-          mkdir -p "${BIN_DIR}" "${OPENCODE_DIR}" "${OPENCLAW_DIR}"
+          mkdir -p "${BIN_DIR}" "${CONFIG_DIR}" "${OPENCODE_DIR}" "${OPENCLAW_DIR}"
 
           cp "target/${TARGET}/release/mb" "${BIN_DIR}/mb"
           cp "target/${TARGET}/release/memory-bank-server" "${BIN_DIR}/memory-bank-server"
@@ -111,6 +112,7 @@ jobs:
 
           cp ".opencode/plugins/memory-bank.js" "${OPENCODE_DIR}/memory-bank.js"
           cp -R ".openclaw/extensions/memory-bank" "${OPENCLAW_DIR}/memory-bank"
+          cp "config/setup-model-catalog.json" "${CONFIG_DIR}/setup-model-catalog.json"
 
           tar -C "${STAGE_DIR}" -czf "memory-bank-${TARGET}.tar.gz" .
 

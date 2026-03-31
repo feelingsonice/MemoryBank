@@ -252,7 +252,9 @@ trait MemoryLlmClient {
     ) -> Result<MemoryEvolution, LlmError>;
 }
 
-trait MemoryEncoderClient {
+pub(crate) trait MemoryEncoderClient {
+    async fn encode(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EncoderError>;
+
     async fn encode_memory(&self, payload: &EmbeddingInput<'_>) -> Result<Vec<f32>, EncoderError>;
 
     async fn encode_memories(
@@ -285,6 +287,10 @@ impl MemoryLlmClient for LlmClient {
 }
 
 impl MemoryEncoderClient for EncoderClient {
+    async fn encode(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EncoderError> {
+        self.encode(texts).await
+    }
+
     async fn encode_memory(&self, payload: &EmbeddingInput<'_>) -> Result<Vec<f32>, EncoderError> {
         self.encode_memory(payload).await
     }
@@ -310,6 +316,15 @@ impl From<RetrievalRow> for MemoryNote {
             tags: parse_json_vec(&row.tags),
         }
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct RetrievalOutcome {
+    pub notes: Vec<MemoryNote>,
+    pub knn_ids: Vec<i64>,
+    pub knn_matches: usize,
+    pub expanded_matches: usize,
 }
 
 /// Timeout for individual LLM API calls (memory analysis and graph evolution).
@@ -429,65 +444,80 @@ impl MemoryActor {
     }
 
     async fn retrieve(&self, query: String) -> Result<Vec<MemoryNote>, McpError> {
-        debug!("Encoding retrieve_memory query");
-
-        // 1. Encode the query text
-        let mut embeddings = self
-            .encoder
-            .encode(vec![query])
+        retrieve_with_encoder(&self.db, &self.encoder, self.nearest_neighbor_count, &query)
             .await
-            .map_err(|e| McpError::internal_error(format!("Encoder error: {}", e), None))?;
-
-        let embedding = take_single_embedding(std::mem::take(&mut embeddings), "query encoding")
-            .map_err(|e| McpError::internal_error(format!("Encoder error: {}", e), None))?;
-
-        let embedding_bytes = embedding_to_bytes(&embedding);
-
-        // 2. KNN search for top K matches
-        let top_ids = self
-            .db
-            .find_nearest_neighbors(&embedding_bytes, self.nearest_neighbor_count)
-            .await
-            .map_err(|e| McpError::internal_error(format!("DB query error: {}", e), None))?;
-
-        if top_ids.is_empty() {
-            info!(
-                knn_matches = 0,
-                returned = 0,
-                "Memory retrieval produced no matches"
-            );
-            return Ok(vec![]);
-        }
-
-        // 3. Expand to 1-hop subgraph via link traversal
-        let knn_count = top_ids.len();
-        let links = self
-            .db
-            .get_links_for_ids(&top_ids)
-            .await
-            .unwrap_or_default();
-        let ordered_ids = ordered_retrieval_ids(&top_ids, &links);
-        let expanded_count = ordered_ids.len();
-
-        // 4. Fetch and return the semantic content
-        self.db
-            .get_memories(&ordered_ids)
-            .await
-            .map(|mut rows| {
-                sort_retrieval_rows(&mut rows, &ordered_ids);
-                let notes: Vec<MemoryNote> = rows.into_iter().map(MemoryNote::from).collect();
-                info!(
-                    knn_matches = knn_count,
-                    expanded_matches = expanded_count,
-                    returned = notes.len(),
-                    "Memory retrieval completed",
-                );
-                notes
-            })
-            .map_err(|e| {
-                McpError::internal_error(format!("DB error fetching memories: {}", e), None)
-            })
+            .map(|outcome| outcome.notes)
     }
+}
+
+pub(crate) async fn retrieve_with_encoder<E>(
+    db: &MemoryDb,
+    encoder: &E,
+    nearest_neighbor_count: i32,
+    query: &str,
+) -> Result<RetrievalOutcome, McpError>
+where
+    E: MemoryEncoderClient + ?Sized,
+{
+    debug!("Encoding retrieve_memory query");
+
+    // 1. Encode the query text
+    let mut embeddings = encoder
+        .encode(vec![query.to_string()])
+        .await
+        .map_err(|e| McpError::internal_error(format!("Encoder error: {}", e), None))?;
+
+    let embedding = take_single_embedding(std::mem::take(&mut embeddings), "query encoding")
+        .map_err(|e| McpError::internal_error(format!("Encoder error: {}", e), None))?;
+
+    let embedding_bytes = embedding_to_bytes(&embedding);
+
+    // 2. KNN search for top K matches
+    let top_ids = db
+        .find_nearest_neighbors(&embedding_bytes, nearest_neighbor_count)
+        .await
+        .map_err(|e| McpError::internal_error(format!("DB query error: {}", e), None))?;
+
+    if top_ids.is_empty() {
+        info!(
+            knn_matches = 0,
+            returned = 0,
+            "Memory retrieval produced no matches"
+        );
+        return Ok(RetrievalOutcome {
+            notes: Vec::new(),
+            knn_ids: Vec::new(),
+            knn_matches: 0,
+            expanded_matches: 0,
+        });
+    }
+
+    // 3. Expand to 1-hop subgraph via link traversal
+    let knn_count = top_ids.len();
+    let links = db.get_links_for_ids(&top_ids).await.unwrap_or_default();
+    let ordered_ids = ordered_retrieval_ids(&top_ids, &links);
+    let expanded_count = ordered_ids.len();
+
+    // 4. Fetch and return the semantic content
+    db.get_memories(&ordered_ids)
+        .await
+        .map(|mut rows| {
+            sort_retrieval_rows(&mut rows, &ordered_ids);
+            let notes: Vec<MemoryNote> = rows.into_iter().map(MemoryNote::from).collect();
+            info!(
+                knn_matches = knn_count,
+                expanded_matches = expanded_count,
+                returned = notes.len(),
+                "Memory retrieval completed",
+            );
+            RetrievalOutcome {
+                notes,
+                knn_ids: top_ids,
+                knn_matches: knn_count,
+                expanded_matches: expanded_count,
+            }
+        })
+        .map_err(|e| McpError::internal_error(format!("DB error fetching memories: {}", e), None))
 }
 
 fn estimate_token_count(text: &str) -> usize {
@@ -769,6 +799,28 @@ where
     persist_prepared_turn(db, turn_id, prepared_turn).await
 }
 
+#[cfg(test)]
+pub(crate) async fn process_turn_for_real_clients(
+    db: &MemoryDb,
+    llm: &LlmClient,
+    encoder: &EncoderClient,
+    nearest_neighbor_count: i32,
+    turn_id: i64,
+    window: ProjectedConversationWindow,
+    timestamp: DateTime<Utc>,
+) -> Result<(), ProcessTurnError> {
+    process_turn_with_clients(
+        db,
+        llm,
+        encoder,
+        nearest_neighbor_count,
+        turn_id,
+        window,
+        timestamp,
+    )
+    .await
+}
+
 async fn prepare_neighbor_writes<E>(
     encoder: &E,
     neighbor_updates: &[NeighborUpdate],
@@ -964,13 +1016,23 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct FakeEncoder {
+        encode_results: Arc<Mutex<Vec<Result<Vec<Vec<f32>>, EncoderError>>>>,
         encode_memory_results: Arc<Mutex<Vec<Result<Vec<f32>, EncoderError>>>>,
         encode_memories_results: Arc<Mutex<Vec<Result<Vec<Vec<f32>>, EncoderError>>>>,
     }
 
     impl FakeEncoder {
+        fn from_query_results(results: Vec<Result<Vec<Vec<f32>>, EncoderError>>) -> Self {
+            Self {
+                encode_results: Arc::new(Mutex::new(results)),
+                encode_memory_results: Arc::new(Mutex::new(Vec::new())),
+                encode_memories_results: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
         fn from_memory_results(results: Vec<Result<Vec<f32>, EncoderError>>) -> Self {
             Self {
+                encode_results: Arc::new(Mutex::new(Vec::new())),
                 encode_memory_results: Arc::new(Mutex::new(results)),
                 encode_memories_results: Arc::new(Mutex::new(Vec::new())),
             }
@@ -978,6 +1040,10 @@ mod tests {
     }
 
     impl MemoryEncoderClient for FakeEncoder {
+        async fn encode(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>, EncoderError> {
+            self.encode_results.lock().expect("lock").remove(0)
+        }
+
         async fn encode_memory(
             &self,
             _payload: &EmbeddingInput<'_>,
@@ -1177,6 +1243,66 @@ mod tests {
             rows.iter().map(|row| row.id).collect::<Vec<_>>(),
             ordered_ids
         );
+    }
+
+    #[tokio::test]
+    async fn retrieve_with_encoder_expands_linked_neighbors_after_knn_hits() {
+        let db = open_memory_db().await;
+        let anchor_id = insert_memory_with_embedding(
+            &db,
+            "Tokio mpsc backpressure keeps bounded queues stable.",
+            "anchor",
+            &["tokio", "mpsc", "backpressure"],
+            &["rust", "async", "queue"],
+            &[1.0, 0.0],
+        )
+        .await;
+        let secondary_id = insert_memory_with_embedding(
+            &db,
+            "Bounded async queue pressure can stall producers until receivers catch up.",
+            "secondary",
+            &["bounded", "queue", "pressure"],
+            &["rust", "async", "queue"],
+            &[0.95, 0.05],
+        )
+        .await;
+        let linked_id = insert_memory_with_embedding(
+            &db,
+            "Channel sizing guidance explains when to increase buffer capacity.",
+            "linked",
+            &["channel", "buffer", "capacity"],
+            &["rust", "async", "tuning"],
+            &[0.1, 0.9],
+        )
+        .await;
+
+        let mut tx = db.begin().await.expect("begin");
+        db.insert_bidirectional_links(&mut tx, anchor_id, linked_id)
+            .await
+            .expect("insert link");
+        tx.commit().await.expect("commit");
+
+        let encoder = FakeEncoder::from_query_results(vec![Ok(vec![vec![1.0, 0.0]])]);
+        let outcome = retrieve_with_encoder(&db, &encoder, 2, "bounded rust queue backpressure")
+            .await
+            .expect("retrieve");
+
+        assert_eq!(outcome.knn_matches, 2);
+        assert_eq!(outcome.expanded_matches, 3);
+        assert_eq!(
+            outcome
+                .notes
+                .iter()
+                .map(|note| note.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Tokio mpsc backpressure keeps bounded queues stable.",
+                "Bounded async queue pressure can stall producers until receivers catch up.",
+                "Channel sizing guidance explains when to increase buffer capacity.",
+            ]
+        );
+
+        let _ = secondary_id;
     }
 
     #[tokio::test]

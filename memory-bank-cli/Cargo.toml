@@ -11,12 +11,16 @@ path = "src/main.rs"
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-dialoguer.workspace = true
+inquire.workspace = true
+jsonc-parser.workspace = true
 memory-bank-app = { path = "../memory-bank-app" }
 serde.workspace = true
 serde_json.workspace = true
+shlex.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+wait-timeout = "0.2"
