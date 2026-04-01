@@ -2,7 +2,8 @@ use clap::Parser;
 use clap::ValueEnum;
 use memory_bank_app::{
     AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL, DEFAULT_GEMINI_MODEL,
-    DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, Namespace, ServerSettings,
+    DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL,
+    Namespace, OLLAMA_HISTORY_WINDOW_SIZE, ServerSettings,
 };
 use std::env;
 use std::fmt;
@@ -270,18 +271,27 @@ impl TryFrom<ServeArgs> for ServeConfig {
         Ok(Self {
             port: args.port.unwrap_or_else(|| settings.resolved_port()),
             namespace,
-            llm: LlmProviderConfig::from_resolved(llm_provider, server_settings)?,
+            llm: LlmProviderConfig::from_resolved(llm_provider.clone(), server_settings)?,
             encoder: EncoderProviderConfig::from_resolved(encoder_provider, server_settings)?,
-            history_window_size: args
-                .history_window_size
-                .or_else(|| server_settings.and_then(|s| s.history_window_size))
-                .unwrap_or(0),
+            history_window_size: effective_history_window_size(
+                &llm_provider,
+                args.history_window_size
+                    .or_else(|| server_settings.and_then(|s| s.history_window_size))
+                    .unwrap_or(DEFAULT_HISTORY_WINDOW_SIZE),
+            ),
             nearest_neighbor_count: args
                 .nearest_neighbor_count
                 .or_else(|| server_settings.and_then(|s| s.nearest_neighbor_count))
                 .unwrap_or(10),
             dirs,
         })
+    }
+}
+
+fn effective_history_window_size(provider: &LlmProviderType, configured_value: u32) -> u32 {
+    match provider {
+        LlmProviderType::Ollama => OLLAMA_HISTORY_WINDOW_SIZE,
+        _ => configured_value,
     }
 }
 
@@ -455,6 +465,104 @@ mod tests {
         assert_eq!(config.nearest_neighbor_count, 12);
         assert!(config.dirs.db.ends_with("team-a/memory.db"));
         assert!(config.dirs.models.ends_with(".memory_bank/models"));
+    }
+
+    #[test]
+    fn serve_config_uses_default_history_window_when_unset() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let temp = TempDir::new().expect("tempdir");
+        let _guard = EnvVarGuard::new(&[
+            "HOME",
+            "MEMORY_BANK_PORT",
+            "MEMORY_BANK_NAMESPACE",
+            "MEMORY_BANK_LLM_PROVIDER",
+            "MEMORY_BANK_ENCODER_PROVIDER",
+            "MEMORY_BANK_HISTORY_WINDOW_SIZE",
+            "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "ANTHROPIC_API_KEY",
+        ]);
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::set_var("ANTHROPIC_API_KEY", "secret");
+        }
+
+        let config = ServeConfig::try_from(
+            ServeArgs::try_parse_from(["memory-bank-server"]).expect("parse"),
+        )
+        .expect("config");
+
+        assert_eq!(config.history_window_size, DEFAULT_HISTORY_WINDOW_SIZE);
+    }
+
+    #[test]
+    fn serve_config_hardcodes_ollama_history_window() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let temp = TempDir::new().expect("tempdir");
+        let _guard = EnvVarGuard::new(&[
+            "HOME",
+            "MEMORY_BANK_PORT",
+            "MEMORY_BANK_NAMESPACE",
+            "MEMORY_BANK_LLM_PROVIDER",
+            "MEMORY_BANK_ENCODER_PROVIDER",
+            "MEMORY_BANK_HISTORY_WINDOW_SIZE",
+            "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+        ]);
+        unsafe {
+            env::set_var("HOME", temp.path());
+        }
+
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            active_namespace: None,
+            service: None,
+            server: Some(ServerSettings {
+                llm_provider: Some("ollama".to_string()),
+                history_window_size: Some(42),
+                ..ServerSettings::default()
+            }),
+            integrations: None,
+        };
+        settings.save(&paths).expect("save settings");
+
+        let config = ServeConfig::try_from(
+            ServeArgs::try_parse_from(["memory-bank-server"]).expect("parse"),
+        )
+        .expect("config");
+
+        assert_eq!(config.history_window_size, OLLAMA_HISTORY_WINDOW_SIZE);
+    }
+
+    #[test]
+    fn serve_config_hardcodes_ollama_history_window_even_with_flag() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let temp = TempDir::new().expect("tempdir");
+        let _guard = EnvVarGuard::new(&[
+            "HOME",
+            "MEMORY_BANK_PORT",
+            "MEMORY_BANK_NAMESPACE",
+            "MEMORY_BANK_LLM_PROVIDER",
+            "MEMORY_BANK_ENCODER_PROVIDER",
+            "MEMORY_BANK_HISTORY_WINDOW_SIZE",
+            "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+        ]);
+        unsafe {
+            env::set_var("HOME", temp.path());
+        }
+
+        let config = ServeConfig::try_from(
+            ServeArgs::try_parse_from([
+                "memory-bank-server",
+                "--llm-provider",
+                "ollama",
+                "--history-window-size",
+                "99",
+            ])
+            .expect("parse"),
+        )
+        .expect("config");
+
+        assert_eq!(config.history_window_size, OLLAMA_HISTORY_WINDOW_SIZE);
     }
 
     #[test]

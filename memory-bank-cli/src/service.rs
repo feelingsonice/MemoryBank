@@ -684,7 +684,7 @@ pub(crate) fn tail_log_file(path: &Path, follow: bool) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::{MB_BINARY_NAME, SERVER_BINARY_NAME};
+    use crate::constants::{MB_BINARY_NAME, OLLAMA_HISTORY_WINDOW_SIZE, SERVER_BINARY_NAME};
     use memory_bank_app::SecretStore;
     use memory_bank_app::{ServerSettings, ServiceSettings};
     #[cfg(unix)]
@@ -712,6 +712,7 @@ mod tests {
             server: Some(ServerSettings {
                 llm_provider: Some("anthropic".to_string()),
                 llm_model: Some("claude-custom".to_string()),
+                history_window_size: Some(7),
                 ..ServerSettings::default()
             }),
             integrations: None,
@@ -736,6 +737,7 @@ mod tests {
             spec.env.get("MEMORY_BANK_LLM_MODEL").map(String::as_str),
             Some("claude-custom")
         );
+        assert!(spec.args.contains(&"7".to_string()));
     }
 
     #[test]
@@ -894,6 +896,7 @@ mod tests {
                 ollama_url: Some("http://ollama.internal:11434/".to_string()),
                 encoder_provider: Some("remote-api".to_string()),
                 remote_encoder_url: Some("https://encoder.example.com".to_string()),
+                history_window_size: Some(99),
                 nearest_neighbor_count: Some(15),
                 ..ServerSettings::default()
             }),
@@ -931,6 +934,8 @@ mod tests {
         );
         assert!(spec.args.contains(&"4040".to_string()));
         assert!(spec.args.contains(&"15".to_string()));
+        assert!(spec.args.contains(&OLLAMA_HISTORY_WINDOW_SIZE.to_string()));
+        assert!(!spec.args.contains(&"99".to_string()));
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
 pub const DEFAULT_FASTEMBED_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
+pub const DEFAULT_HISTORY_WINDOW_SIZE: u32 = 0;
+pub const OLLAMA_HISTORY_WINDOW_SIZE: u32 = 5;
 pub const SERVER_STARTUP_STATE_FILE_NAME: &str = "server-startup.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

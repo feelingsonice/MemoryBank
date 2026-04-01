@@ -532,7 +532,9 @@ fn prompt_advanced_settings(
     let history_window_size = WizardStep::from_option(
         CustomType::<u32>::new("History window size")
             .with_default(current.history_window_size)
-            .with_help_message("0 means unlimited prior turns during memory analysis.")
+            .with_help_message(
+                "For non-Ollama providers, the default is 0 (unlimited). Ollama always uses 5.",
+            )
             .prompt_skippable()?,
     )
     .into_result()?;

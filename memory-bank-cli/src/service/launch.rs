@@ -4,7 +4,8 @@ use crate::config::{
     llm_provider_value, normalize_ollama_url, validate_encoder_provider, validate_llm_provider,
 };
 use crate::constants::{
-    HOOK_BINARY_NAME, MB_BINARY_NAME, MCP_PROXY_BINARY_NAME, SERVER_BINARY_NAME,
+    DEFAULT_HISTORY_WINDOW_SIZE, HOOK_BINARY_NAME, MB_BINARY_NAME, MCP_PROXY_BINARY_NAME,
+    OLLAMA_HISTORY_WINDOW_SIZE, SERVER_BINARY_NAME,
 };
 use crate::domain::{EncoderProviderId, ProviderId};
 use memory_bank_app::{AppPaths, AppSettings, SecretStore};
@@ -123,6 +124,13 @@ pub(crate) fn build_server_launch_spec(
     if let Some(url) = server_settings.remote_encoder_url.clone() {
         env.insert("MEMORY_BANK_REMOTE_ENCODER_URL".to_string(), url);
     }
+    let history_window_size = if provider == ProviderId::Ollama {
+        OLLAMA_HISTORY_WINDOW_SIZE
+    } else {
+        server_settings
+            .history_window_size
+            .unwrap_or(DEFAULT_HISTORY_WINDOW_SIZE)
+    };
 
     Ok(ServerLaunchSpec {
         program,
@@ -136,7 +144,7 @@ pub(crate) fn build_server_launch_spec(
             "--encoder-provider".to_string(),
             encoder_provider.as_str().to_string(),
             "--history-window-size".to_string(),
-            server_settings.history_window_size.unwrap_or(0).to_string(),
+            history_window_size.to_string(),
             "--nearest-neighbor-count".to_string(),
             nearest_neighbor_count.to_string(),
         ],
