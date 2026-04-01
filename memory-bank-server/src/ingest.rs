@@ -1522,7 +1522,7 @@ mod tests {
     use crate::actor::{
         MemoryHandle, ProcessTurnError, RetryableProcessTurnError, TestStoreTurnRequest,
     };
-    use crate::db::{MemoryDb, SqliteRuntime, SQLITE_BUSY_TIMEOUT_MS, SQLITE_MMAP_SIZE_BYTES};
+    use crate::db::{MemoryDb, SQLITE_BUSY_TIMEOUT_MS, SQLITE_MMAP_SIZE_BYTES, SqliteRuntime};
     use crate::error::AppError;
     use crate::memory_window::{MemoryProjection, MemoryStep};
     use memory_bank_protocol::{
@@ -1815,13 +1815,13 @@ mod tests {
             tokio::spawn(async move { store_for_write.recover_processing_turns().await });
         wait_for_write_attempts(&mut write_attempts, 1).await;
 
-        let memories = db
-            .get_memories(&[memory_id])
-            .await
-            .expect("read memories");
+        let memories = db.get_memories(&[memory_id]).await.expect("read memories");
         assert_eq!(memories.len(), 1, "read should use the second connection");
         tokio::task::yield_now().await;
-        assert!(!blocked_write.is_finished(), "write should wait for the shared gate");
+        assert!(
+            !blocked_write.is_finished(),
+            "write should wait for the shared gate"
+        );
 
         tx.commit().await.expect("commit transaction");
         drop(write_permit);
@@ -1870,7 +1870,10 @@ mod tests {
         wait_for_write_attempts(&mut write_attempts, 1).await;
         drop(write_permit);
 
-        let user = user_task.await.expect("join user task").expect("stage user");
+        let user = user_task
+            .await
+            .expect("join user task")
+            .expect("stage user");
         let assistant = assistant_task
             .await
             .expect("join assistant task")
@@ -1936,7 +1939,9 @@ mod tests {
             .await
             .expect_err("busy lock error");
         assert!(super::is_sqlite_lock_contention(&error));
-        assert!(should_retry_stage_error(&super::IngestError::Database(error)));
+        assert!(should_retry_stage_error(&super::IngestError::Database(
+            error
+        )));
 
         tx.rollback().await.expect("rollback");
     }
@@ -1958,7 +1963,9 @@ mod tests {
             .await
             .expect_err("unique violation");
         assert!(!super::is_sqlite_lock_contention(&error));
-        assert!(should_retry_stage_error(&super::IngestError::Database(error)));
+        assert!(should_retry_stage_error(&super::IngestError::Database(
+            error
+        )));
     }
 
     #[tokio::test]

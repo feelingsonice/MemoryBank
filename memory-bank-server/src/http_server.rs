@@ -40,14 +40,9 @@ impl HttpServer {
         let requested_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let shutdown = CancellationToken::new();
         let app = build_app(health, memory, ingest, log_tx, &shutdown);
-        let listener = TcpListener::bind(requested_bind_addr)
-            .await
-            .map_err(|e| {
-                AppError::HttpServer(format!(
-                    "Failed to bind to {}: {}",
-                    requested_bind_addr, e
-                ))
-            })?;
+        let listener = TcpListener::bind(requested_bind_addr).await.map_err(|e| {
+            AppError::HttpServer(format!("Failed to bind to {}: {}", requested_bind_addr, e))
+        })?;
         let bind_addr = listener.local_addr().map_err(|e| {
             AppError::HttpServer(format!(
                 "Failed to read bound address for {}: {}",
@@ -291,13 +286,12 @@ mod tests {
             202
         );
 
-        let turn_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?",
-        )
-        .bind("session-http-external")
-        .fetch_one(runtime.pool())
-        .await
-        .expect("turn count");
+        let turn_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
+                .bind("session-http-external")
+                .fetch_one(runtime.pool())
+                .await
+                .expect("turn count");
         assert_eq!(turn_count, 1);
 
         let projection_json: String = sqlx::query_scalar(
@@ -315,7 +309,8 @@ mod tests {
         assert!(projection_json.contains("Bash"));
         assert!(projection_json.contains("done"));
 
-        let dispatched_turn_id = receive_single_dispatch_and_ack(&mut requests, runtime.pool()).await;
+        let dispatched_turn_id =
+            receive_single_dispatch_and_ack(&mut requests, runtime.pool()).await;
         assert!(dispatched_turn_id > 0);
 
         server.stop().await;
@@ -350,20 +345,18 @@ mod tests {
             assert_eq!(task.await.expect("join duplicate request"), 202);
         }
 
-        let turn_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?",
-        )
-        .bind("session-http-duplicate")
-        .fetch_one(runtime.pool())
-        .await
-        .expect("turn count");
-        let fragment_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM ingest_fragments WHERE conversation_id = ?",
-        )
-        .bind("session-http-duplicate")
-        .fetch_one(runtime.pool())
-        .await
-        .expect("fragment count");
+        let turn_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
+                .bind("session-http-duplicate")
+                .fetch_one(runtime.pool())
+                .await
+                .expect("turn count");
+        let fragment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_fragments WHERE conversation_id = ?")
+                .bind("session-http-duplicate")
+                .fetch_one(runtime.pool())
+                .await
+                .expect("fragment count");
         assert_eq!(turn_count, 1);
         assert_eq!(fragment_count, 1);
 
@@ -738,11 +731,7 @@ mod tests {
         .expect("mark turn stored");
     }
 
-    fn fixed_user_payload(
-        conversation_id: &str,
-        fragment_id: &str,
-        text: &str,
-    ) -> IngestEnvelope {
+    fn fixed_user_payload(conversation_id: &str, fragment_id: &str, text: &str) -> IngestEnvelope {
         IngestEnvelope {
             protocol_version: INGEST_PROTOCOL_VERSION,
             source: SourceMeta {

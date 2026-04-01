@@ -953,8 +953,8 @@ mod tests {
         ConversationFragment, ConversationScope, FragmentBody, INGEST_PROTOCOL_VERSION,
         IngestEnvelope, SourceMeta, Terminality,
     };
-    use serde_json::json;
     use serde::Serializer;
+    use serde_json::json;
     use sqlx::Row;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1558,7 +1558,10 @@ mod tests {
 
         release_analysis.notify_waiters();
 
-        store_task.await.expect("join store task").expect("store window");
+        store_task
+            .await
+            .expect("join store task")
+            .expect("store window");
         let notes = retrieve_task
             .await
             .expect("join retrieve task")
@@ -1639,7 +1642,11 @@ mod tests {
 
         let ingest_task = tokio::spawn({
             let service = service.clone();
-            async move { service.ingest(open_user_envelope("session-shared", "fragment-1")).await }
+            async move {
+                service
+                    .ingest(open_user_envelope("session-shared", "fragment-1"))
+                    .await
+            }
         });
         let persist_task = tokio::spawn({
             let db = db.clone();
@@ -1664,7 +1671,10 @@ mod tests {
         wait_for_write_attempts(&mut write_attempts, 2).await;
         tokio::task::yield_now().await;
         assert!(!ingest_task.is_finished(), "ingest should still be blocked");
-        assert!(!persist_task.is_finished(), "persist should still be blocked");
+        assert!(
+            !persist_task.is_finished(),
+            "persist should still be blocked"
+        );
 
         tx.commit().await.expect("commit transaction");
         drop(write_permit);

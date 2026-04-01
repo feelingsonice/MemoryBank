@@ -129,7 +129,6 @@ impl SqliteRuntime {
             .expect("lock write attempt notifier") = Some(tx);
         rx
     }
-
 }
 
 pub struct MemoryDb {
@@ -167,14 +166,7 @@ impl MemoryDb {
     ) -> Result<Self, AppError> {
         let pool = runtime.pool();
         create_schema(pool).await?;
-        ensure_vec_table(
-            pool,
-            llm_model_id,
-            encoder_model_id,
-            encoder,
-            startup_state,
-        )
-        .await?;
+        ensure_vec_table(pool, llm_model_id, encoder_model_id, encoder, startup_state).await?;
 
         info!(
             db_path = %db_path.display(),
