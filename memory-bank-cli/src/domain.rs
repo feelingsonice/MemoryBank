@@ -139,6 +139,7 @@ pub(crate) fn integration_state(
 ) -> Option<&IntegrationState> {
     integrations.and_then(|integrations| match agent {
         AgentKind::ClaudeCode => integrations.claude_code.as_ref(),
+        AgentKind::Codex => integrations.codex.as_ref(),
         AgentKind::GeminiCli => integrations.gemini_cli.as_ref(),
         AgentKind::OpenCode => integrations.opencode.as_ref(),
         AgentKind::OpenClaw => integrations.openclaw.as_ref(),
@@ -162,6 +163,7 @@ pub(crate) fn set_integration_configured(
     let state = Some(IntegrationState { configured });
     match agent {
         AgentKind::ClaudeCode => integrations.claude_code = state,
+        AgentKind::Codex => integrations.codex = state,
         AgentKind::GeminiCli => integrations.gemini_cli = state,
         AgentKind::OpenCode => integrations.opencode = state,
         AgentKind::OpenClaw => integrations.openclaw = state,
@@ -220,11 +222,11 @@ mod tests {
     fn integration_helpers_round_trip_agent_state() {
         let mut integrations = IntegrationsSettings::default();
 
-        set_integration_configured(&mut integrations, AgentKind::OpenClaw, true);
+        set_integration_configured(&mut integrations, AgentKind::Codex, true);
 
         assert!(integration_configured(
             Some(&integrations),
-            AgentKind::OpenClaw
+            AgentKind::Codex
         ));
         assert!(!integration_configured(
             Some(&integrations),

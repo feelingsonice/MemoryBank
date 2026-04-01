@@ -882,7 +882,8 @@ async fn persist_prepared_turn(
     turn_id: i64,
     prepared_turn: PreparedTurnWrite,
 ) -> Result<(), ProcessTurnError> {
-    let mut tx = db.begin().await?;
+    let _write_permit = db.acquire_write_permit().await;
+    let mut tx = db.begin_immediate().await?;
     let link_count = prepared_turn.link_ids.len();
     let neighbor_update_count = prepared_turn.neighbor_updates.len();
 
@@ -944,12 +945,23 @@ async fn persist_prepared_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::MemoryDb;
+    use crate::db::{MemoryDb, SqliteRuntime};
+    use crate::ingest::IngestService;
     use crate::memory_window::{MemoryProjection, MemoryStep, ProjectedConversationWindow};
     use chrono::Utc;
+    use memory_bank_protocol::{
+        ConversationFragment, ConversationScope, FragmentBody, INGEST_PROTOCOL_VERSION,
+        IngestEnvelope, SourceMeta, Terminality,
+    };
     use serde::Serializer;
+    use serde_json::json;
     use sqlx::Row;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Default, Clone)]
     struct FakeAnalyzerState {
@@ -985,6 +997,38 @@ mod tests {
                 analysis_result: Ok(analysis),
                 evolution_result: Ok(evolution),
             }
+        }
+    }
+
+    struct BlockingAnalyzer {
+        analysis_started: Arc<Notify>,
+        release_analysis: Arc<Notify>,
+    }
+
+    impl MemoryLlmClient for BlockingAnalyzer {
+        async fn analyze_memory_window(
+            &self,
+            _previous_turns: &str,
+            _current_turn: &str,
+            _timestamp: DateTime<Utc>,
+        ) -> Result<ExtractedMemoryAnalysis, LlmError> {
+            self.analysis_started.notify_one();
+            self.release_analysis.notified().await;
+            Ok(ExtractedMemoryAnalysis {
+                context: "blocked context".to_string(),
+                keywords: vec!["kw".to_string()],
+                tags: vec!["tag".to_string()],
+            })
+        }
+
+        async fn generate_memory_evolution(
+            &self,
+            _context: &str,
+            _content: &str,
+            _keywords: &[String],
+            _neighbors_json: &str,
+        ) -> Result<MemoryEvolution, LlmError> {
+            Ok(MemoryEvolution::default())
         }
     }
 
@@ -1463,6 +1507,192 @@ mod tests {
         assert_eq!(stored_embedding, original_embedding);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_handle_retrieve_waits_behind_inflight_store_window() {
+        let db = Arc::new(open_memory_db().await);
+        create_processing_turn_table(db.as_ref()).await;
+        insert_processing_turn(db.as_ref(), 41).await;
+        insert_memory_with_embedding(
+            db.as_ref(),
+            "Existing memory",
+            "context",
+            &["kw"],
+            &["tag"],
+            &[1.0, 0.0],
+        )
+        .await;
+
+        let analysis_started = Arc::new(Notify::new());
+        let release_analysis = Arc::new(Notify::new());
+        let analyzer = BlockingAnalyzer {
+            analysis_started: analysis_started.clone(),
+            release_analysis: release_analysis.clone(),
+        };
+        let encoder = FakeEncoder {
+            encode_results: Arc::new(Mutex::new(vec![Ok(vec![vec![1.0, 0.0]])])),
+            encode_memory_results: Arc::new(Mutex::new(vec![Ok(vec![0.4, 0.6])])),
+            encode_memories_results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let (handle, actor_task) = spawn_test_actor(db.clone(), analyzer, encoder, 1);
+        let window = ProjectedConversationWindow {
+            previous_turns: Vec::new(),
+            current_turn: current_projection(),
+        };
+
+        let store_task = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.store_window(41, window, Utc::now()).await }
+        });
+
+        analysis_started.notified().await;
+
+        let retrieve_task = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.retrieve("existing memory".to_string()).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !retrieve_task.is_finished(),
+            "retrieve should wait behind the in-flight add task"
+        );
+
+        release_analysis.notify_waiters();
+
+        store_task
+            .await
+            .expect("join store task")
+            .expect("store window");
+        let notes = retrieve_task
+            .await
+            .expect("join retrieve task")
+            .expect("retrieve notes");
+        assert_eq!(turn_status(db.as_ref(), 41).await, "stored");
+        assert!(!notes.is_empty());
+
+        drop(handle);
+        tokio::task::spawn_blocking(move || actor_task.join().expect("join actor thread"))
+            .await
+            .expect("join actor task");
+    }
+
+    #[tokio::test]
+    async fn retrieve_with_encoder_reads_while_runtime_writer_is_active() {
+        let db_path = test_db_path("retrieve_while_writer_active");
+        let runtime = SqliteRuntime::open_file_for_tests(&db_path, 2)
+            .await
+            .expect("open sqlite runtime");
+        let db = MemoryDb::open_with_runtime_for_tests(runtime.clone(), 2)
+            .await
+            .expect("open memory db");
+        insert_memory_with_embedding(
+            &db,
+            "Existing memory",
+            "context",
+            &["kw"],
+            &["tag"],
+            &[1.0, 0.0],
+        )
+        .await;
+
+        let write_permit = runtime.acquire_write_permit().await;
+        let tx = runtime
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin immediate");
+
+        let encoder = FakeEncoder::from_query_results(vec![Ok(vec![vec![1.0, 0.0]])]);
+        let outcome = retrieve_with_encoder(&db, &encoder, 1, "existing memory")
+            .await
+            .expect("retrieve while writer active");
+        assert_eq!(outcome.notes.len(), 1);
+
+        tx.commit().await.expect("commit writer transaction");
+        drop(write_permit);
+    }
+
+    #[tokio::test]
+    async fn ingest_and_memory_persistence_queue_behind_shared_writer_gate() {
+        let db_path = test_db_path("shared_runtime");
+        let runtime = SqliteRuntime::open_file_for_tests(&db_path, 2)
+            .await
+            .expect("open sqlite runtime");
+        let db = Arc::new(
+            MemoryDb::open_with_runtime_for_tests(runtime.clone(), 2)
+                .await
+                .expect("open memory db"),
+        );
+        let service = IngestService::open_with_runtime(
+            runtime.clone(),
+            &db_path,
+            MemoryHandle::closed_for_tests(),
+            0,
+        )
+        .await
+        .expect("open ingest service");
+        insert_real_processing_turn(db.as_ref(), 23).await;
+
+        let write_permit = runtime.acquire_write_permit().await;
+        let mut write_attempts = runtime.install_write_attempt_notifier();
+        let tx = runtime
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin immediate");
+
+        let ingest_task = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .ingest(open_user_envelope("session-shared", "fragment-1"))
+                    .await
+            }
+        });
+        let persist_task = tokio::spawn({
+            let db = db.clone();
+            async move {
+                persist_prepared_turn(
+                    db.as_ref(),
+                    23,
+                    PreparedTurnWrite {
+                        content: "new memory".to_string(),
+                        memory_timestamp: "2026-03-05T00:00:00Z".to_string(),
+                        conversation_context: "ctx".to_string(),
+                        keywords_json: "[\"kw\"]".to_string(),
+                        tags_json: "[\"tag\"]".to_string(),
+                        embedding_bytes: embedding_to_bytes(&[0.4, 0.6]),
+                        link_ids: Vec::new(),
+                        neighbor_updates: Vec::new(),
+                    },
+                )
+                .await
+            }
+        });
+        wait_for_write_attempts(&mut write_attempts, 2).await;
+        tokio::task::yield_now().await;
+        assert!(!ingest_task.is_finished(), "ingest should still be blocked");
+        assert!(
+            !persist_task.is_finished(),
+            "persist should still be blocked"
+        );
+
+        tx.commit().await.expect("commit transaction");
+        drop(write_permit);
+
+        let ingest = ingest_task
+            .await
+            .expect("join ingest task")
+            .expect("ingest write");
+        assert!(!ingest.finalized);
+        persist_task
+            .await
+            .expect("join persist task")
+            .expect("persist write");
+
+        assert_eq!(memory_count(db.as_ref()).await, 1);
+        assert_eq!(turn_status(db.as_ref(), 23).await, "stored");
+    }
+
     async fn open_memory_db() -> MemoryDb {
         MemoryDb::open_in_memory_for_tests(2)
             .await
@@ -1545,5 +1775,142 @@ mod tests {
             .fetch_one(db.pool_for_tests())
             .await
             .expect("turn status")
+    }
+
+    async fn wait_for_write_attempts(
+        write_attempts: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+        expected: usize,
+    ) {
+        for _ in 0..expected {
+            write_attempts.recv().await.expect("write attempt");
+        }
+    }
+
+    fn spawn_test_actor<L, E>(
+        db: Arc<MemoryDb>,
+        llm: L,
+        encoder: E,
+        nearest_neighbor_count: i32,
+    ) -> (MemoryHandle, std::thread::JoinHandle<()>)
+    where
+        L: MemoryLlmClient + Send + Sync + 'static,
+        E: MemoryEncoderClient + Send + Sync + 'static,
+    {
+        let (tx, mut rx) = mpsc::channel(MEMORY_CHANNEL_CAPACITY);
+        let llm = Arc::new(llm);
+        let encoder = Arc::new(encoder);
+        let task = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build actor test runtime");
+            runtime.block_on(async move {
+                while let Some(task) = rx.recv().await {
+                    match task {
+                        MemoryTask::Add {
+                            turn_id,
+                            window,
+                            timestamp,
+                            responder,
+                        } => {
+                            let result = process_turn_with_clients(
+                                db.as_ref(),
+                                llm.as_ref(),
+                                encoder.as_ref(),
+                                nearest_neighbor_count,
+                                turn_id,
+                                window,
+                                timestamp,
+                            )
+                            .await;
+                            let _ = responder.send(result);
+                        }
+                        MemoryTask::Retrieve { query, responder } => {
+                            let result = retrieve_with_encoder(
+                                db.as_ref(),
+                                encoder.as_ref(),
+                                nearest_neighbor_count,
+                                &query,
+                            )
+                            .await
+                            .map(|outcome| outcome.notes);
+                            let _ = responder.send(result);
+                        }
+                    }
+                }
+            });
+        });
+        (MemoryHandle { tx }, task)
+    }
+
+    async fn insert_real_processing_turn(db: &MemoryDb, turn_id: i64) {
+        sqlx::query(
+            "INSERT INTO ingest_turns (
+                id,
+                conversation_id,
+                external_turn_id,
+                turn_index,
+                status,
+                projection_json,
+                terminality,
+                created_at,
+                updated_at,
+                finalized_at,
+                attempt_count,
+                last_error,
+                next_attempt_at,
+                processing_started_at,
+                stored_at
+            ) VALUES (?, ?, NULL, ?, 'processing', ?, 'hard', ?, ?, ?, 0, NULL, ?, ?, NULL);",
+        )
+        .bind(turn_id)
+        .bind("session-processing")
+        .bind(1_i64)
+        .bind(serde_json::to_string(&MemoryProjection::default()).expect("projection"))
+        .bind("2026-03-05T00:00:00Z")
+        .bind("2026-03-05T00:00:01Z")
+        .bind("2026-03-05T00:00:00Z")
+        .bind("2026-03-05T00:00:00Z")
+        .bind("2026-03-05T00:00:01Z")
+        .execute(db.pool_for_tests())
+        .await
+        .expect("insert processing turn");
+    }
+
+    fn test_db_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("memory_bank_actor_{label}_{}.db", unique_suffix()))
+    }
+
+    fn unique_suffix() -> u128 {
+        let time_component = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let counter_component = u128::from(UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed));
+        (time_component << 16) | counter_component
+    }
+
+    fn open_user_envelope(conversation_id: &str, fragment_id: &str) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "UserPromptSubmit".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: None,
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: Some(1),
+                emitted_at_rfc3339: Some("2026-03-05T00:00:00Z".to_string()),
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::UserMessage {
+                    text: "remember this".to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id}),
+        }
     }
 }

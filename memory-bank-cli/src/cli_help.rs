@@ -120,6 +120,7 @@ Supported keys:
   server.local_encoder_url
   server.remote_encoder_url
   integrations.claude_code.configured
+  integrations.codex.configured
   integrations.gemini_cli.configured
   integrations.opencode.configured
   integrations.openclaw.configured
@@ -152,6 +153,7 @@ Supported keys:
   server.local_encoder_url
   server.remote_encoder_url
   integrations.claude_code.configured
+  integrations.codex.configured
   integrations.gemini_cli.configured
   integrations.opencode.configured
   integrations.openclaw.configured
@@ -183,6 +185,7 @@ mod tests {
         assert!(CONFIG_AFTER_HELP.contains("server.llm_provider"));
         assert!(CONFIG_AFTER_HELP.contains("server.fastembed_model"));
         assert!(CONFIG_AFTER_HELP.contains("integrations.openclaw.configured"));
+        assert!(CONFIG_AFTER_HELP.contains("integrations.codex.configured"));
         assert!(CONFIG_SET_AFTER_HELP.contains("mb config set service.port 4545"));
         assert!(CONFIG_SET_AFTER_HELP.contains("Use `--yes` in automation."));
     }

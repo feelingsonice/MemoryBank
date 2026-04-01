@@ -48,6 +48,7 @@ At a high level, it separates memory into two paths:
 
 The capture path depends on the agent:
 
+- Codex: hooks
 - Claude Code: hooks
 - Gemini CLI: hooks
 - OpenCode: plugin
@@ -94,6 +95,7 @@ That separation is what makes cross-agent memory possible. You can use one tool 
 ## Related Docs
 
 - [Requirements](./requirements.md)
+- [Codex](./codex.md)
 - [Troubleshooting](./troubleshooting.md)
 - [Claude Code](./claude-code.md)
 - [Gemini CLI](./gemini-cli.md)

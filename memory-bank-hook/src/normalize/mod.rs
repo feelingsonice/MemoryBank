@@ -1,4 +1,5 @@
 mod claude_code;
+mod codex;
 mod gemini_cli;
 mod openclaw;
 mod opencode;
@@ -24,13 +25,14 @@ impl<'a> EnvelopeParser<'a> {
             "claude-code" => claude_code::ClaudeCodeParser::new(self.event)
                 .parse(raw)
                 .map(Some),
+            "codex" => codex::CodexParser::new(self.event).parse(raw),
             "gemini-cli" => gemini_cli::GeminiCliParser::new(self.event)
                 .parse(raw)
                 .map(Some),
             "openclaw" => openclaw::OpenClawParser::new(self.event).parse(raw),
             "opencode" => opencode::OpenCodeParser::new(self.event).parse(raw),
             other => Err(AppError::Normalize(format!(
-                "Unsupported agent '{other}'. Supported agents: claude-code, gemini-cli, openclaw, opencode"
+                "Unsupported agent '{other}'. Supported agents: claude-code, codex, gemini-cli, openclaw, opencode"
             ))),
         }
     }
@@ -132,6 +134,27 @@ mod tests {
             payload.fragment.body,
             FragmentBody::UserMessage { ref text } if text == "hello gemini"
         ));
+    }
+
+    #[test]
+    fn dispatches_to_codex_parser() {
+        let raw = json!({
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "hello codex"
+        });
+
+        let payload = EnvelopeParser::new("codex", "UserPromptSubmit")
+            .parse(raw.to_string().as_bytes())
+            .expect("parse");
+        let payload = payload.expect("payload should not be skipped");
+
+        assert!(matches!(
+            payload.fragment.body,
+            FragmentBody::UserMessage { ref text } if text == "hello codex"
+        ));
+        assert_eq!(payload.scope.turn_id.as_deref(), Some("turn-1"));
     }
 
     #[test]

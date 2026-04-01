@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use libsqlite3_sys::{SQLITE_BUSY, SQLITE_LOCKED};
 use memory_bank_protocol::{ConversationFragment, FragmentBody, IngestEnvelope, Terminality};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{SqlitePool, Transaction};
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -16,11 +16,9 @@ use tokio_retry::strategy::ExponentialBackoff;
 use tracing::{debug, info, warn};
 
 use crate::actor::{MemoryHandle, ProcessTurnError, UnrecoverableProcessTurnError};
+use crate::db::SqliteRuntime;
 use crate::error::AppError;
 use crate::memory_window::{MemoryProjection, MemoryStep, ProjectedConversationWindow};
-
-const SQLITE_BUSY_TIMEOUT_MS: &str = "5000";
-const SQLITE_MMAP_SIZE_BYTES: &str = "268435456";
 const MAX_STAGE_RETRIES: usize = 3;
 const STAGE_RETRY_BASE_DELAY_MS: u64 = 10;
 const STAGE_RETRY_MAX_DELAY: Duration = Duration::from_millis(80);
@@ -151,12 +149,23 @@ pub struct IngestService {
 }
 
 impl IngestService {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn open(
         db_path: &Path,
         memory: MemoryHandle,
         history_window_size: u32,
     ) -> Result<Self, AppError> {
-        let store = Arc::new(IngestStore::open(db_path, history_window_size).await?);
+        let runtime = SqliteRuntime::open(db_path).await?;
+        Self::open_with_runtime(runtime, db_path, memory, history_window_size).await
+    }
+
+    pub(crate) async fn open_with_runtime(
+        runtime: SqliteRuntime,
+        db_path: &Path,
+        memory: MemoryHandle,
+        history_window_size: u32,
+    ) -> Result<Self, AppError> {
+        let store = Arc::new(IngestStore::open_with_runtime(runtime, history_window_size).await?);
         let dispatcher_notify = Arc::new(Notify::new());
         let recovered_turns = store.recover_processing_turns().await?;
         if recovered_turns > 0 {
@@ -225,42 +234,53 @@ pub enum IngestError {
     Serialization(#[from] serde_json::Error),
 }
 
+impl IngestError {
+    pub(crate) fn is_sqlite_lock_contention(&self) -> bool {
+        matches!(self, Self::Database(database_error) if is_sqlite_lock_contention(database_error))
+    }
+}
+
 pub struct IngestStore {
-    pool: SqlitePool,
+    runtime: SqliteRuntime,
     history_window_size: u32,
 }
 
 impl IngestStore {
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn open(db_path: &Path, history_window_size: u32) -> Result<Self, AppError> {
-        let connection_string = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
-        let options = SqliteConnectOptions::from_str(&connection_string)?
-            .create_if_missing(true)
-            .pragma("journal_mode", "WAL")
-            .pragma("synchronous", "NORMAL")
-            .pragma("busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
-            .pragma("foreign_keys", "ON")
-            .pragma("mmap_size", SQLITE_MMAP_SIZE_BYTES);
+        let runtime = SqliteRuntime::open(db_path).await?;
+        Self::open_with_runtime(runtime, history_window_size).await
+    }
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
-
-        initialize_ingest_schema(&pool).await?;
+    async fn open_with_runtime(
+        runtime: SqliteRuntime,
+        history_window_size: u32,
+    ) -> Result<Self, AppError> {
+        initialize_ingest_schema(runtime.pool()).await?;
 
         Ok(Self {
-            pool,
+            runtime,
             history_window_size,
         })
+    }
+
+    fn pool(&self) -> &SqlitePool {
+        self.runtime.pool()
+    }
+
+    async fn acquire_write_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.runtime.acquire_write_permit().await
     }
 
     async fn stage_fragment(
         &self,
         envelope: &IngestEnvelope,
     ) -> Result<StagedFragment, IngestError> {
-        RetryIf::spawn(stage_retry_strategy(), || self.stage_fragment_once(envelope), |error: &IngestError| {
-            matches!(error, IngestError::Database(database_error) if is_unique_violation(database_error))
-        })
+        RetryIf::spawn(
+            stage_retry_strategy(),
+            || self.stage_fragment_once(envelope),
+            should_retry_stage_error,
+        )
         .await
     }
 
@@ -268,8 +288,17 @@ impl IngestStore {
         &self,
         envelope: &IngestEnvelope,
     ) -> Result<StagedFragment, IngestError> {
-        let mut tx = self.pool.begin().await?;
+        let _write_permit = self.acquire_write_permit().await;
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
         let now = Utc::now().to_rfc3339();
+
+        if let Some(existing) = self
+            .load_existing_fragment_in_tx(&mut tx, &envelope.scope.fragment_id)
+            .await?
+        {
+            tx.rollback().await?;
+            return Ok(staged_fragment_from_existing(existing));
+        }
 
         let turn = self.resolve_turn(&mut tx, envelope, &now).await?;
         let fragment_json = serde_json::to_string(&envelope.fragment)?;
@@ -306,19 +335,7 @@ impl IngestStore {
             let existing = self
                 .load_existing_fragment(&envelope.scope.fragment_id)
                 .await?;
-            return Ok(StagedFragment {
-                conversation_id: existing.conversation_id,
-                fragment_id: existing.fragment_id,
-                turn_index: existing.turn_index,
-                duplicate: true,
-                finalized: matches!(
-                    existing.status,
-                    IngestTurnStatus::Finalized
-                        | IngestTurnStatus::Processing
-                        | IngestTurnStatus::Stored
-                        | IngestTurnStatus::Failed
-                ),
-            });
+            return Ok(staged_fragment_from_existing(existing));
         }
 
         let reduced = self.rebuild_projection(&mut tx, turn.id).await?;
@@ -361,7 +378,13 @@ impl IngestStore {
                 .load_turn_by_external_id(tx, &envelope.scope.conversation_id, external_turn_id)
                 .await?
             {
-                return Ok(turn);
+                return match turn.status {
+                    IngestTurnStatus::Open => Ok(turn.into_turn_ref()),
+                    closed_status => Err(IngestError::Validation(format!(
+                        "fragment references closed external turn '{}' in conversation '{}' with status '{}'",
+                        external_turn_id, envelope.scope.conversation_id, closed_status
+                    ))),
+                };
             }
             return self
                 .create_turn(
@@ -425,6 +448,7 @@ impl IngestStore {
     }
 
     async fn claim_next_due_turn(&self, now: &str) -> Result<Option<ClaimedTurnRow>, sqlx::Error> {
+        let _write_permit = self.acquire_write_permit().await;
         sqlx::query_as::<_, ClaimedTurnRow>(CLAIM_NEXT_DUE_TURN_SQL)
             .bind(IngestTurnStatus::Processing)
             .bind(now)
@@ -435,7 +459,7 @@ impl IngestStore {
             .bind(IngestTurnStatus::Finalized)
             .bind(IngestTurnStatus::Processing)
             .bind(IngestTurnStatus::Failed)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.pool())
             .await
     }
 
@@ -446,7 +470,7 @@ impl IngestStore {
             .bind(IngestTurnStatus::Finalized)
             .bind(IngestTurnStatus::Processing)
             .bind(IngestTurnStatus::Failed)
-            .fetch_optional(&self.pool)
+            .fetch_optional(self.pool())
             .await?;
         due_at.as_deref().map(parse_retry_deadline).transpose()
     }
@@ -460,7 +484,7 @@ impl IngestStore {
                 .bind(&turn.conversation_id)
                 .bind(IngestTurnStatus::Stored)
                 .bind(turn.turn_index)
-                .fetch_all(&self.pool)
+                .fetch_all(self.pool())
                 .await?
         } else {
             sqlx::query_scalar::<_, String>(SELECT_PREVIOUS_TURNS_SQL)
@@ -468,7 +492,7 @@ impl IngestStore {
                 .bind(IngestTurnStatus::Stored)
                 .bind(turn.turn_index)
                 .bind(i64::from(self.history_window_size))
-                .fetch_all(&self.pool)
+                .fetch_all(self.pool())
                 .await?
         };
 
@@ -506,6 +530,7 @@ impl IngestStore {
         next_attempt_at: &str,
         now: &str,
     ) -> Result<(), DispatcherError> {
+        let _write_permit = self.acquire_write_permit().await;
         let result = sqlx::query(MARK_TURN_RETRYABLE_SQL)
             .bind(IngestTurnStatus::Finalized)
             .bind(attempt_count)
@@ -514,7 +539,7 @@ impl IngestStore {
             .bind(now)
             .bind(turn_id)
             .bind(IngestTurnStatus::Processing)
-            .execute(&self.pool)
+            .execute(self.pool())
             .await?;
         if result.rows_affected() != 1 {
             return Err(DispatcherError::Invariant(format!(
@@ -530,13 +555,14 @@ impl IngestStore {
         error: &str,
         now: &str,
     ) -> Result<(), DispatcherError> {
+        let _write_permit = self.acquire_write_permit().await;
         let result = sqlx::query(MARK_TURN_FAILED_SQL)
             .bind(IngestTurnStatus::Failed)
             .bind(error)
             .bind(now)
             .bind(turn_id)
             .bind(IngestTurnStatus::Processing)
-            .execute(&self.pool)
+            .execute(self.pool())
             .await?;
         if result.rows_affected() != 1 {
             return Err(DispatcherError::Invariant(format!(
@@ -547,6 +573,7 @@ impl IngestStore {
     }
 
     async fn recover_processing_turns(&self) -> Result<u64, sqlx::Error> {
+        let _write_permit = self.acquire_write_permit().await;
         let now = Utc::now().to_rfc3339();
         let result = sqlx::query(RECOVER_PROCESSING_TURNS_SQL)
             .bind(IngestTurnStatus::Finalized)
@@ -554,7 +581,7 @@ impl IngestStore {
             .bind(&now)
             .bind(&now)
             .bind(IngestTurnStatus::Processing)
-            .execute(&self.pool)
+            .execute(self.pool())
             .await?;
         Ok(result.rows_affected())
     }
@@ -564,12 +591,14 @@ impl IngestStore {
         tx: &mut Transaction<'_, sqlx::Sqlite>,
         conversation_id: &str,
         external_turn_id: &str,
-    ) -> Result<Option<TurnRef>, IngestError> {
-        Ok(sqlx::query_as::<_, TurnRef>(SELECT_TURN_BY_EXTERNAL_ID_SQL)
-            .bind(conversation_id)
-            .bind(external_turn_id)
-            .fetch_optional(&mut **tx)
-            .await?)
+    ) -> Result<Option<ExternalTurnRef>, IngestError> {
+        Ok(
+            sqlx::query_as::<_, ExternalTurnRef>(SELECT_TURN_BY_EXTERNAL_ID_SQL)
+                .bind(conversation_id)
+                .bind(external_turn_id)
+                .fetch_optional(&mut **tx)
+                .await?,
+        )
     }
 
     async fn load_open_turn(
@@ -591,7 +620,20 @@ impl IngestStore {
         Ok(
             sqlx::query_as::<_, ExistingFragmentRow>(SELECT_EXISTING_FRAGMENT_SQL)
                 .bind(fragment_id)
-                .fetch_one(&self.pool)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+
+    async fn load_existing_fragment_in_tx(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Sqlite>,
+        fragment_id: &str,
+    ) -> Result<Option<ExistingFragmentRow>, IngestError> {
+        Ok(
+            sqlx::query_as::<_, ExistingFragmentRow>(SELECT_EXISTING_FRAGMENT_SQL)
+                .bind(fragment_id)
+                .fetch_optional(&mut **tx)
                 .await?,
         )
     }
@@ -995,6 +1037,22 @@ struct TurnRef {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+struct ExternalTurnRef {
+    id: i64,
+    turn_index: i64,
+    status: IngestTurnStatus,
+}
+
+impl ExternalTurnRef {
+    fn into_turn_ref(self) -> TurnRef {
+        TurnRef {
+            id: self.id,
+            turn_index: self.turn_index,
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
 struct StoredFragmentRow {
     fragment_json: String,
 }
@@ -1015,6 +1073,22 @@ struct ExistingFragmentRow {
     fragment_id: String,
     turn_index: i64,
     status: IngestTurnStatus,
+}
+
+fn staged_fragment_from_existing(existing: ExistingFragmentRow) -> StagedFragment {
+    StagedFragment {
+        conversation_id: existing.conversation_id,
+        fragment_id: existing.fragment_id,
+        turn_index: existing.turn_index,
+        duplicate: true,
+        finalized: matches!(
+            existing.status,
+            IngestTurnStatus::Finalized
+                | IngestTurnStatus::Processing
+                | IngestTurnStatus::Stored
+                | IngestTurnStatus::Failed
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -1138,22 +1212,38 @@ fn parse_retry_deadline(value: &str) -> Result<Instant, DispatcherError> {
     Ok(Instant::now() + wait)
 }
 
-fn validate_runtime_constraints(envelope: &IngestEnvelope) -> Result<(), IngestError> {
-    if envelope.scope.turn_id.is_some() {
-        return Err(IngestError::Validation(
-            "scope.turn_id is not supported yet; omit turn_id for now".to_string(),
-        ));
-    }
-
+fn validate_runtime_constraints(_envelope: &IngestEnvelope) -> Result<(), IngestError> {
     Ok(())
 }
 
-fn is_unique_violation(error: &sqlx::Error) -> bool {
-    let sqlx::Error::Database(db_error) = error else {
+fn should_retry_stage_error(error: &IngestError) -> bool {
+    let IngestError::Database(database_error) = error else {
         return false;
     };
 
-    matches!(db_error.code().as_deref(), Some("1555" | "2067"))
+    is_unique_violation(database_error) || is_sqlite_lock_contention(database_error)
+}
+
+fn sqlite_error_code(error: &sqlx::Error) -> Option<i32> {
+    let sqlx::Error::Database(db_error) = error else {
+        return None;
+    };
+
+    db_error.code()?.parse().ok()
+}
+
+fn sqlite_base_error_code(code: i32) -> i32 {
+    code & 0xff
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    matches!(sqlite_error_code(error), Some(1555 | 2067))
+}
+
+fn is_sqlite_lock_contention(error: &sqlx::Error) -> bool {
+    sqlite_error_code(error)
+        .map(sqlite_base_error_code)
+        .is_some_and(|code| matches!(code, SQLITE_BUSY | SQLITE_LOCKED))
 }
 
 const CREATE_INGEST_TURNS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS ingest_turns (
@@ -1219,7 +1309,7 @@ const CREATE_INGEST_FRAGMENTS_CONVERSATION_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ingest_fragments_conversation
     ON ingest_fragments (conversation_id, turn_id, id);";
 
-const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index
+const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index, status
     FROM ingest_turns
     WHERE conversation_id = ? AND external_turn_id = ?
     LIMIT 1;";
@@ -1426,14 +1516,15 @@ mod tests {
     use super::{
         ClaimedTurnRow, INGEST_FRAGMENTS_SCHEMA_REQUIREMENTS, INGEST_TURNS_SCHEMA_REQUIREMENTS,
         IngestDispatcher, IngestFragmentKind, IngestService, IngestStore, IngestTurnStatus,
-        SELECT_TABLE_SCHEMA_SQL, SQLITE_BUSY_TIMEOUT_MS, SQLITE_MMAP_SIZE_BYTES, Terminality,
-        apply_fragment_to_projection, compact_sql, validate_runtime_constraints,
+        SELECT_TABLE_SCHEMA_SQL, Terminality, apply_fragment_to_projection, compact_sql,
+        should_retry_stage_error, validate_runtime_constraints,
     };
     use crate::actor::{
         MemoryHandle, ProcessTurnError, RetryableProcessTurnError, TestStoreTurnRequest,
     };
+    use crate::db::{MemoryDb, SQLITE_BUSY_TIMEOUT_MS, SQLITE_MMAP_SIZE_BYTES, SqliteRuntime};
     use crate::error::AppError;
-    use crate::memory_window::MemoryProjection;
+    use crate::memory_window::{MemoryProjection, MemoryStep};
     use memory_bank_protocol::{
         ConversationFragment, ConversationScope, FragmentBody, INGEST_PROTOCOL_VERSION,
         IngestEnvelope, SourceMeta,
@@ -1656,7 +1747,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_constraints_reject_turn_ids_for_now() {
+    fn runtime_constraints_allow_turn_ids() {
         let envelope = IngestEnvelope {
             protocol_version: INGEST_PROTOCOL_VERSION,
             source: SourceMeta {
@@ -1679,14 +1770,7 @@ mod tests {
             raw: json!({"session_id": "session-1"}),
         };
 
-        let error =
-            validate_runtime_constraints(&envelope).expect_err("turn_id should be rejected");
-
-        assert!(matches!(
-            error,
-            super::IngestError::Validation(message)
-                if message == "scope.turn_id is not supported yet; omit turn_id for now"
-        ));
+        validate_runtime_constraints(&envelope).expect("turn_id should be accepted");
     }
 
     #[tokio::test]
@@ -1696,10 +1780,192 @@ mod tests {
             .await
             .expect("open store");
 
-        let turns_sql = load_table_sql(&store.pool, "ingest_turns").await;
-        let fragments_sql = load_table_sql(&store.pool, "ingest_fragments").await;
+        let turns_sql = load_table_sql(store.pool(), "ingest_turns").await;
+        let fragments_sql = load_table_sql(store.pool(), "ingest_fragments").await;
         assert_schema_requirements(&turns_sql, INGEST_TURNS_SCHEMA_REQUIREMENTS);
         assert_schema_requirements(&fragments_sql, INGEST_FRAGMENTS_SCHEMA_REQUIREMENTS);
+    }
+
+    #[tokio::test]
+    async fn writer_gate_blocks_writes_but_still_allows_reads() {
+        let db_path = test_db_path("writer_gate");
+        let runtime = SqliteRuntime::open_file_for_tests(&db_path, 2)
+            .await
+            .expect("open sqlite runtime");
+        let store = Arc::new(
+            IngestStore::open_with_runtime(runtime.clone(), TEST_HISTORY_WINDOW_SIZE)
+                .await
+                .expect("open store"),
+        );
+        let db = MemoryDb::open_with_runtime_for_tests(runtime.clone(), 2)
+            .await
+            .expect("memory db");
+        let memory_id = insert_memory_note(&db, "seed memory").await;
+
+        let write_permit = runtime.acquire_write_permit().await;
+        let mut write_attempts = runtime.install_write_attempt_notifier();
+        let tx = runtime
+            .pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin immediate");
+
+        let store_for_write = store.clone();
+        let blocked_write =
+            tokio::spawn(async move { store_for_write.recover_processing_turns().await });
+        wait_for_write_attempts(&mut write_attempts, 1).await;
+
+        let memories = db.get_memories(&[memory_id]).await.expect("read memories");
+        assert_eq!(memories.len(), 1, "read should use the second connection");
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked_write.is_finished(),
+            "write should wait for the shared gate"
+        );
+
+        tx.commit().await.expect("commit transaction");
+        drop(write_permit);
+
+        let recovered = blocked_write
+            .await
+            .expect("join blocked write")
+            .expect("recover processing turns");
+        assert_eq!(recovered, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_external_fragments_preserve_a_single_coherent_projection() {
+        let db_path = test_db_path("concurrent_external_fragments");
+        let runtime = SqliteRuntime::open_file_for_tests(&db_path, 2)
+            .await
+            .expect("open sqlite runtime");
+        let store = Arc::new(
+            IngestStore::open_with_runtime(runtime.clone(), TEST_HISTORY_WINDOW_SIZE)
+                .await
+                .expect("open store"),
+        );
+        let write_permit = runtime.acquire_write_permit().await;
+        let mut write_attempts = runtime.install_write_attempt_notifier();
+
+        let user_store = store.clone();
+        let user_task = tokio::spawn(async move {
+            let envelope =
+                external_user_envelope("session-concurrent", "turn-1", "fragment-1", "hello");
+            user_store.stage_fragment(&envelope).await
+        });
+        wait_for_write_attempts(&mut write_attempts, 1).await;
+
+        let assistant_store = store.clone();
+        let assistant_task = tokio::spawn(async move {
+            let envelope = external_tool_call_envelope(
+                "session-concurrent",
+                "turn-1",
+                "fragment-2",
+                "tool-1",
+                "Bash",
+                json!({"command": "pwd"}),
+            );
+            assistant_store.stage_fragment(&envelope).await
+        });
+        wait_for_write_attempts(&mut write_attempts, 1).await;
+        drop(write_permit);
+
+        let user = user_task
+            .await
+            .expect("join user task")
+            .expect("stage user");
+        let assistant = assistant_task
+            .await
+            .expect("join assistant task")
+            .expect("stage assistant");
+
+        assert_eq!(user.turn_index, 1);
+        assert_eq!(assistant.turn_index, 1);
+
+        let turn_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
+                .bind("session-concurrent")
+                .fetch_one(store.pool())
+                .await
+                .expect("turn count");
+        assert_eq!(turn_count, 1);
+
+        let projection_json: String = sqlx::query_scalar(
+            "SELECT projection_json
+             FROM ingest_turns
+             WHERE conversation_id = ? AND external_turn_id = ?
+             LIMIT 1",
+        )
+        .bind("session-concurrent")
+        .bind("turn-1")
+        .fetch_one(store.pool())
+        .await
+        .expect("projection json");
+        let projection: MemoryProjection =
+            serde_json::from_str(&projection_json).expect("projection");
+
+        assert_eq!(projection.user_message, "hello");
+        assert!(projection.assistant_reply.is_empty());
+        assert_eq!(
+            projection.steps,
+            vec![MemoryStep::ToolCall {
+                name: "Bash".to_string(),
+                input: "{\"command\":\"pwd\"}".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_lock_errors_are_classified_as_retryable_stage_errors() {
+        let db_path = test_db_path("busy_retry");
+        let holder = open_file_pool_with_busy_timeout(&db_path, "0").await;
+        let blocked = open_file_pool_with_busy_timeout(&db_path, "0").await;
+        sqlx::query("CREATE TABLE write_lock (id INTEGER PRIMARY KEY, value TEXT NOT NULL);")
+            .execute(&holder)
+            .await
+            .expect("create write_lock table");
+
+        let mut tx = holder
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("begin immediate");
+        sqlx::query("INSERT INTO write_lock (id, value) VALUES (1, 'locked');")
+            .execute(&mut *tx)
+            .await
+            .expect("insert row");
+
+        let error = blocked
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect_err("busy lock error");
+        assert!(super::is_sqlite_lock_contention(&error));
+        assert!(should_retry_stage_error(&super::IngestError::Database(
+            error
+        )));
+
+        tx.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn unique_constraint_errors_remain_retryable() {
+        let pool = open_memory_pool().await;
+        sqlx::query("CREATE TABLE dedupe (id INTEGER PRIMARY KEY, value TEXT NOT NULL UNIQUE);")
+            .execute(&pool)
+            .await
+            .expect("create dedupe table");
+        sqlx::query("INSERT INTO dedupe (id, value) VALUES (1, 'once');")
+            .execute(&pool)
+            .await
+            .expect("insert first row");
+
+        let error = sqlx::query("INSERT INTO dedupe (id, value) VALUES (2, 'once');")
+            .execute(&pool)
+            .await
+            .expect_err("unique violation");
+        assert!(!super::is_sqlite_lock_contention(&error));
+        assert!(should_retry_stage_error(&super::IngestError::Database(
+            error
+        )));
     }
 
     #[tokio::test]
@@ -1850,19 +2116,404 @@ mod tests {
         let turn_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
                 .bind("session-1")
-                .fetch_one(&store.pool)
+                .fetch_one(store.pool())
                 .await
                 .expect("turn count");
         let open_turns: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ? AND status = 'open'",
         )
         .bind("session-1")
-        .fetch_one(&store.pool)
+        .fetch_one(store.pool())
         .await
         .expect("open turn count");
 
         assert_eq!(turn_count, 1);
         assert_eq!(open_turns, 0);
+    }
+
+    #[tokio::test]
+    async fn external_turn_id_coalesces_fragments_into_one_turn() {
+        let db_path = test_db_path("external_turn_coalesce");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        let first = store
+            .stage_fragment(&external_user_envelope(
+                "session-external",
+                "turn-1",
+                "fragment-1",
+                "hello",
+            ))
+            .await
+            .expect("stage first fragment");
+        let second = store
+            .stage_fragment(&external_hard_assistant_envelope(
+                "session-external",
+                "turn-1",
+                "fragment-2",
+                "done",
+            ))
+            .await
+            .expect("stage second fragment");
+
+        assert_eq!(first.turn_index, 1);
+        assert_eq!(second.turn_index, 1);
+        assert!(!first.finalized);
+        assert!(second.finalized);
+
+        let turn_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
+                .bind("session-external")
+                .fetch_one(store.pool())
+                .await
+                .expect("turn count");
+        assert_eq!(turn_count, 1);
+    }
+
+    #[tokio::test]
+    async fn different_external_turn_ids_create_new_turns() {
+        let db_path = test_db_path("external_turn_split");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        let first = store
+            .stage_fragment(&external_hard_assistant_envelope(
+                "session-external",
+                "turn-1",
+                "fragment-1",
+                "first",
+            ))
+            .await
+            .expect("stage first turn");
+        let second = store
+            .stage_fragment(&external_hard_assistant_envelope(
+                "session-external",
+                "turn-2",
+                "fragment-2",
+                "second",
+            ))
+            .await
+            .expect("stage second turn");
+
+        assert_eq!(first.turn_index, 1);
+        assert_eq!(second.turn_index, 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_fragment_for_closed_external_turn_returns_duplicate_success() {
+        let db_path = test_db_path("external_turn_duplicate");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+        let envelope =
+            external_hard_assistant_envelope("session-external", "turn-1", "fragment-1", "done");
+
+        let first = store.stage_fragment(&envelope).await.expect("first stage");
+        let duplicate = store
+            .stage_fragment(&envelope)
+            .await
+            .expect("duplicate stage");
+
+        assert!(first.finalized);
+        assert!(duplicate.duplicate);
+        assert!(duplicate.finalized);
+        assert_eq!(duplicate.turn_index, first.turn_index);
+    }
+
+    #[tokio::test]
+    async fn late_fragments_for_closed_external_turns_are_rejected() {
+        let db_path = test_db_path("external_turn_closed");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        for (index, status) in [
+            IngestTurnStatus::Finalized,
+            IngestTurnStatus::Processing,
+            IngestTurnStatus::Stored,
+            IngestTurnStatus::Failed,
+            IngestTurnStatus::Aborted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let conversation_id = format!("session-closed-{index}");
+            let turn_id = format!("turn-{index}");
+            let (next_attempt_at, stored_at, finalized_at, processing_started_at) = match status {
+                IngestTurnStatus::Finalized => (
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                ),
+                IngestTurnStatus::Processing => (
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                    Some("2026-03-05T00:00:00Z"),
+                    Some("2026-03-05T00:00:00Z"),
+                ),
+                IngestTurnStatus::Stored => (
+                    None,
+                    Some("2026-03-05T00:00:00Z"),
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                ),
+                IngestTurnStatus::Failed => (None, None, Some("2026-03-05T00:00:00Z"), None),
+                IngestTurnStatus::Aborted => (None, None, None, None),
+                IngestTurnStatus::Open => unreachable!("test only covers closed turns"),
+            };
+            insert_turn_row_with_external_id(
+                store.pool(),
+                &conversation_id,
+                Some(&turn_id),
+                1,
+                status,
+                &projection_json("user", "assistant"),
+                next_attempt_at,
+                stored_at,
+                finalized_at,
+                processing_started_at,
+                0,
+            )
+            .await;
+
+            let error = store
+                .stage_fragment(&external_user_envelope(
+                    &conversation_id,
+                    &turn_id,
+                    &format!("fragment-late-{index}"),
+                    "late fragment",
+                ))
+                .await
+                .expect_err("closed external turn should reject late fragment");
+
+            assert!(matches!(
+                error,
+                super::IngestError::Validation(message)
+                    if message.contains("fragment references closed external turn")
+                        && message.contains(&turn_id)
+                        && message.contains(status.as_str())
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn service_duplicate_replay_of_closed_external_fragment_reports_duplicate() {
+        let db_path = test_db_path("service_external_duplicate");
+        let service = IngestService::open(&db_path, MemoryHandle::closed_for_tests(), 0)
+            .await
+            .expect("open service");
+        let envelope =
+            external_hard_assistant_envelope("session-service", "turn-1", "fragment-1", "done");
+
+        let first = service
+            .ingest(envelope.clone())
+            .await
+            .expect("first ingest");
+        let duplicate = service.ingest(envelope).await.expect("duplicate ingest");
+
+        assert_eq!(first.turn_index, 1);
+        assert!(!first.duplicate);
+        assert!(first.finalized);
+        assert_eq!(duplicate.turn_index, 1);
+        assert!(duplicate.duplicate);
+        assert!(duplicate.finalized);
+    }
+
+    #[tokio::test]
+    async fn service_scopes_external_turn_ids_by_conversation() {
+        let db_path = test_db_path("service_external_scope");
+        let service = IngestService::open(&db_path, MemoryHandle::closed_for_tests(), 0)
+            .await
+            .expect("open service");
+
+        let first = service
+            .ingest(external_hard_assistant_envelope(
+                "conversation-a",
+                "turn-1",
+                "fragment-1",
+                "first",
+            ))
+            .await
+            .expect("first ingest");
+        let second = service
+            .ingest(external_hard_assistant_envelope(
+                "conversation-b",
+                "turn-1",
+                "fragment-2",
+                "second",
+            ))
+            .await
+            .expect("second ingest");
+
+        assert_eq!(first.turn_index, 1);
+        assert_eq!(second.turn_index, 1);
+
+        let pool = open_file_pool(&db_path).await;
+        let first_count = turn_count_for_conversation(&pool, "conversation-a").await;
+        let second_count = turn_count_for_conversation(&pool, "conversation-b").await;
+        assert_eq!(first_count, 1);
+        assert_eq!(second_count, 1);
+    }
+
+    #[tokio::test]
+    async fn service_external_turn_window_preserves_steps_and_messages() {
+        let db_path = test_db_path("service_external_window");
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let service = IngestService::open(&db_path, memory, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open service");
+
+        service
+            .ingest(external_user_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-1",
+                "remember this",
+            ))
+            .await
+            .expect("user fragment");
+        service
+            .ingest(external_tool_call_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-2",
+                "tool-1",
+                "Bash",
+                json!({"command": "pwd"}),
+            ))
+            .await
+            .expect("tool call fragment");
+        service
+            .ingest(external_tool_result_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-3",
+                "tool-1",
+                "Bash",
+                json!({"stdout": "/tmp"}),
+            ))
+            .await
+            .expect("tool result fragment");
+        let outcome = service
+            .ingest(external_hard_assistant_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-4",
+                "done",
+            ))
+            .await
+            .expect("assistant fragment");
+
+        assert!(outcome.finalized);
+
+        let request = recv_store_request(&mut requests).await;
+        assert_eq!(request.window.previous_turns.len(), 0);
+        assert_eq!(request.window.current_turn.user_message, "remember this");
+        assert_eq!(request.window.current_turn.assistant_reply, "done");
+        assert_eq!(
+            request.window.current_turn.steps,
+            vec![
+                MemoryStep::ToolCall {
+                    name: "Bash".to_string(),
+                    input: "{\"command\":\"pwd\"}".to_string(),
+                },
+                MemoryStep::ToolResult {
+                    name: "Bash".to_string(),
+                    output: "{\"stdout\":\"/tmp\"}".to_string(),
+                },
+            ]
+        );
+
+        let pool = open_file_pool(&db_path).await;
+        mark_processing_turn_stored(&pool, request.turn_id).await;
+        request.responder.send(Ok(())).expect("ack success");
+        let stored = wait_for_turn_status(&pool, request.turn_id, IngestTurnStatus::Stored).await;
+        assert_eq!(stored.status, IngestTurnStatus::Stored);
+    }
+
+    #[tokio::test]
+    async fn service_rejects_late_external_fragments_while_processing() {
+        let db_path = test_db_path("service_external_processing_reject");
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let service = IngestService::open(&db_path, memory, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open service");
+
+        service
+            .ingest(external_hard_assistant_envelope(
+                "session-processing",
+                "turn-1",
+                "fragment-1",
+                "done",
+            ))
+            .await
+            .expect("finalizing ingest");
+
+        let request = recv_store_request(&mut requests).await;
+        let error = service
+            .ingest(external_user_envelope(
+                "session-processing",
+                "turn-1",
+                "fragment-2",
+                "late user",
+            ))
+            .await
+            .expect_err("processing turn should reject late fragment");
+        assert!(matches!(
+            error,
+            super::IngestError::Validation(message)
+                if message.contains("closed external turn 'turn-1'")
+                    && message.contains("processing")
+        ));
+
+        let pool = open_file_pool(&db_path).await;
+        mark_processing_turn_stored(&pool, request.turn_id).await;
+        request.responder.send(Ok(())).expect("ack success");
+        wait_for_turn_status(&pool, request.turn_id, IngestTurnStatus::Stored).await;
+    }
+
+    #[tokio::test]
+    async fn service_rejects_late_external_fragments_after_stored() {
+        let db_path = test_db_path("service_external_stored_reject");
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let service = IngestService::open(&db_path, memory, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open service");
+
+        service
+            .ingest(external_hard_assistant_envelope(
+                "session-stored",
+                "turn-1",
+                "fragment-1",
+                "done",
+            ))
+            .await
+            .expect("finalizing ingest");
+
+        let request = recv_store_request(&mut requests).await;
+        let pool = open_file_pool(&db_path).await;
+        mark_processing_turn_stored(&pool, request.turn_id).await;
+        request.responder.send(Ok(())).expect("ack success");
+        wait_for_turn_status(&pool, request.turn_id, IngestTurnStatus::Stored).await;
+
+        let error = service
+            .ingest(external_user_envelope(
+                "session-stored",
+                "turn-1",
+                "fragment-2",
+                "late user",
+            ))
+            .await
+            .expect_err("stored turn should reject late fragment");
+        assert!(matches!(
+            error,
+            super::IngestError::Validation(message)
+                if message.contains("closed external turn 'turn-1'")
+                    && message.contains("stored")
+        ));
     }
 
     #[tokio::test]
@@ -1892,7 +2543,7 @@ mod tests {
         assert_eq!(claimed.turn_index, 1);
         assert_eq!(claimed.attempt_count, 0);
 
-        let row = load_turn_state(&store.pool, claimed.id).await;
+        let row = load_turn_state(store.pool(), claimed.id).await;
         assert_eq!(row.status, IngestTurnStatus::Processing);
         assert!(row.processing_started_at.is_some());
         assert!(row.next_attempt_at.is_some());
@@ -1958,7 +2609,7 @@ mod tests {
         .bind("2026-03-05T00:00:02Z")
         .bind("2026-03-05T00:00:02Z")
         .bind(first.id)
-        .execute(&store.pool)
+        .execute(store.pool())
         .await
         .expect("mark first stored");
 
@@ -1982,7 +2633,7 @@ mod tests {
         let ignored_projection = projection_json("ignored question", "ignored answer");
         let current_projection = projection_json("current question", "current answer");
         insert_turn_row(
-            &store.pool,
+            store.pool(),
             "session-history",
             1,
             IngestTurnStatus::Stored,
@@ -1995,7 +2646,7 @@ mod tests {
         )
         .await;
         insert_turn_row(
-            &store.pool,
+            store.pool(),
             "session-history",
             2,
             IngestTurnStatus::Stored,
@@ -2008,7 +2659,7 @@ mod tests {
         )
         .await;
         insert_turn_row(
-            &store.pool,
+            store.pool(),
             "session-history",
             3,
             IngestTurnStatus::Finalized,
@@ -2021,7 +2672,7 @@ mod tests {
         )
         .await;
         let current_id = insert_turn_row(
-            &store.pool,
+            store.pool(),
             "session-history",
             4,
             IngestTurnStatus::Processing,
@@ -2061,7 +2712,7 @@ mod tests {
         let second_stored_projection = projection_json("stored question 2", "stored answer 2");
         let current_projection = projection_json("current question", "current answer");
         insert_turn_row(
-            &store.pool,
+            store.pool(),
             "session-history-limited",
             1,
             IngestTurnStatus::Stored,
@@ -2074,7 +2725,7 @@ mod tests {
         )
         .await;
         insert_turn_row(
-            &store.pool,
+            store.pool(),
             "session-history-limited",
             2,
             IngestTurnStatus::Stored,
@@ -2087,7 +2738,7 @@ mod tests {
         )
         .await;
         let current_id = insert_turn_row(
-            &store.pool,
+            store.pool(),
             "session-history-limited",
             3,
             IngestTurnStatus::Processing,
@@ -2150,7 +2801,7 @@ mod tests {
             .expect("send retryable failure");
         run.await.expect("join").expect("dispatcher result");
 
-        let row = load_turn_state(&store.pool, request.turn_id).await;
+        let row = load_turn_state(store.pool(), request.turn_id).await;
         assert_eq!(row.status, IngestTurnStatus::Finalized);
         assert_eq!(row.attempt_count, 1);
         assert_eq!(
@@ -2282,13 +2933,17 @@ mod tests {
     }
 
     async fn open_file_pool(db_path: &Path) -> SqlitePool {
+        open_file_pool_with_busy_timeout(db_path, SQLITE_BUSY_TIMEOUT_MS).await
+    }
+
+    async fn open_file_pool_with_busy_timeout(db_path: &Path, busy_timeout_ms: &str) -> SqlitePool {
         let connection_string = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
         let options = SqliteConnectOptions::from_str(&connection_string)
             .expect("sqlite options")
             .create_if_missing(true)
             .pragma("journal_mode", "WAL")
             .pragma("synchronous", "NORMAL")
-            .pragma("busy_timeout", SQLITE_BUSY_TIMEOUT_MS)
+            .pragma("busy_timeout", busy_timeout_ms.to_string())
             .pragma("foreign_keys", "ON")
             .pragma("mmap_size", SQLITE_MMAP_SIZE_BYTES);
 
@@ -2297,6 +2952,18 @@ mod tests {
             .connect_with(options)
             .await
             .expect("file pool")
+    }
+
+    async fn wait_for_write_attempts(
+        write_attempts: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+        expected: usize,
+    ) {
+        for _ in 0..expected {
+            timeout(Duration::from_secs(1), write_attempts.recv())
+                .await
+                .expect("write attempt timeout")
+                .expect("write attempt");
+        }
     }
 
     async fn load_table_sql(pool: &SqlitePool, table_name: &str) -> String {
@@ -2366,6 +3033,35 @@ mod tests {
         }
     }
 
+    fn external_hard_assistant_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        text: &str,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "Stop".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::Hard,
+                body: FragmentBody::AssistantMessage {
+                    text: text.to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id, "turn_id": turn_id}),
+        }
+    }
+
     fn user_envelope(
         conversation_id: &str,
         fragment_id: &str,
@@ -2395,6 +3091,113 @@ mod tests {
         }
     }
 
+    fn external_user_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        text: &str,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "UserPromptSubmit".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::UserMessage {
+                    text: text.to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id, "turn_id": turn_id}),
+        }
+    }
+
+    fn external_tool_call_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "PreToolUse".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::ToolCall {
+                    name: tool_name.to_string(),
+                    input_json: serde_json::to_string(&input).expect("tool input json"),
+                    tool_use_id: Some(tool_use_id.to_string()),
+                },
+            },
+            raw: json!({
+                "session_id": conversation_id,
+                "turn_id": turn_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_input": input
+            }),
+        }
+    }
+
+    fn external_tool_result_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: serde_json::Value,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "PostToolUse".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::ToolResult {
+                    name: tool_name.to_string(),
+                    output_json: serde_json::to_string(&output).expect("tool output json"),
+                    tool_use_id: Some(tool_use_id.to_string()),
+                },
+            },
+            raw: json!({
+                "session_id": conversation_id,
+                "turn_id": turn_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_response": output
+            }),
+        }
+    }
+
     fn projection_json(user_message: &str, assistant_reply: &str) -> String {
         serde_json::to_string(&MemoryProjection {
             user_message: user_message.to_string(),
@@ -2416,9 +3219,56 @@ mod tests {
         processing_started_at: Option<&str>,
         attempt_count: i64,
     ) -> i64 {
+        insert_turn_row_with_external_id(
+            pool,
+            conversation_id,
+            None,
+            turn_index,
+            status,
+            projection_json,
+            next_attempt_at,
+            stored_at,
+            finalized_at,
+            processing_started_at,
+            attempt_count,
+        )
+        .await
+    }
+
+    async fn insert_memory_note(db: &MemoryDb, content: &str) -> i64 {
+        let mut tx = db.begin().await.expect("begin memory transaction");
+        let memory_id = db
+            .insert_memory(
+                &mut *tx,
+                content,
+                "2026-03-05T00:00:00Z",
+                "context",
+                "[]",
+                "[]",
+            )
+            .await
+            .expect("insert memory note");
+        tx.commit().await.expect("commit memory note");
+        memory_id
+    }
+
+    async fn insert_turn_row_with_external_id(
+        pool: &SqlitePool,
+        conversation_id: &str,
+        external_turn_id: Option<&str>,
+        turn_index: i64,
+        status: IngestTurnStatus,
+        projection_json: &str,
+        next_attempt_at: Option<&str>,
+        stored_at: Option<&str>,
+        finalized_at: Option<&str>,
+        processing_started_at: Option<&str>,
+        attempt_count: i64,
+    ) -> i64 {
         let result = sqlx::query(
             "INSERT INTO ingest_turns (
                 conversation_id,
+                external_turn_id,
                 turn_index,
                 status,
                 projection_json,
@@ -2431,9 +3281,10 @@ mod tests {
                 next_attempt_at,
                 processing_started_at,
                 stored_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(conversation_id)
+        .bind(external_turn_id)
         .bind(turn_index)
         .bind(status)
         .bind(projection_json)
@@ -2462,6 +3313,33 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("turn state")
+    }
+
+    async fn turn_count_for_conversation(pool: &SqlitePool, conversation_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await
+            .expect("turn count")
+    }
+
+    async fn mark_processing_turn_stored(pool: &SqlitePool, turn_id: i64) {
+        sqlx::query(
+            "UPDATE ingest_turns
+             SET status = 'stored',
+                 last_error = NULL,
+                 next_attempt_at = NULL,
+                 processing_started_at = NULL,
+                 stored_at = ?,
+                 updated_at = ?
+             WHERE id = ? AND status = 'processing'",
+        )
+        .bind("2026-03-05T00:00:05Z")
+        .bind("2026-03-05T00:00:05Z")
+        .bind(turn_id)
+        .execute(pool)
+        .await
+        .expect("mark turn stored");
     }
 
     async fn recv_store_request(

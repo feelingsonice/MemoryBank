@@ -155,8 +155,8 @@ mod tests {
     fn render_agents_summary_handles_empty_and_multiple_values() {
         assert_eq!(render_agents_summary(&[]), "none selected");
         assert_eq!(
-            render_agents_summary(&[AgentKind::ClaudeCode, AgentKind::OpenClaw]),
-            "Claude Code, OpenClaw"
+            render_agents_summary(&[AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::OpenClaw]),
+            "Claude Code, Codex, OpenClaw"
         );
     }
 }

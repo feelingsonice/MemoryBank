@@ -343,6 +343,14 @@ impl Drop for HealthzServer {
     }
 }
 
+fn unused_local_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0))
+        .expect("bind unused local port")
+        .local_addr()
+        .expect("unused local addr")
+        .port()
+}
+
 fn write_shim(path: &Path, contents: &str) {
     fs::write(path, contents).expect("shim file");
     #[cfg(unix)]
@@ -480,6 +488,7 @@ fn mb_help_for_namespace_service_and_config_includes_examples_and_guidance() {
             "Configuration is stored in `~/.memory_bank/settings.toml`.",
             "service.port",
             "server.llm_provider",
+            "integrations.codex.configured",
             "integrations.openclaw.configured",
             "Default namespace: default",
             "server.llm_provider: anthropic | gemini | open-ai | ollama",
@@ -593,6 +602,32 @@ fn mb_config_round_trips_values_through_the_binary() {
 }
 
 #[test]
+fn mb_config_round_trips_codex_integration_and_renders_it_in_show() {
+    let harness = MbHarness::new();
+
+    let set_codex = harness.run(&["config", "set", "integrations.codex.configured", "true"]);
+    assert!(set_codex.status.success(), "{}", stderr_string(&set_codex));
+    assert_contains_all(
+        &stdout_string(&set_codex),
+        &[
+            "Updated `integrations.codex.configured`.",
+            "Old value: false",
+            "New value: true",
+        ],
+    );
+
+    let get_codex = harness.run(&["config", "get", "integrations.codex.configured"]);
+    assert!(get_codex.status.success(), "{}", stderr_string(&get_codex));
+    assert_eq!(stdout_string(&get_codex).trim(), "true");
+
+    let show = harness.run(&["config", "show"]);
+    assert!(show.status.success(), "{}", stderr_string(&show));
+    let rendered = stdout_string(&show);
+    assert!(rendered.contains("[integrations.codex]"));
+    assert!(rendered.contains("configured = true"));
+}
+
+#[test]
 fn mb_config_set_fastembed_model_requires_confirmation_without_yes() {
     let harness = MbHarness::new();
 
@@ -633,6 +668,37 @@ fn mb_config_set_fastembed_model_accepts_yes_flag() {
             "Old value: jinaai/jina-embeddings-v2-base-code",
             "New value: custom/embed-model",
             "rebuild the vector index and re-encode existing memories",
+        ],
+    );
+}
+
+#[test]
+fn mb_status_reports_codex_integration_state() {
+    let harness = MbHarness::new();
+    let unavailable_port = unused_local_port();
+
+    let set_port = harness.run(&[
+        "config",
+        "set",
+        "service.port",
+        &unavailable_port.to_string(),
+    ]);
+    assert!(set_port.status.success(), "{}", stderr_string(&set_port));
+
+    let set_codex = harness.run(&["config", "set", "integrations.codex.configured", "true"]);
+    assert!(set_codex.status.success(), "{}", stderr_string(&set_codex));
+
+    let status = harness.run(&["status"]);
+    assert!(status.status.success(), "{}", stderr_string(&status));
+    assert_contains_all(
+        &stdout_string(&status),
+        &[
+            "Integrations",
+            "Codex: yes",
+            "Claude Code: no",
+            "Gemini CLI: no",
+            "OpenCode: no",
+            "OpenClaw: no",
         ],
     );
 }
@@ -913,6 +979,15 @@ fn mb_service_status_shows_runtime_summary_when_health_is_available() {
 fn mb_status_reports_reindexing_when_service_is_active_but_not_healthy() {
     let harness = MbHarness::new();
     harness.seed_service_binary_placeholders();
+    let unavailable_port = unused_local_port();
+
+    let set_port = harness.run(&[
+        "config",
+        "set",
+        "service.port",
+        &unavailable_port.to_string(),
+    ]);
+    assert!(set_port.status.success(), "{}", stderr_string(&set_port));
 
     let install = harness.run(&["service", "install"]);
     assert!(install.status.success(), "{}", stderr_string(&install));

@@ -17,6 +17,7 @@ mod startup_state;
 
 use crate::actor::MemoryActor;
 use crate::config::ServeConfig;
+use crate::db::SqliteRuntime;
 use crate::http_server::{HealthResponse, HttpServer};
 use crate::ingest::IngestService;
 use crate::startup_state::StartupStateTracker;
@@ -64,10 +65,19 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
         db_path = %dirs.db.display(),
         llm_model = %llm.model_id,
         encoder_model = %encoder.model_id,
+        "Opening shared SQLite runtime",
+    );
+    let sqlite_runtime = SqliteRuntime::open(&dirs.db).await?;
+
+    info!(
+        db_path = %dirs.db.display(),
+        llm_model = %llm.model_id,
+        encoder_model = %encoder.model_id,
         "Opening memory database",
     );
     let startup_state = StartupStateTracker::new(dirs.startup_state.clone(), namespace.to_string());
-    let db = db::MemoryDb::open(
+    let db = db::MemoryDb::open_with_runtime(
+        sqlite_runtime.clone(),
         &dirs.db,
         &llm.model_id,
         &encoder.model_id,
@@ -84,7 +94,13 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
         MemoryActor::spawn(db, llm.client, encoder.client, nearest_neighbor_count);
 
     info!(db_path = %dirs.db.display(), "Opening durable ingest service");
-    let ingest = IngestService::open(&dirs.db, memory_handle.clone(), history_window_size).await?;
+    let ingest = IngestService::open_with_runtime(
+        sqlite_runtime,
+        &dirs.db,
+        memory_handle.clone(),
+        history_window_size,
+    )
+    .await?;
 
     let health = HealthResponse {
         ok: true,

@@ -119,7 +119,8 @@ Check:
 
 Agent-specific capture notes:
 
-- Claude Code and Gemini CLI need their Memory Bank hooks loaded.
+- Codex, Claude Code, and Gemini CLI need their Memory Bank hooks loaded.
+- Codex tool-call and tool-result capture is currently limited to Bash because current Codex `PreToolUse` and `PostToolUse` events only emit for `Bash`.
 - OpenCode capture is plugin-based.
 - OpenClaw capture is extension-based and recall goes through the stdio proxy.
 
@@ -129,6 +130,7 @@ If recall works but nothing new is being stored, the capture side is the first t
 
 First confirm the MCP side is loaded:
 
+- Codex: use `/mcp` in the Codex TUI, or inspect `~/.codex/config.toml`
 - Claude Code: use `/mcp`
 - Gemini CLI: check `gemini mcp list`
 - OpenCode: check `opencode mcp list`
@@ -138,7 +140,7 @@ Then ask the agent explicitly to call `retrieve_memory` as part of a smoke test.
 
 ## I Need To Inspect Or Undo Config Changes
 
-When `mb setup` rewrites JSON-based agent config files, it makes backups first.
+When `mb setup` rewrites JSON- or TOML-based agent config files, it makes backups first.
 
 Look for:
 
@@ -151,6 +153,7 @@ If something looks stale or inconsistent, rerun `mb setup` before hand-editing m
 
 Use the agent-specific guide for the integration you are using:
 
+- [Codex](./codex.md)
 - [Claude Code](./claude-code.md)
 - [Gemini CLI](./gemini-cli.md)
 - [OpenCode](./opencode.md)

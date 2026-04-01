@@ -15,6 +15,7 @@ mod output;
 mod real_binary_tests;
 mod service;
 mod setup;
+mod toml_config;
 
 use clap::Parser;
 use cli::{Cli, Command, InternalCommand};
