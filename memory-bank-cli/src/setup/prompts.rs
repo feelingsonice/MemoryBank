@@ -100,21 +100,23 @@ pub(super) fn collect_setup_plan(
         prompt_namespace(settings.active_namespace()).and_then(WizardStep::into_result)?;
 
     print_setup_section("LLM configuration");
-    let provider = prompt_provider(
-        settings
-            .server
-            .as_ref()
-            .and_then(|server| server.llm_provider.as_deref()),
-    )
-    .and_then(WizardStep::into_result)?;
+    let current_provider = settings
+        .server
+        .as_ref()
+        .and_then(|server| server.llm_provider.as_deref());
+    let provider = prompt_provider(current_provider).and_then(WizardStep::into_result)?;
     let current_ollama_url = settings
         .server
         .as_ref()
         .and_then(|server| server.ollama_url.as_deref());
-    let current_model = settings
-        .server
-        .as_ref()
-        .and_then(|server| server.llm_model.as_deref());
+    let current_model = saved_model_for_selected_provider(
+        current_provider,
+        provider,
+        settings
+            .server
+            .as_ref()
+            .and_then(|server| server.llm_model.as_deref()),
+    );
     let (ollama_url, model) = if provider == ProviderId::Ollama {
         let ollama_url = prompt_ollama_url(current_ollama_url).and_then(WizardStep::into_result)?;
         let model = prompt_ollama_model(current_model, &ollama_url, model_catalog)
@@ -188,20 +190,37 @@ fn prompt_namespace(current: Namespace) -> Result<WizardStep<Namespace>, AppErro
 }
 
 fn prompt_provider(current: Option<&str>) -> Result<WizardStep<ProviderId>, AppError> {
+    let current_provider = ProviderId::from_config_value(current);
     let options = ProviderId::ALL.to_vec();
+    let help_message = provider_prompt_help(current_provider);
     let default_index = options
         .iter()
-        .position(|choice| *choice == ProviderId::from_config_value(current))
+        .position(|choice| *choice == current_provider)
         .unwrap_or(0);
     Ok(WizardStep::from_option(
         Select::new("LLM provider:", options)
             .with_starting_cursor(default_index)
             .with_page_size(4)
-            .with_help_message(
-                "This powers Memory Bank's internal memory analysis, not the coding agent you use directly.",
-            )
+            .with_help_message(&help_message)
             .prompt_skippable()?,
     ))
+}
+
+fn provider_prompt_help(current_provider: ProviderId) -> String {
+    format!(
+        "Currently configured: {}. This powers Memory Bank's internal memory analysis, not the coding agent you use directly.",
+        current_provider
+    )
+}
+
+fn saved_model_for_selected_provider<'a>(
+    current_provider: Option<&str>,
+    selected_provider: ProviderId,
+    current_model: Option<&'a str>,
+) -> Option<&'a str> {
+    (ProviderId::from_config_value(current_provider) == selected_provider)
+        .then_some(current_model)
+        .flatten()
 }
 
 fn prompt_ollama_url(current: Option<&str>) -> Result<WizardStep<String>, AppError> {
@@ -588,6 +607,34 @@ mod tests {
     #[test]
     fn no_supported_agents_message_mentions_codex() {
         assert!(NO_SUPPORTED_AGENTS_MESSAGE.contains("Codex"));
+    }
+
+    #[test]
+    fn provider_prompt_help_mentions_current_provider() {
+        let help = provider_prompt_help(ProviderId::Ollama);
+
+        assert!(help.contains("Currently configured: Ollama"));
+        assert!(help.contains("internal memory analysis"));
+    }
+
+    #[test]
+    fn saved_model_is_only_reused_when_provider_matches() {
+        assert_eq!(
+            saved_model_for_selected_provider(
+                Some("ollama"),
+                ProviderId::Ollama,
+                Some("qwen3.5:35b-a3b-coding-nvfp4")
+            ),
+            Some("qwen3.5:35b-a3b-coding-nvfp4")
+        );
+        assert_eq!(
+            saved_model_for_selected_provider(
+                Some("ollama"),
+                ProviderId::OpenAi,
+                Some("qwen3.5:35b-a3b-coding-nvfp4")
+            ),
+            None
+        );
     }
 
     #[test]
