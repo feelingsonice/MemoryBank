@@ -131,6 +131,24 @@ impl From<&FragmentBody> for IngestFragmentKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(rename_all = "snake_case")]
+enum StoredTerminality {
+    None,
+    Soft,
+    Hard,
+}
+
+impl StoredTerminality {
+    const fn into_terminality(self) -> Terminality {
+        match self {
+            Self::None => Terminality::None,
+            Self::Soft => Terminality::Soft,
+            Self::Hard => Terminality::Hard,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IngestOutcome {
     pub agent: String,
@@ -339,23 +357,19 @@ impl IngestStore {
             return Ok(staged_fragment_from_existing(existing));
         }
 
-        let reduced = self.rebuild_projection(&mut tx, turn.id).await?;
-        let finalized = reduced.terminality == Terminality::Hard;
-        let turn_status = if finalized {
-            IngestTurnStatus::Finalized
+        let finalized = if envelope.fragment.terminality == Terminality::Hard {
+            let reduced = self.rebuild_projection(&mut tx, turn.id).await?;
+            self.update_turn_after_reduce(&mut tx, turn.id, reduced, &now)
+                .await?
         } else {
-            IngestTurnStatus::Open
+            let terminality = merge_terminality(
+                turn.terminality.into_terminality(),
+                envelope.fragment.terminality,
+            );
+            self.update_open_turn_after_insert(&mut tx, turn.id, terminality, &now)
+                .await?;
+            false
         };
-        sqlx::query(UPDATE_TURN_AFTER_REDUCE_SQL)
-            .bind(serde_json::to_string(&reduced.projection)?)
-            .bind(reduced.terminality.as_str())
-            .bind(turn_status)
-            .bind(if finalized { Some(now.as_str()) } else { None })
-            .bind(if finalized { Some(now.as_str()) } else { None })
-            .bind(&now)
-            .bind(turn.id)
-            .execute(&mut *tx)
-            .await?;
 
         tx.commit().await?;
 
@@ -444,6 +458,56 @@ impl IngestStore {
             projection,
             terminality,
         })
+    }
+
+    async fn update_open_turn_after_insert(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Sqlite>,
+        turn_id: i64,
+        terminality: Terminality,
+        now: &str,
+    ) -> Result<(), IngestError> {
+        let result = sqlx::query(UPDATE_OPEN_TURN_AFTER_INSERT_SQL)
+            .bind(terminality.as_str())
+            .bind(now)
+            .bind(turn_id)
+            .bind(IngestTurnStatus::Open)
+            .execute(&mut **tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::RowNotFound.into());
+        }
+        Ok(())
+    }
+
+    async fn update_turn_after_reduce(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Sqlite>,
+        turn_id: i64,
+        reduced: ReducedProjection,
+        now: &str,
+    ) -> Result<bool, IngestError> {
+        let finalized = reduced.terminality == Terminality::Hard;
+        let turn_status = if finalized {
+            IngestTurnStatus::Finalized
+        } else {
+            IngestTurnStatus::Open
+        };
+        let result = sqlx::query(UPDATE_TURN_AFTER_REDUCE_SQL)
+            .bind(serde_json::to_string(&reduced.projection)?)
+            .bind(reduced.terminality.as_str())
+            .bind(turn_status)
+            .bind(if finalized { Some(now) } else { None })
+            .bind(if finalized { Some(now) } else { None })
+            .bind(now)
+            .bind(turn_id)
+            .bind(IngestTurnStatus::Open)
+            .execute(&mut **tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::RowNotFound.into());
+        }
+        Ok(finalized)
     }
 
     async fn claim_next_due_turn(&self, now: &str) -> Result<Option<ClaimedTurnRow>, sqlx::Error> {
@@ -673,6 +737,7 @@ impl IngestStore {
         Ok(TurnRef {
             id: turn_id,
             turn_index,
+            terminality: StoredTerminality::None,
         })
     }
 
@@ -1031,6 +1096,7 @@ struct StagedFragment {
 struct TurnRef {
     id: i64,
     turn_index: i64,
+    terminality: StoredTerminality,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1038,6 +1104,7 @@ struct ExternalTurnRef {
     id: i64,
     turn_index: i64,
     status: IngestTurnStatus,
+    terminality: StoredTerminality,
 }
 
 impl ExternalTurnRef {
@@ -1045,6 +1112,7 @@ impl ExternalTurnRef {
         TurnRef {
             id: self.id,
             turn_index: self.turn_index,
+            terminality: self.terminality,
         }
     }
 }
@@ -1141,6 +1209,14 @@ fn append_message_fragment(target: &mut String, fragment: String) {
 
     target.push_str("\n\n");
     target.push_str(&fragment);
+}
+
+const fn merge_terminality(current: Terminality, next: Terminality) -> Terminality {
+    if next.rank() > current.rank() {
+        next
+    } else {
+        current
+    }
 }
 
 fn compute_next_attempt_at(attempt_count: i64) -> String {
@@ -1301,11 +1377,11 @@ const CREATE_INGEST_FRAGMENTS_CONVERSATION_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ingest_fragments_conversation
     ON ingest_fragments (conversation_id, turn_id, id);";
 
-const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index, status
+const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index, status, terminality
     FROM ingest_turns
     WHERE conversation_id = ? AND external_turn_id = ?
     LIMIT 1;";
-const SELECT_OPEN_TURN_SQL: &str = "SELECT id, turn_index
+const SELECT_OPEN_TURN_SQL: &str = "SELECT id, turn_index, terminality
     FROM ingest_turns
     WHERE conversation_id = ? AND status = ? AND external_turn_id IS NULL
     LIMIT 1;";
@@ -1356,6 +1432,11 @@ const SELECT_TURN_FRAGMENTS_SQL: &str = "SELECT fragment_json
     WHERE turn_id = ?
     ORDER BY CASE WHEN sequence_hint IS NULL THEN 1 ELSE 0 END, sequence_hint, id;";
 
+const UPDATE_OPEN_TURN_AFTER_INSERT_SQL: &str = "UPDATE ingest_turns
+    SET terminality = ?,
+        updated_at = ?
+    WHERE id = ? AND status = ?;";
+
 const UPDATE_TURN_AFTER_REDUCE_SQL: &str = "UPDATE ingest_turns
     SET projection_json = ?,
         terminality = ?,
@@ -1366,7 +1447,7 @@ const UPDATE_TURN_AFTER_REDUCE_SQL: &str = "UPDATE ingest_turns
         processing_started_at = NULL,
         stored_at = NULL,
         updated_at = ?
-    WHERE id = ?;";
+    WHERE id = ? AND status = ?;";
 
 const CLAIM_NEXT_DUE_TURN_SQL: &str = "UPDATE ingest_turns
     SET status = ?,
@@ -1504,8 +1585,8 @@ mod tests {
     use super::{
         ClaimedTurnRow, INGEST_FRAGMENTS_SCHEMA_REQUIREMENTS, INGEST_TURNS_SCHEMA_REQUIREMENTS,
         IngestDispatcher, IngestFragmentKind, IngestService, IngestStore, IngestTurnStatus,
-        SELECT_TABLE_SCHEMA_SQL, Terminality, apply_fragment_to_projection, compact_sql,
-        should_retry_stage_error, validate_runtime_constraints,
+        SELECT_TABLE_SCHEMA_SQL, StoredTerminality, Terminality, apply_fragment_to_projection,
+        compact_sql, should_retry_stage_error, validate_runtime_constraints,
     };
     use crate::actor::{
         MemoryHandle, ProcessTurnError, RetryableProcessTurnError, TestStoreTurnRequest,
@@ -1578,6 +1659,14 @@ mod tests {
         next_attempt_at: Option<String>,
         processing_started_at: Option<String>,
         stored_at: Option<String>,
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct TurnProjectionRow {
+        id: i64,
+        status: IngestTurnStatus,
+        terminality: StoredTerminality,
+        projection_json: String,
     }
 
     #[test]
@@ -1878,24 +1967,34 @@ mod tests {
                 .expect("turn count");
         assert_eq!(turn_count, 1);
 
-        let projection_json: String = sqlx::query_scalar(
-            "SELECT projection_json
-             FROM ingest_turns
-             WHERE conversation_id = ? AND external_turn_id = ?
-             LIMIT 1",
-        )
-        .bind("session-concurrent")
-        .bind("turn-1")
-        .fetch_one(store.pool())
-        .await
-        .expect("projection json");
-        let projection: MemoryProjection =
-            serde_json::from_str(&projection_json).expect("projection");
+        let turn = load_turn_projection_row(store.pool(), "session-concurrent", "turn-1").await;
+        assert_eq!(turn.status, IngestTurnStatus::Open);
+        assert_eq!(turn.terminality.into_terminality(), Terminality::None);
 
-        assert_eq!(projection.user_message, "hello");
-        assert!(projection.assistant_reply.is_empty());
+        let fragment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_fragments WHERE turn_id = ?")
+                .bind(turn.id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fragment count");
+        assert_eq!(fragment_count, 2);
+
+        let mut tx = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin replay transaction");
+        let reduced = store
+            .rebuild_projection(&mut tx, turn.id)
+            .await
+            .expect("rebuild projection");
+        tx.rollback().await.expect("rollback replay transaction");
+
+        assert_eq!(reduced.terminality, Terminality::None);
+        assert_eq!(reduced.projection.user_message, "hello");
+        assert!(reduced.projection.assistant_reply.is_empty());
         assert_eq!(
-            projection.steps,
+            reduced.projection.steps,
             vec![MemoryStep::ToolCall {
                 name: "Bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
@@ -2157,6 +2256,16 @@ mod tests {
                 .await
                 .expect("turn count");
         assert_eq!(turn_count, 1);
+
+        let turn = load_turn_projection_row(store.pool(), "session-external", "turn-1").await;
+        assert_eq!(turn.status, IngestTurnStatus::Finalized);
+        assert_eq!(turn.terminality.into_terminality(), Terminality::Hard);
+
+        let projection: MemoryProjection =
+            serde_json::from_str(&turn.projection_json).expect("finalized projection");
+        assert_eq!(projection.user_message, "hello");
+        assert_eq!(projection.assistant_reply, "done");
+        assert!(projection.steps.is_empty());
     }
 
     #[tokio::test]
@@ -2187,6 +2296,28 @@ mod tests {
 
         assert_eq!(first.turn_index, 1);
         assert_eq!(second.turn_index, 2);
+    }
+
+    #[tokio::test]
+    async fn soft_terminality_keeps_turn_open_and_updates_turn_metadata() {
+        let db_path = test_db_path("soft_terminality_metadata");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        let mut envelope = external_user_envelope("session-soft", "turn-1", "fragment-1", "hello");
+        envelope.fragment.terminality = Terminality::Soft;
+
+        let staged = store
+            .stage_fragment(&envelope)
+            .await
+            .expect("stage soft-terminal fragment");
+
+        assert!(!staged.finalized);
+
+        let turn = load_turn_projection_row(store.pool(), "session-soft", "turn-1").await;
+        assert_eq!(turn.status, IngestTurnStatus::Open);
+        assert_eq!(turn.terminality.into_terminality(), Terminality::Soft);
     }
 
     #[tokio::test]
@@ -3301,6 +3432,24 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("turn state")
+    }
+
+    async fn load_turn_projection_row(
+        pool: &SqlitePool,
+        conversation_id: &str,
+        external_turn_id: &str,
+    ) -> TurnProjectionRow {
+        sqlx::query_as::<_, TurnProjectionRow>(
+            "SELECT id, status, terminality, projection_json
+             FROM ingest_turns
+             WHERE conversation_id = ? AND external_turn_id = ?
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(external_turn_id)
+        .fetch_one(pool)
+        .await
+        .expect("turn projection row")
     }
 
     async fn turn_count_for_conversation(pool: &SqlitePool, conversation_id: &str) -> i64 {
