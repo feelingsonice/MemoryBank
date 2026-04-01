@@ -1,6 +1,8 @@
 use crate::agents::AgentKind;
 use crate::config::{set_integrations, set_server, set_service};
-use crate::constants::{DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_NEAREST_NEIGHBOR_COUNT};
+use crate::constants::{
+    DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_MAX_PROCESSING_ATTEMPTS, DEFAULT_NEAREST_NEIGHBOR_COUNT,
+};
 use crate::domain::{ProviderId, integration_configured, set_integration_configured};
 use memory_bank_app::{
     AppSettings, DEFAULT_FASTEMBED_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_OLLAMA_URL, DEFAULT_PORT,
@@ -25,6 +27,7 @@ pub(super) struct AdvancedSettings {
     pub(super) fastembed_model: String,
     pub(super) history_window_size: u32,
     pub(super) nearest_neighbor_count: i32,
+    pub(super) max_processing_attempts: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,9 @@ impl AdvancedSettings {
             nearest_neighbor_count: server
                 .and_then(|server| server.nearest_neighbor_count)
                 .unwrap_or(DEFAULT_NEAREST_NEIGHBOR_COUNT),
+            max_processing_attempts: server
+                .and_then(|server| server.max_processing_attempts)
+                .unwrap_or(DEFAULT_MAX_PROCESSING_ATTEMPTS),
         }
     }
 
@@ -57,6 +63,7 @@ impl AdvancedSettings {
             || self.fastembed_model != DEFAULT_FASTEMBED_MODEL
             || self.history_window_size != DEFAULT_HISTORY_WINDOW_SIZE
             || self.nearest_neighbor_count != DEFAULT_NEAREST_NEIGHBOR_COUNT
+            || self.max_processing_attempts != DEFAULT_MAX_PROCESSING_ATTEMPTS
     }
 
     pub(super) fn override_lines(&self) -> Vec<String> {
@@ -74,6 +81,12 @@ impl AdvancedSettings {
             lines.push(format!(
                 "Nearest neighbor count: {}",
                 self.nearest_neighbor_count
+            ));
+        }
+        if self.max_processing_attempts != DEFAULT_MAX_PROCESSING_ATTEMPTS {
+            lines.push(format!(
+                "Max processing attempts: {}",
+                self.max_processing_attempts
             ));
         }
         lines
@@ -144,6 +157,9 @@ pub(super) fn build_settings_for_plan(
     server.nearest_neighbor_count = (plan.advanced.nearest_neighbor_count
         != DEFAULT_NEAREST_NEIGHBOR_COUNT)
         .then_some(plan.advanced.nearest_neighbor_count);
+    server.max_processing_attempts = (plan.advanced.max_processing_attempts
+        != DEFAULT_MAX_PROCESSING_ATTEMPTS)
+        .then_some(plan.advanced.max_processing_attempts);
     set_server(&mut settings, server);
 
     let mut integrations = current.integrations.clone().unwrap_or_default();
@@ -182,6 +198,10 @@ mod tests {
             advanced.nearest_neighbor_count,
             DEFAULT_NEAREST_NEIGHBOR_COUNT
         );
+        assert_eq!(
+            advanced.max_processing_attempts,
+            DEFAULT_MAX_PROCESSING_ATTEMPTS
+        );
         assert!(!advanced.has_overrides());
     }
 
@@ -201,6 +221,7 @@ mod tests {
                 fastembed_model: "custom/embed-model".to_string(),
                 history_window_size: 25,
                 nearest_neighbor_count: 15,
+                max_processing_attempts: 12,
             },
         };
 
@@ -220,6 +241,7 @@ mod tests {
         );
         assert_eq!(server.history_window_size, Some(25));
         assert_eq!(server.nearest_neighbor_count, Some(15));
+        assert_eq!(server.max_processing_attempts, Some(12));
         assert_eq!(server.ollama_url, None);
         assert_eq!(
             integrations.opencode.as_ref().map(|state| state.configured),
@@ -380,5 +402,21 @@ mod tests {
             },
         );
         assert_eq!(secrets.get("ANTHROPIC_API_KEY"), Some("updated"));
+    }
+
+    #[test]
+    fn advanced_override_lines_include_max_processing_attempts() {
+        let advanced = AdvancedSettings {
+            port: DEFAULT_PORT,
+            fastembed_model: DEFAULT_FASTEMBED_MODEL.to_string(),
+            history_window_size: DEFAULT_HISTORY_WINDOW_SIZE,
+            nearest_neighbor_count: DEFAULT_NEAREST_NEIGHBOR_COUNT,
+            max_processing_attempts: 14,
+        };
+
+        assert_eq!(
+            advanced.override_lines(),
+            vec!["Max processing attempts: 14".to_string()]
+        );
     }
 }

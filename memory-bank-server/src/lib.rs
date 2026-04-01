@@ -31,6 +31,7 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
         encoder,
         history_window_size,
         nearest_neighbor_count,
+        max_processing_attempts,
         dirs,
     } = config;
 
@@ -43,6 +44,7 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
         encoder_provider = %encoder,
         history_window_size,
         nearest_neighbor_count,
+        max_processing_attempts,
         data_dir = %dirs.data.display(),
         db_path = %dirs.db.display(),
         models_dir = %dirs.models.display(),
@@ -94,11 +96,12 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
         MemoryActor::spawn(db, llm.client, encoder.client, nearest_neighbor_count);
 
     info!(db_path = %dirs.db.display(), "Opening durable ingest service");
-    let ingest = IngestService::open_with_runtime(
+    let ingest = IngestService::open_with_runtime_and_max_processing_attempts(
         sqlite_runtime,
         &dirs.db,
         memory_handle.clone(),
         history_window_size,
+        max_processing_attempts,
     )
     .await?;
 

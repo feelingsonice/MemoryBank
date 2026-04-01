@@ -126,6 +126,26 @@ Agent-specific capture notes:
 
 If recall works but nothing new is being stored, the capture side is the first thing to inspect.
 
+## Finalized Turns Keep Retrying Or Become `exhausted`
+
+Retryable memory-processing failures now stop after a capped number of attempts instead of retrying forever. The default cap is `10`.
+
+You can change it with:
+
+- `mb config set server.max_processing_attempts <N>`
+- `mb setup` -> Advanced settings
+- or the lower-level server setting / env if you run `memory-bank-server` directly
+
+When a turn reaches that cap, Memory Bank marks it `exhausted`. That turn will not be retried again, and later turns in the same conversation are allowed to continue.
+
+If you are using a slow local provider such as Ollama, lowering prompt size or increasing model throughput is still the best fix. The retry cap is a guardrail, not a substitute for a healthy provider setup.
+
+## Server Fails To Open After Upgrading With An Ingest Schema Error
+
+The ingest retry-cap change adds a new `exhausted` turn status to the SQLite schema.
+
+There is no automatic migration for existing ingest databases. If startup fails with an unsupported ingest schema error, recreate the namespace database or migrate it externally, then start the service again.
+
 ## The Agent Never Calls `retrieve_memory`
 
 First confirm the MCP side is loaded:

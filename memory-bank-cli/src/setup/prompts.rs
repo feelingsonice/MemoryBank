@@ -554,11 +554,29 @@ fn prompt_advanced_settings(
     )
     .into_result()?;
 
+    let max_processing_attempts = WizardStep::from_option(
+        CustomType::<u32>::new("Max processing attempts")
+            .with_default(current.max_processing_attempts)
+            .with_help_message(
+                "How many retryable finalized-turn processing failures Memory Bank will allow before marking the turn exhausted.",
+            )
+            .with_validator(|value: &u32| {
+                Ok(if *value >= 1 {
+                    Validation::Valid
+                } else {
+                    Validation::Invalid("Max processing attempts must be at least 1".into())
+                })
+            })
+            .prompt_skippable()?,
+    )
+    .into_result()?;
+
     Ok(WizardStep::Continue(AdvancedSettings {
         port,
         fastembed_model,
         history_window_size,
         nearest_neighbor_count,
+        max_processing_attempts,
     }))
 }
 

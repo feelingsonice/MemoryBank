@@ -1,6 +1,8 @@
 use crate::AppError;
 use crate::agents::AgentKind;
-use crate::constants::{DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_NEAREST_NEIGHBOR_COUNT};
+use crate::constants::{
+    DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_MAX_PROCESSING_ATTEMPTS, DEFAULT_NEAREST_NEIGHBOR_COUNT,
+};
 use crate::domain::{
     EncoderProviderId, ProviderId, integration_configured, set_integration_configured,
 };
@@ -24,6 +26,7 @@ enum ConfigKey {
     ServerFastembedModel,
     ServerHistoryWindowSize,
     ServerNearestNeighborCount,
+    ServerMaxProcessingAttempts,
     ServerLocalEncoderUrl,
     ServerRemoteEncoderUrl,
     IntegrationConfigured(AgentKind),
@@ -51,6 +54,7 @@ impl FromStr for ConfigKey {
             "server.fastembed_model" => Ok(Self::ServerFastembedModel),
             "server.history_window_size" => Ok(Self::ServerHistoryWindowSize),
             "server.nearest_neighbor_count" => Ok(Self::ServerNearestNeighborCount),
+            "server.max_processing_attempts" => Ok(Self::ServerMaxProcessingAttempts),
             "server.local_encoder_url" => Ok(Self::ServerLocalEncoderUrl),
             "server.remote_encoder_url" => Ok(Self::ServerRemoteEncoderUrl),
             "integrations.claude_code.configured" => {
@@ -102,6 +106,12 @@ pub(crate) fn get_config_value(settings: &AppSettings, key: &str) -> Result<Stri
             .as_ref()
             .and_then(|server| server.nearest_neighbor_count)
             .unwrap_or(DEFAULT_NEAREST_NEIGHBOR_COUNT)
+            .to_string()),
+        ConfigKey::ServerMaxProcessingAttempts => Ok(settings
+            .server
+            .as_ref()
+            .and_then(|server| server.max_processing_attempts)
+            .unwrap_or(DEFAULT_MAX_PROCESSING_ATTEMPTS)
             .to_string()),
         ConfigKey::ServerLocalEncoderUrl => Ok(settings
             .server
@@ -233,6 +243,21 @@ pub(crate) fn set_config_value(
             let mut server = settings.server.clone().unwrap_or_default();
             server.nearest_neighbor_count =
                 (parsed != DEFAULT_NEAREST_NEIGHBOR_COUNT).then_some(parsed);
+            set_server(settings, server);
+        }
+        ConfigKey::ServerMaxProcessingAttempts => {
+            let parsed: u32 = value.trim().parse::<u32>().map_err(|error| {
+                AppError::InvalidConfigValue(key.to_string(), error.to_string())
+            })?;
+            if parsed < 1 {
+                return Err(AppError::InvalidConfigValue(
+                    key.to_string(),
+                    "must be at least 1".to_string(),
+                ));
+            }
+            let mut server = settings.server.clone().unwrap_or_default();
+            server.max_processing_attempts =
+                (parsed != DEFAULT_MAX_PROCESSING_ATTEMPTS).then_some(parsed);
             set_server(settings, server);
         }
         ConfigKey::ServerLocalEncoderUrl => {
@@ -536,5 +561,55 @@ mod tests {
         let count_error = set_config_value(&mut settings, "server.nearest_neighbor_count", "0")
             .expect_err("invalid count");
         assert!(count_error.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn config_get_uses_default_max_processing_attempts_when_unset() {
+        let settings = AppSettings::default();
+
+        let attempts =
+            get_config_value(&settings, "server.max_processing_attempts").expect("attempts");
+
+        assert_eq!(attempts, DEFAULT_MAX_PROCESSING_ATTEMPTS.to_string());
+    }
+
+    #[test]
+    fn config_set_round_trips_max_processing_attempts_and_clears_default() {
+        let mut settings = AppSettings::default();
+
+        set_config_value(&mut settings, "server.max_processing_attempts", "12")
+            .expect("set attempts");
+        assert_eq!(
+            get_config_value(&settings, "server.max_processing_attempts").expect("get attempts"),
+            "12"
+        );
+        assert_eq!(
+            settings
+                .server
+                .as_ref()
+                .and_then(|server| server.max_processing_attempts),
+            Some(12)
+        );
+
+        set_config_value(
+            &mut settings,
+            "server.max_processing_attempts",
+            &DEFAULT_MAX_PROCESSING_ATTEMPTS.to_string(),
+        )
+        .expect("reset attempts");
+        assert_eq!(
+            get_config_value(&settings, "server.max_processing_attempts").expect("get default"),
+            DEFAULT_MAX_PROCESSING_ATTEMPTS.to_string()
+        );
+        assert!(settings.server.is_none());
+    }
+
+    #[test]
+    fn config_set_rejects_zero_max_processing_attempts() {
+        let mut settings = AppSettings::default();
+
+        let attempts_error = set_config_value(&mut settings, "server.max_processing_attempts", "0")
+            .expect_err("invalid max attempts");
+        assert!(attempts_error.to_string().contains("at least 1"));
     }
 }

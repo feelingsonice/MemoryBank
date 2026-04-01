@@ -713,6 +713,7 @@ mod tests {
                 llm_provider: Some("anthropic".to_string()),
                 llm_model: Some("claude-custom".to_string()),
                 history_window_size: Some(7),
+                max_processing_attempts: Some(12),
                 ..ServerSettings::default()
             }),
             integrations: None,
@@ -738,6 +739,8 @@ mod tests {
             Some("claude-custom")
         );
         assert!(spec.args.contains(&"7".to_string()));
+        assert!(spec.args.contains(&"--max-processing-attempts".to_string()));
+        assert!(spec.args.contains(&"12".to_string()));
     }
 
     #[test]
@@ -898,6 +901,7 @@ mod tests {
                 remote_encoder_url: Some("https://encoder.example.com".to_string()),
                 history_window_size: Some(99),
                 nearest_neighbor_count: Some(15),
+                max_processing_attempts: Some(11),
                 ..ServerSettings::default()
             }),
             ..AppSettings::default()
@@ -934,6 +938,7 @@ mod tests {
         );
         assert!(spec.args.contains(&"4040".to_string()));
         assert!(spec.args.contains(&"15".to_string()));
+        assert!(spec.args.contains(&"11".to_string()));
         assert!(spec.args.contains(&OLLAMA_HISTORY_WINDOW_SIZE.to_string()));
         assert!(!spec.args.contains(&"99".to_string()));
     }
@@ -960,6 +965,32 @@ mod tests {
         let error = build_server_launch_spec(&paths, &settings, &secrets)
             .expect_err("invalid nearest neighbor count");
 
+        assert!(error.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn launch_spec_rejects_invalid_max_processing_attempts() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("ollama".to_string()),
+                max_processing_attempts: Some(0),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let secrets = SecretStore::default();
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let error = build_server_launch_spec(&paths, &settings, &secrets)
+            .expect_err("invalid max processing attempts");
+
+        assert!(error.to_string().contains("server.max_processing_attempts"));
         assert!(error.to_string().contains("at least 1"));
     }
 

@@ -488,6 +488,7 @@ fn mb_help_for_namespace_service_and_config_includes_examples_and_guidance() {
             "Configuration is stored in `~/.memory_bank/settings.toml`.",
             "service.port",
             "server.llm_provider",
+            "server.max_processing_attempts",
             "integrations.codex.configured",
             "integrations.openclaw.configured",
             "Default namespace: default",
@@ -543,6 +544,7 @@ fn mb_nested_help_describes_arguments_and_non_obvious_behavior() {
             "Config key to update. Run `mb config --help` to see supported keys",
             "New value for the selected key",
             "server.encoder_provider: fast-embed | local-api | remote-api",
+            "server.max_processing_attempts",
             "mb config set server.llm_model \"\"",
             "Use an empty string to clear optional string overrides",
         ],
@@ -599,6 +601,41 @@ fn mb_config_round_trips_values_through_the_binary() {
     assert!(rendered.contains("active_namespace = \"team_a_1\""));
     assert!(rendered.contains("[service]"));
     assert!(rendered.contains("port = 4545"));
+}
+
+#[test]
+fn mb_config_round_trips_max_processing_attempts_through_the_binary() {
+    let harness = MbHarness::new();
+
+    let set_attempts = harness.run(&["config", "set", "server.max_processing_attempts", "12"]);
+    assert!(
+        set_attempts.status.success(),
+        "{}",
+        stderr_string(&set_attempts)
+    );
+    assert_contains_all(
+        &stdout_string(&set_attempts),
+        &[
+            "Updated `server.max_processing_attempts`.",
+            "Old value: 10",
+            "New value: 12",
+            "next time the managed service starts",
+        ],
+    );
+
+    let get_attempts = harness.run(&["config", "get", "server.max_processing_attempts"]);
+    assert!(
+        get_attempts.status.success(),
+        "{}",
+        stderr_string(&get_attempts)
+    );
+    assert_eq!(stdout_string(&get_attempts).trim(), "12");
+
+    let show = harness.run(&["config", "show"]);
+    assert!(show.status.success(), "{}", stderr_string(&show));
+    let rendered = stdout_string(&show);
+    assert!(rendered.contains("[server]"));
+    assert!(rendered.contains("max_processing_attempts = 12"));
 }
 
 #[test]

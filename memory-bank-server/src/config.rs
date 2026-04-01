@@ -2,8 +2,9 @@ use clap::Parser;
 use clap::ValueEnum;
 use memory_bank_app::{
     AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL, DEFAULT_GEMINI_MODEL,
-    DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL,
-    Namespace, OLLAMA_HISTORY_WINDOW_SIZE, ServerSettings,
+    DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_MAX_PROCESSING_ATTEMPTS, DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, Namespace, OLLAMA_HISTORY_WINDOW_SIZE,
+    ServerSettings,
 };
 use std::env;
 use std::fmt;
@@ -222,6 +223,9 @@ pub struct ServeArgs {
 
     #[arg(long, env = "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT", value_parser = clap::value_parser!(i32).range(1..))]
     nearest_neighbor_count: Option<i32>,
+
+    #[arg(long, env = "MEMORY_BANK_MAX_PROCESSING_ATTEMPTS", value_parser = clap::value_parser!(u32).range(1..))]
+    max_processing_attempts: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -232,6 +236,7 @@ pub struct ServeConfig {
     pub encoder: EncoderProviderConfig,
     pub history_window_size: u32,
     pub nearest_neighbor_count: i32,
+    pub max_processing_attempts: u32,
     pub dirs: Dirs,
 }
 
@@ -283,9 +288,25 @@ impl TryFrom<ServeArgs> for ServeConfig {
                 .nearest_neighbor_count
                 .or_else(|| server_settings.and_then(|s| s.nearest_neighbor_count))
                 .unwrap_or(10),
+            max_processing_attempts: resolve_max_processing_attempts(
+                args.max_processing_attempts
+                    .or_else(|| server_settings.and_then(|s| s.max_processing_attempts)),
+            )?,
             dirs,
         })
     }
+}
+
+fn resolve_max_processing_attempts(
+    configured_value: Option<u32>,
+) -> Result<u32, crate::error::AppError> {
+    let max_processing_attempts = configured_value.unwrap_or(DEFAULT_MAX_PROCESSING_ATTEMPTS);
+    if max_processing_attempts == 0 {
+        return Err(crate::error::AppError::Config(
+            "max_processing_attempts must be greater than 0".to_string(),
+        ));
+    }
+    Ok(max_processing_attempts)
 }
 
 fn effective_history_window_size(provider: &LlmProviderType, configured_value: u32) -> u32 {
@@ -355,6 +376,8 @@ mod tests {
             "42",
             "--nearest-neighbor-count",
             "24",
+            "--max-processing-attempts",
+            "17",
         ])
         .expect("parse serve");
 
@@ -367,12 +390,21 @@ mod tests {
         ));
         assert_eq!(args.history_window_size, Some(42));
         assert_eq!(args.nearest_neighbor_count, Some(24));
+        assert_eq!(args.max_processing_attempts, Some(17));
     }
 
     #[test]
     fn serve_rejects_zero_nearest_neighbor_count() {
         assert!(
             ServeArgs::try_parse_from(["memory-bank-server", "--nearest-neighbor-count", "0",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn serve_rejects_zero_max_processing_attempts() {
+        assert!(
+            ServeArgs::try_parse_from(["memory-bank-server", "--max-processing-attempts", "0",])
                 .is_err()
         );
     }
@@ -429,6 +461,7 @@ mod tests {
             "MEMORY_BANK_ENCODER_PROVIDER",
             "MEMORY_BANK_HISTORY_WINDOW_SIZE",
             "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "MEMORY_BANK_MAX_PROCESSING_ATTEMPTS",
             "ANTHROPIC_API_KEY",
         ]);
         unsafe {
@@ -448,6 +481,7 @@ mod tests {
                 llm_provider: Some("anthropic".to_string()),
                 history_window_size: Some(9),
                 nearest_neighbor_count: Some(12),
+                max_processing_attempts: Some(7),
                 ..ServerSettings::default()
             }),
             integrations: None,
@@ -463,6 +497,7 @@ mod tests {
         assert_eq!(config.namespace.as_ref(), "team-a");
         assert_eq!(config.history_window_size, 9);
         assert_eq!(config.nearest_neighbor_count, 12);
+        assert_eq!(config.max_processing_attempts, 7);
         assert!(config.dirs.db.ends_with("team-a/memory.db"));
         assert!(config.dirs.models.ends_with(".memory_bank/models"));
     }
@@ -479,6 +514,7 @@ mod tests {
             "MEMORY_BANK_ENCODER_PROVIDER",
             "MEMORY_BANK_HISTORY_WINDOW_SIZE",
             "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "MEMORY_BANK_MAX_PROCESSING_ATTEMPTS",
             "ANTHROPIC_API_KEY",
         ]);
         unsafe {
@@ -492,6 +528,10 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.history_window_size, DEFAULT_HISTORY_WINDOW_SIZE);
+        assert_eq!(
+            config.max_processing_attempts,
+            DEFAULT_MAX_PROCESSING_ATTEMPTS
+        );
     }
 
     #[test]
@@ -506,6 +546,7 @@ mod tests {
             "MEMORY_BANK_ENCODER_PROVIDER",
             "MEMORY_BANK_HISTORY_WINDOW_SIZE",
             "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "MEMORY_BANK_MAX_PROCESSING_ATTEMPTS",
         ]);
         unsafe {
             env::set_var("HOME", temp.path());
@@ -545,6 +586,7 @@ mod tests {
             "MEMORY_BANK_ENCODER_PROVIDER",
             "MEMORY_BANK_HISTORY_WINDOW_SIZE",
             "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "MEMORY_BANK_MAX_PROCESSING_ATTEMPTS",
         ]);
         unsafe {
             env::set_var("HOME", temp.path());
@@ -563,6 +605,80 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.history_window_size, OLLAMA_HISTORY_WINDOW_SIZE);
+    }
+
+    #[test]
+    fn serve_config_reads_max_processing_attempts_from_env() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let temp = TempDir::new().expect("tempdir");
+        let _guard = EnvVarGuard::new(&[
+            "HOME",
+            "MEMORY_BANK_PORT",
+            "MEMORY_BANK_NAMESPACE",
+            "MEMORY_BANK_LLM_PROVIDER",
+            "MEMORY_BANK_ENCODER_PROVIDER",
+            "MEMORY_BANK_HISTORY_WINDOW_SIZE",
+            "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "MEMORY_BANK_MAX_PROCESSING_ATTEMPTS",
+            "ANTHROPIC_API_KEY",
+        ]);
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::set_var("ANTHROPIC_API_KEY", "secret");
+            env::set_var("MEMORY_BANK_MAX_PROCESSING_ATTEMPTS", "13");
+        }
+
+        let config = ServeConfig::try_from(
+            ServeArgs::try_parse_from(["memory-bank-server"]).expect("parse"),
+        )
+        .expect("config");
+
+        assert_eq!(config.max_processing_attempts, 13);
+    }
+
+    #[test]
+    fn serve_config_rejects_zero_settings_max_processing_attempts() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let temp = TempDir::new().expect("tempdir");
+        let _guard = EnvVarGuard::new(&[
+            "HOME",
+            "MEMORY_BANK_PORT",
+            "MEMORY_BANK_NAMESPACE",
+            "MEMORY_BANK_LLM_PROVIDER",
+            "MEMORY_BANK_ENCODER_PROVIDER",
+            "MEMORY_BANK_HISTORY_WINDOW_SIZE",
+            "MEMORY_BANK_NEAREST_NEIGHBOR_COUNT",
+            "MEMORY_BANK_MAX_PROCESSING_ATTEMPTS",
+            "ANTHROPIC_API_KEY",
+        ]);
+        unsafe {
+            env::set_var("HOME", temp.path());
+            env::set_var("ANTHROPIC_API_KEY", "secret");
+        }
+
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            active_namespace: None,
+            service: None,
+            server: Some(ServerSettings {
+                llm_provider: Some("anthropic".to_string()),
+                max_processing_attempts: Some(0),
+                ..ServerSettings::default()
+            }),
+            integrations: None,
+        };
+        settings.save(&paths).expect("save settings");
+
+        let error = ServeConfig::try_from(
+            ServeArgs::try_parse_from(["memory-bank-server"]).expect("parse"),
+        )
+        .expect_err("zero max_processing_attempts should fail");
+        assert!(matches!(
+            error,
+            crate::error::AppError::Config(message)
+                if message.contains("max_processing_attempts")
+        ));
     }
 
     #[test]

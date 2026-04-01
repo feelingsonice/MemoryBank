@@ -54,6 +54,10 @@ If the installer finished in a non-interactive shell and skipped setup, just run
 
 If you later change `server.fastembed_model` with `mb config set`, the CLI will ask you to confirm it. The next service start will rebuild the vector index for the active namespace and re-encode any existing memories with the new embedding model. While that runs, `mb status` and `mb service status` will report that Memory Bank is not up yet because it is reindexing.
 
+If you need to cap how many times finalized turns retry after retryable provider failures, use `mb config set server.max_processing_attempts <N>` or change it in `mb setup` advanced settings. The default is `10`. Once a turn hits that cap it moves to `exhausted` instead of retrying forever, and later turns in the same conversation can continue processing.
+
+Important: this retry-cap release updates the ingest turn-status schema. Existing namespace databases created before this change must be recreated or migrated externally before the new server will open them.
+
 ### Smoke Test
 
 In a fresh agent session, ask it to remember something memorable and do at least one tool call:

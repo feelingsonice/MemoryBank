@@ -4,8 +4,8 @@ use crate::config::{
     llm_provider_value, normalize_ollama_url, validate_encoder_provider, validate_llm_provider,
 };
 use crate::constants::{
-    DEFAULT_HISTORY_WINDOW_SIZE, HOOK_BINARY_NAME, MB_BINARY_NAME, MCP_PROXY_BINARY_NAME,
-    OLLAMA_HISTORY_WINDOW_SIZE, SERVER_BINARY_NAME,
+    DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_MAX_PROCESSING_ATTEMPTS, HOOK_BINARY_NAME, MB_BINARY_NAME,
+    MCP_PROXY_BINARY_NAME, OLLAMA_HISTORY_WINDOW_SIZE, SERVER_BINARY_NAME,
 };
 use crate::domain::{EncoderProviderId, ProviderId};
 use memory_bank_app::{AppPaths, AppSettings, SecretStore};
@@ -78,6 +78,15 @@ pub(crate) fn build_server_launch_spec(
             "must be at least 1".to_string(),
         ));
     }
+    let max_processing_attempts = server_settings
+        .max_processing_attempts
+        .unwrap_or(DEFAULT_MAX_PROCESSING_ATTEMPTS);
+    if max_processing_attempts < 1 {
+        return Err(AppError::InvalidConfigValue(
+            "server.max_processing_attempts".to_string(),
+            "must be at least 1".to_string(),
+        ));
+    }
 
     let mut env = std::collections::BTreeMap::new();
     if let Some(secret_key) = provider.secret_env_key() {
@@ -147,6 +156,8 @@ pub(crate) fn build_server_launch_spec(
             history_window_size.to_string(),
             "--nearest-neighbor-count".to_string(),
             nearest_neighbor_count.to_string(),
+            "--max-processing-attempts".to_string(),
+            max_processing_attempts.to_string(),
         ],
         env,
         remove_env: vec![

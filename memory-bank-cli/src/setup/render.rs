@@ -126,6 +126,31 @@ mod tests {
     }
 
     #[test]
+    fn render_review_summary_includes_max_processing_attempts_override() {
+        let plan = SetupPlan {
+            namespace: Namespace::new("default"),
+            provider: ProviderId::Anthropic,
+            model: memory_bank_app::DEFAULT_ANTHROPIC_MODEL.to_string(),
+            ollama_url: None,
+            autostart: true,
+            selected_agents: vec![AgentKind::Codex],
+            secret_choice: SecretChoice::KeepStored {
+                key: "ANTHROPIC_API_KEY",
+            },
+            advanced: AdvancedSettings {
+                port: memory_bank_app::DEFAULT_PORT,
+                fastembed_model: memory_bank_app::DEFAULT_FASTEMBED_MODEL.to_string(),
+                history_window_size: memory_bank_app::DEFAULT_HISTORY_WINDOW_SIZE,
+                nearest_neighbor_count: crate::constants::DEFAULT_NEAREST_NEIGHBOR_COUNT,
+                max_processing_attempts: 12,
+            },
+        };
+
+        let summary = render_review_summary(&plan);
+        assert!(summary.contains("Max processing attempts: 12"));
+    }
+
+    #[test]
     fn render_post_setup_help_mentions_key_commands() {
         let help = render_post_setup_help(&ExposureOutcome {
             mode: ExposureMode::Launcher,
