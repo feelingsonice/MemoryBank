@@ -37,12 +37,23 @@ impl HttpServer {
         ingest: IngestService,
         log_tx: broadcast::Sender<LoggingMessageNotificationParam>,
     ) -> Result<Self, AppError> {
-        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let requested_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let shutdown = CancellationToken::new();
         let app = build_app(health, memory, ingest, log_tx, &shutdown);
-        let listener = TcpListener::bind(bind_addr)
+        let listener = TcpListener::bind(requested_bind_addr)
             .await
-            .map_err(|e| AppError::HttpServer(format!("Failed to bind to {}: {}", bind_addr, e)))?;
+            .map_err(|e| {
+                AppError::HttpServer(format!(
+                    "Failed to bind to {}: {}",
+                    requested_bind_addr, e
+                ))
+            })?;
+        let bind_addr = listener.local_addr().map_err(|e| {
+            AppError::HttpServer(format!(
+                "Failed to read bound address for {}: {}",
+                requested_bind_addr, e
+            ))
+        })?;
 
         Ok(Self {
             listener,
@@ -145,6 +156,13 @@ async fn handle_ingest(
             warn!(error = %error, "Rejected ingest fragment after validation");
             StatusCode::UNPROCESSABLE_ENTITY
         }
+        Err(error) if error.is_sqlite_lock_contention() => {
+            warn!(
+                error = %error,
+                "Failed to stage ingest fragment because SQLite remained locked after in-process writer serialization; this usually indicates another process is writing the same namespace database"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         Err(error) => {
             warn!(error = %error, "Failed to stage ingest fragment");
             StatusCode::SERVICE_UNAVAILABLE
@@ -167,15 +185,22 @@ pub struct HealthResponse {
 }
 
 async fn shutdown_signal(shutdown: CancellationToken) {
-    tokio::signal::ctrl_c().await.ok();
-    info!("Shutdown signal received; waiting for in-flight requests to finish");
-    shutdown.cancel();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutdown signal received; waiting for in-flight requests to finish");
+            shutdown.cancel();
+        }
+        _ = shutdown.cancelled() => {
+            info!("HTTP server shutdown requested; waiting for in-flight requests to finish");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{HealthResponse, build_app};
-    use crate::actor::MemoryHandle;
+    use super::{HealthResponse, HttpServer, build_app};
+    use crate::actor::{MemoryHandle, TestStoreTurnRequest};
+    use crate::db::SqliteRuntime;
     use crate::ingest::IngestService;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -185,9 +210,12 @@ mod tests {
     };
     use rmcp::model::LoggingMessageNotificationParam;
     use serde_json::json;
+    use sqlx::SqlitePool;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use tokio::sync::broadcast;
+    use tokio::sync::{broadcast, mpsc};
+    use tokio::task::JoinHandle;
+    use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
@@ -209,6 +237,187 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_http_concurrent_external_turn_fragments_share_one_turn_and_one_dispatch() {
+        let db_path = test_db_path();
+        let runtime = SqliteRuntime::open_file_for_tests(&db_path, 2)
+            .await
+            .expect("sqlite runtime");
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(2).await;
+        let ingest = IngestService::open_with_runtime(runtime.clone(), &db_path, memory.clone(), 0)
+            .await
+            .expect("ingest service");
+        let server = spawn_http_server(memory, ingest).await;
+
+        let write_permit = runtime.acquire_write_permit().await;
+        let mut write_attempts = runtime.install_write_attempt_notifier();
+
+        let user_task = tokio::spawn(post_ingest_status(
+            server.base_url.clone(),
+            external_user_payload("session-http-external", "turn-1", "fragment-user", "hello"),
+        ));
+        wait_for_write_attempts(&mut write_attempts, 1).await;
+
+        let tool_call_task = tokio::spawn(post_ingest_status(
+            server.base_url.clone(),
+            external_tool_call_payload(
+                "session-http-external",
+                "turn-1",
+                "fragment-tool-call",
+                "tool-1",
+                "Bash",
+                json!({"command": "pwd"}),
+            ),
+        ));
+        wait_for_write_attempts(&mut write_attempts, 1).await;
+
+        drop(write_permit);
+
+        assert_eq!(user_task.await.expect("join user request"), 202);
+        assert_eq!(tool_call_task.await.expect("join tool call request"), 202);
+        assert_eq!(
+            post_ingest_status(
+                server.base_url.clone(),
+                external_assistant_stop_payload(
+                    "session-http-external",
+                    "turn-1",
+                    "fragment-stop",
+                    "done",
+                ),
+            )
+            .await,
+            202
+        );
+
+        let turn_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?",
+        )
+        .bind("session-http-external")
+        .fetch_one(runtime.pool())
+        .await
+        .expect("turn count");
+        assert_eq!(turn_count, 1);
+
+        let projection_json: String = sqlx::query_scalar(
+            "SELECT projection_json
+             FROM ingest_turns
+             WHERE conversation_id = ? AND external_turn_id = ?
+             LIMIT 1",
+        )
+        .bind("session-http-external")
+        .bind("turn-1")
+        .fetch_one(runtime.pool())
+        .await
+        .expect("projection json");
+        assert!(projection_json.contains("hello"));
+        assert!(projection_json.contains("Bash"));
+        assert!(projection_json.contains("done"));
+
+        let dispatched_turn_id = receive_single_dispatch_and_ack(&mut requests, runtime.pool()).await;
+        assert!(dispatched_turn_id > 0);
+
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_http_duplicate_replay_race_accepts_all_requests_without_extra_rows() {
+        let db_path = test_db_path();
+        let runtime = SqliteRuntime::open_file_for_tests(&db_path, 2)
+            .await
+            .expect("sqlite runtime");
+        let memory = MemoryHandle::closed_for_tests();
+        let ingest = IngestService::open_with_runtime(runtime.clone(), &db_path, memory.clone(), 0)
+            .await
+            .expect("ingest service");
+        let server = spawn_http_server(memory, ingest).await;
+
+        let write_permit = runtime.acquire_write_permit().await;
+        let mut write_attempts = runtime.install_write_attempt_notifier();
+        let payload = fixed_user_payload("session-http-duplicate", "fragment-fixed", "hello");
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            tasks.push(tokio::spawn(post_ingest_status(
+                server.base_url.clone(),
+                payload.clone(),
+            )));
+        }
+        wait_for_write_attempts(&mut write_attempts, 3).await;
+        drop(write_permit);
+
+        for task in tasks {
+            assert_eq!(task.await.expect("join duplicate request"), 202);
+        }
+
+        let turn_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?",
+        )
+        .bind("session-http-duplicate")
+        .fetch_one(runtime.pool())
+        .await
+        .expect("turn count");
+        let fragment_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ingest_fragments WHERE conversation_id = ?",
+        )
+        .bind("session-http-duplicate")
+        .fetch_one(runtime.pool())
+        .await
+        .expect("fragment count");
+        assert_eq!(turn_count, 1);
+        assert_eq!(fragment_count, 1);
+
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn real_http_concurrent_conversations_keep_turn_scopes_independent() {
+        let db_path = test_db_path();
+        let runtime = SqliteRuntime::open_file_for_tests(&db_path, 2)
+            .await
+            .expect("sqlite runtime");
+        let memory = MemoryHandle::closed_for_tests();
+        let ingest = IngestService::open_with_runtime(runtime.clone(), &db_path, memory.clone(), 0)
+            .await
+            .expect("ingest service");
+        let server = spawn_http_server(memory, ingest).await;
+
+        let write_permit = runtime.acquire_write_permit().await;
+        let mut write_attempts = runtime.install_write_attempt_notifier();
+        let first_task = tokio::spawn(post_ingest_status(
+            server.base_url.clone(),
+            fixed_user_payload("conversation-a", "fragment-a", "hello a"),
+        ));
+        let second_task = tokio::spawn(post_ingest_status(
+            server.base_url.clone(),
+            fixed_user_payload("conversation-b", "fragment-b", "hello b"),
+        ));
+        wait_for_write_attempts(&mut write_attempts, 2).await;
+        drop(write_permit);
+
+        assert_eq!(first_task.await.expect("join first request"), 202);
+        assert_eq!(second_task.await.expect("join second request"), 202);
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT conversation_id, turn_index
+             FROM ingest_turns
+             WHERE conversation_id IN (?, ?)
+             ORDER BY conversation_id",
+        )
+        .bind("conversation-a")
+        .bind("conversation-b")
+        .fetch_all(runtime.pool())
+        .await
+        .expect("turn rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("conversation-a".to_string(), 1),
+                ("conversation-b".to_string(), 1),
+            ]
+        );
+
+        server.stop().await;
     }
 
     #[tokio::test]
@@ -436,6 +645,233 @@ mod tests {
             version: "test",
         };
         build_app(health, memory, ingest, log_tx, &shutdown)
+    }
+
+    struct TestHttpServer {
+        base_url: String,
+        shutdown: CancellationToken,
+        task: JoinHandle<Result<(), crate::error::AppError>>,
+    }
+
+    impl TestHttpServer {
+        async fn stop(self) {
+            self.shutdown.cancel();
+            self.task
+                .await
+                .expect("join http server task")
+                .expect("http server run");
+        }
+    }
+
+    async fn spawn_http_server(memory: MemoryHandle, ingest: IngestService) -> TestHttpServer {
+        let (log_tx, _) = broadcast::channel::<LoggingMessageNotificationParam>(8);
+        let server = HttpServer::bind(0, test_health(), memory, ingest, log_tx)
+            .await
+            .expect("bind http server");
+        let base_url = format!("http://{}", server.bind_addr);
+        let shutdown = server.shutdown.clone();
+        let task = tokio::spawn(async move { server.run().await });
+        TestHttpServer {
+            base_url,
+            shutdown,
+            task,
+        }
+    }
+
+    async fn post_ingest_status(base_url: String, payload: IngestEnvelope) -> u16 {
+        tokio::task::spawn_blocking(move || {
+            let response = ureq::post(&format!("{base_url}/ingest"))
+                .send_json(serde_json::to_value(payload).expect("payload json"));
+            match response {
+                Ok(response) => response.status(),
+                Err(ureq::Error::Status(code, _response)) => code,
+                Err(error) => panic!("http request failed: {error}"),
+            }
+        })
+        .await
+        .expect("join blocking request")
+    }
+
+    async fn wait_for_write_attempts(
+        write_attempts: &mut mpsc::UnboundedReceiver<()>,
+        expected: usize,
+    ) {
+        for _ in 0..expected {
+            timeout(Duration::from_secs(1), write_attempts.recv())
+                .await
+                .expect("write attempt timeout")
+                .expect("write attempt");
+        }
+    }
+
+    async fn receive_single_dispatch_and_ack(
+        requests: &mut mpsc::Receiver<TestStoreTurnRequest>,
+        pool: &SqlitePool,
+    ) -> i64 {
+        let request = timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .expect("dispatch timeout")
+            .expect("dispatch request");
+        mark_processing_turn_stored(pool, request.turn_id).await;
+        request.responder.send(Ok(())).expect("ack success");
+        tokio::task::yield_now().await;
+        assert!(requests.try_recv().is_err(), "expected a single dispatch");
+        request.turn_id
+    }
+
+    async fn mark_processing_turn_stored(pool: &SqlitePool, turn_id: i64) {
+        sqlx::query(
+            "UPDATE ingest_turns
+             SET status = 'stored',
+                 last_error = NULL,
+                 next_attempt_at = NULL,
+                 processing_started_at = NULL,
+                 stored_at = ?,
+                 updated_at = ?
+             WHERE id = ? AND status = 'processing'",
+        )
+        .bind("2026-03-05T00:00:05Z")
+        .bind("2026-03-05T00:00:05Z")
+        .bind(turn_id)
+        .execute(pool)
+        .await
+        .expect("mark turn stored");
+    }
+
+    fn fixed_user_payload(
+        conversation_id: &str,
+        fragment_id: &str,
+        text: &str,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "UserPromptSubmit".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: None,
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: Some(1),
+                emitted_at_rfc3339: Some("2026-03-05T00:00:00Z".to_string()),
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::UserMessage {
+                    text: text.to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id}),
+        }
+    }
+
+    fn external_user_payload(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        text: &str,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "UserPromptSubmit".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::UserMessage {
+                    text: text.to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id, "turn_id": turn_id}),
+        }
+    }
+
+    fn external_assistant_stop_payload(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        text: &str,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "Stop".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::Hard,
+                body: FragmentBody::AssistantMessage {
+                    text: text.to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id, "turn_id": turn_id}),
+        }
+    }
+
+    fn external_tool_call_payload(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "PreToolUse".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::ToolCall {
+                    name: tool_name.to_string(),
+                    input_json: serde_json::to_string(&input).expect("tool input json"),
+                    tool_use_id: Some(tool_use_id.to_string()),
+                },
+            },
+            raw: json!({
+                "session_id": conversation_id,
+                "turn_id": turn_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_input": input
+            }),
+        }
+    }
+
+    fn test_health() -> HealthResponse {
+        HealthResponse {
+            ok: true,
+            namespace: "default".to_string(),
+            port: 3737,
+            llm_provider: "anthropic".to_string(),
+            encoder_provider: "fast-embed".to_string(),
+            version: "test",
+        }
     }
 
     fn sample_payload() -> IngestEnvelope {

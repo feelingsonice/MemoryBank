@@ -4,6 +4,7 @@ use std::ffi::c_char;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Once;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::encoder::{EmbeddingInput, EncoderClient, embedding_to_bytes, validate_embedding_count};
@@ -39,11 +40,104 @@ pub struct RetrievalRow {
 
 // --- Public database API ---
 
-pub struct MemoryDb {
+#[derive(Clone)]
+pub(crate) struct SqliteRuntime {
     pool: SqlitePool,
+    write_gate: std::sync::Arc<Semaphore>,
+    #[cfg(test)]
+    write_attempt_tx:
+        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+}
+
+impl SqliteRuntime {
+    pub(crate) async fn open(db_path: &Path) -> Result<Self, AppError> {
+        register_sqlite_vec();
+
+        let pool = create_pool(db_path, 2).await?;
+        Ok(Self {
+            pool,
+            write_gate: std::sync::Arc::new(Semaphore::new(1)),
+            #[cfg(test)]
+            write_attempt_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    pub(crate) async fn acquire_write_permit(&self) -> OwnedSemaphorePermit {
+        #[cfg(test)]
+        if let Some(write_attempt_tx) = self
+            .write_attempt_tx
+            .lock()
+            .expect("lock write attempt notifier")
+            .as_ref()
+        {
+            let _ = write_attempt_tx.send(());
+        }
+        self.write_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("SQLite write gate unexpectedly closed")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_in_memory_for_tests(max_connections: u32) -> Result<Self, AppError> {
+        register_sqlite_vec();
+
+        let options =
+            SqliteConnectOptions::from_str("sqlite::memory:")?.pragma("foreign_keys", "ON");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(max_connections)
+            .connect_with(options)
+            .await?;
+
+        Ok(Self {
+            pool,
+            write_gate: std::sync::Arc::new(Semaphore::new(1)),
+            #[cfg(test)]
+            write_attempt_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_file_for_tests(
+        db_path: &Path,
+        max_connections: u32,
+    ) -> Result<Self, AppError> {
+        register_sqlite_vec();
+
+        let pool = create_pool(db_path, max_connections).await?;
+        Ok(Self {
+            pool,
+            write_gate: std::sync::Arc::new(Semaphore::new(1)),
+            #[cfg(test)]
+            write_attempt_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_write_attempt_notifier(
+        &self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self
+            .write_attempt_tx
+            .lock()
+            .expect("lock write attempt notifier") = Some(tx);
+        rx
+    }
+
+}
+
+pub struct MemoryDb {
+    runtime: SqliteRuntime,
 }
 
 impl MemoryDb {
+    #[allow(dead_code)]
     pub async fn open(
         db_path: &Path,
         llm_model_id: &str,
@@ -51,12 +145,30 @@ impl MemoryDb {
         encoder: &EncoderClient,
         startup_state: Option<&StartupStateTracker>,
     ) -> Result<Self, AppError> {
-        register_sqlite_vec();
+        let runtime = SqliteRuntime::open(db_path).await?;
+        Self::open_with_runtime(
+            runtime,
+            db_path,
+            llm_model_id,
+            encoder_model_id,
+            encoder,
+            startup_state,
+        )
+        .await
+    }
 
-        let pool = create_pool(db_path).await?;
-        create_schema(&pool).await?;
+    pub(crate) async fn open_with_runtime(
+        runtime: SqliteRuntime,
+        db_path: &Path,
+        llm_model_id: &str,
+        encoder_model_id: &str,
+        encoder: &EncoderClient,
+        startup_state: Option<&StartupStateTracker>,
+    ) -> Result<Self, AppError> {
+        let pool = runtime.pool();
+        create_schema(pool).await?;
         ensure_vec_table(
-            &pool,
+            pool,
             llm_model_id,
             encoder_model_id,
             encoder,
@@ -70,11 +182,20 @@ impl MemoryDb {
             encoder_model = %encoder_model_id,
             "Memory database ready"
         );
-        Ok(Self { pool })
+        Ok(Self { runtime })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn begin(&self) -> Result<Transaction<'_, Sqlite>, sqlx::Error> {
-        self.pool.begin().await
+        self.runtime.pool().begin().await
+    }
+
+    pub async fn begin_immediate(&self) -> Result<Transaction<'_, Sqlite>, sqlx::Error> {
+        self.runtime.pool().begin_with("BEGIN IMMEDIATE").await
+    }
+
+    pub(crate) async fn acquire_write_permit(&self) -> OwnedSemaphorePermit {
+        self.runtime.acquire_write_permit().await
     }
 
     // --- Vector search ---
@@ -86,7 +207,7 @@ impl MemoryDb {
     ) -> Result<Vec<i64>, sqlx::Error> {
         sqlx::query_scalar(&nearest_neighbor_ids_query(k))
             .bind(embedding)
-            .fetch_all(&self.pool)
+            .fetch_all(self.runtime.pool())
             .await
     }
 
@@ -97,7 +218,7 @@ impl MemoryDb {
     ) -> Result<Vec<NeighborRow>, sqlx::Error> {
         sqlx::query_as::<_, NeighborRow>(&nearest_memories_query(k))
             .bind(embedding)
-            .fetch_all(&self.pool)
+            .fetch_all(self.runtime.pool())
             .await
     }
 
@@ -118,7 +239,7 @@ impl MemoryDb {
 
         builder
             .build_query_as::<RetrievalRow>()
-            .fetch_all(&self.pool)
+            .fetch_all(self.runtime.pool())
             .await
     }
 
@@ -135,7 +256,7 @@ impl MemoryDb {
 
         builder
             .build_query_as::<(i64, i64)>()
-            .fetch_all(&self.pool)
+            .fetch_all(self.runtime.pool())
             .await
     }
 
@@ -243,23 +364,23 @@ impl MemoryDb {
 
     #[cfg(test)]
     pub(crate) async fn open_in_memory_for_tests(dimension: usize) -> Result<Self, AppError> {
-        register_sqlite_vec();
+        let runtime = SqliteRuntime::open_in_memory_for_tests(1).await?;
+        Self::open_with_runtime_for_tests(runtime, dimension).await
+    }
 
-        let options =
-            SqliteConnectOptions::from_str("sqlite::memory:")?.pragma("foreign_keys", "ON");
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(options)
-            .await?;
-        create_schema(&pool).await?;
-        create_vec_table(&pool, dimension).await?;
-
-        Ok(Self { pool })
+    #[cfg(test)]
+    pub(crate) async fn open_with_runtime_for_tests(
+        runtime: SqliteRuntime,
+        dimension: usize,
+    ) -> Result<Self, AppError> {
+        create_schema(runtime.pool()).await?;
+        create_vec_table(runtime.pool(), dimension).await?;
+        Ok(Self { runtime })
     }
 
     #[cfg(test)]
     pub(crate) fn pool_for_tests(&self) -> &SqlitePool {
-        &self.pool
+        self.runtime.pool()
     }
 }
 
@@ -290,7 +411,7 @@ fn sqlite_vec_init_fn() -> SqliteVecInitFn {
     unsafe { std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ()) }
 }
 
-async fn create_pool(db_path: &Path) -> Result<SqlitePool, AppError> {
+async fn create_pool(db_path: &Path, max_connections: u32) -> Result<SqlitePool, AppError> {
     let connection_string = format!("sqlite://{}?mode=rwc", db_path.to_string_lossy());
     debug!(
         db_path = %db_path.display(),
@@ -306,7 +427,10 @@ async fn create_pool(db_path: &Path) -> Result<SqlitePool, AppError> {
         .pragma("foreign_keys", "ON")
         .pragma("mmap_size", SQLITE_MMAP_SIZE_BYTES);
 
-    Ok(SqlitePoolOptions::new().connect_with(options).await?)
+    Ok(SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(options)
+        .await?)
 }
 
 async fn create_schema(pool: &SqlitePool) -> Result<(), AppError> {
@@ -681,8 +805,8 @@ impl MigrationMemoryRow {
 // --- SQL and tuning constants ---
 
 const MIGRATION_CHUNK_SIZE: usize = 50;
-const SQLITE_BUSY_TIMEOUT_MS: &str = "5000";
-const SQLITE_MMAP_SIZE_BYTES: &str = "268435456";
+pub(crate) const SQLITE_BUSY_TIMEOUT_MS: &str = "5000";
+pub(crate) const SQLITE_MMAP_SIZE_BYTES: &str = "268435456";
 const DIMENSION_PROBE_INPUT: &str = "test";
 
 const INSERT_MEMORY_SQL: &str =
