@@ -12,10 +12,11 @@ Current caveats:
 
 - Intel macOS is source-build only for now: use `./install.sh --from-source`
 - Windows is not currently a supported managed install target
+- Codex hooks are currently experimental in Codex and are temporarily disabled on Windows according to the current OpenAI Codex docs
 
 ## What You Need
 
-- A supported agent installed if you want `mb setup` to wire it automatically: Claude Code, Gemini CLI, OpenCode, or OpenClaw
+- A supported agent installed if you want `mb setup` to wire it automatically: Claude Code, Codex, Gemini CLI, OpenCode, or OpenClaw
 - One internal LLM provider for Memory Bank: Anthropic, Gemini, OpenAI, or Ollama
 - Internet access for the default installer and for the first embedding-model download
 - Enough local disk for `~/.memory_bank/`, the embedding model cache, and your namespace databases as they grow
@@ -94,3 +95,4 @@ For most users, the main questions are:
 
 - [Troubleshooting](./troubleshooting.md)
 - [Architecture](./architecture.md)
+- [Codex](./codex.md)

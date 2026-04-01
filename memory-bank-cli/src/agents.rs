@@ -1,4 +1,5 @@
 mod claude;
+mod codex;
 mod gemini;
 mod openclaw;
 mod opencode;
@@ -19,6 +20,7 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentKind {
     ClaudeCode,
+    Codex,
     GeminiCli,
     OpenCode,
     OpenClaw,
@@ -31,9 +33,10 @@ pub(crate) struct AgentSetupOutcome {
 }
 
 impl AgentKind {
-    pub(crate) fn all() -> [Self; 4] {
+    pub(crate) fn all() -> [Self; 5] {
         [
             Self::ClaudeCode,
+            Self::Codex,
             Self::GeminiCli,
             Self::OpenCode,
             Self::OpenClaw,
@@ -43,6 +46,7 @@ impl AgentKind {
     pub(crate) fn command_name(self) -> &'static str {
         match self {
             Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
             Self::GeminiCli => "gemini",
             Self::OpenCode => "opencode",
             Self::OpenClaw => "openclaw",
@@ -52,6 +56,7 @@ impl AgentKind {
     pub(crate) fn display_name(self) -> &'static str {
         match self {
             Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
             Self::GeminiCli => "Gemini CLI",
             Self::OpenCode => "OpenCode",
             Self::OpenClaw => "OpenClaw",
@@ -66,9 +71,16 @@ impl fmt::Display for AgentKind {
 }
 
 pub(crate) fn detect_installed_agents() -> Vec<AgentKind> {
+    detect_installed_agents_with(|agent| find_on_path(agent.command_name()).is_some())
+}
+
+fn detect_installed_agents_with<F>(mut is_installed: F) -> Vec<AgentKind>
+where
+    F: FnMut(AgentKind) -> bool,
+{
     AgentKind::all()
         .into_iter()
-        .filter(|agent| find_on_path(agent.command_name()).is_some())
+        .filter(|agent| is_installed(*agent))
         .collect()
 }
 
@@ -84,6 +96,7 @@ pub(crate) fn configure_selected_agents(
     for agent in selected_agents {
         let result = match agent {
             AgentKind::ClaudeCode => configure_claude(paths, &server_url),
+            AgentKind::Codex => configure_codex(paths, &server_url),
             AgentKind::GeminiCli => configure_gemini(paths, &server_url),
             AgentKind::OpenCode => configure_opencode(paths, &server_url),
             AgentKind::OpenClaw => configure_openclaw(paths, &server_url),
@@ -106,6 +119,10 @@ pub(crate) fn integration_configured(settings: &AppSettings, agent: AgentKind) -
 
 fn configure_claude(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
     claude::configure(paths, server_url)
+}
+
+fn configure_codex(paths: &AppPaths, server_url: &str) -> Result<(), AppError> {
+    codex::configure(paths, server_url)
 }
 
 #[cfg(test)]
@@ -153,6 +170,16 @@ fn build_hook_command(
 }
 
 #[cfg(test)]
+fn upsert_codex_hook(
+    root: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> Result<(), AppError> {
+    codex::upsert_hook(root, event, matcher, command)
+}
+
+#[cfg(test)]
 fn upsert_claude_hook(root: &mut Value, event: &str, command: &str) -> Result<(), AppError> {
     claude::upsert_hook(root, event, command)
 }
@@ -178,7 +205,7 @@ fn upsert_openclaw_plugin_load_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::MCP_PROXY_BINARY_NAME;
+    use crate::constants::{HOOK_BINARY_NAME, MCP_PROXY_BINARY_NAME};
     use crate::json_config::load_json_config;
     use crate::real_binary_tests::RealBinaryTestEnv;
     use std::cell::RefCell;
@@ -259,6 +286,37 @@ mod tests {
     }
 
     #[test]
+    fn upsert_codex_hook_rewrites_owned_handler_and_timeout() {
+        let mut root = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "stale",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "old --agent codex --event PreToolUse",
+                                "timeout": 5
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        upsert_codex_hook(&mut root, "PreToolUse", Some("Bash"), "new-command")
+            .expect("upsert codex hook");
+
+        let group = &root["hooks"]["PreToolUse"][0];
+        assert_eq!(group["matcher"], Value::String("Bash".to_string()));
+        assert_eq!(
+            group["hooks"][0]["command"],
+            Value::String("new-command".to_string())
+        );
+        assert_eq!(group["hooks"][0]["timeout"], Value::from(10));
+    }
+
+    #[test]
     fn build_hook_command_shell_escapes_paths_with_spaces() {
         let command = build_hook_command(
             std::path::Path::new("/Users/test/Memory Bank/bin/memory-bank-hook"),
@@ -271,6 +329,53 @@ mod tests {
             command,
             "'/Users/test/Memory Bank/bin/memory-bank-hook' --agent 'gemini-cli' --event 'BeforeAgent' --server-url 'http://127.0.0.1:3737'"
         );
+    }
+
+    #[test]
+    fn upsert_codex_hook_repairs_malformed_groups_and_preserves_unrelated_hooks() {
+        let mut root = json!({
+            "hooks": {
+                "PreToolUse": [
+                    "broken",
+                    {
+                        "matcher": "Bash",
+                        "hooks": "not-an-array"
+                    },
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "old --agent codex --event PreToolUse",
+                                "timeout": 5
+                            },
+                            {
+                                "type": "command",
+                                "command": "python3 ~/.codex/hooks/keep.py"
+                            },
+                            42
+                        ]
+                    }
+                ]
+            }
+        });
+
+        upsert_codex_hook(&mut root, "PreToolUse", Some("Bash"), "new-command")
+            .expect("upsert codex hook");
+
+        let groups = root["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("pre-tool groups");
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0]["hooks"][0]["command"],
+            Value::String("python3 ~/.codex/hooks/keep.py".to_string())
+        );
+        assert_eq!(
+            groups[1]["hooks"][0]["command"],
+            Value::String("new-command".to_string())
+        );
+        assert_eq!(groups[1]["matcher"], Value::String("Bash".to_string()));
     }
 
     #[test]
@@ -348,6 +453,251 @@ mod tests {
             rendered["hooks"]["BeforeTool"][0]["hooks"][0]["name"],
             Value::String("memory-bank".to_string())
         );
+    }
+
+    #[test]
+    fn configure_codex_writes_user_config_and_hooks() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        configure_codex(&paths, "http://127.0.0.1:4545").expect("configure codex");
+
+        let config_path = paths.home_dir.join(".codex/config.toml");
+        let hooks_path = paths.home_dir.join(".codex/hooks.json");
+        let config = fs::read_to_string(&config_path).expect("read codex config");
+        let hooks = load_json_config(&hooks_path).expect("load hooks");
+
+        assert!(config.contains("[features]"));
+        assert!(config.contains("codex_hooks = true"));
+        assert!(config.contains("[mcp_servers.memory-bank]"));
+        assert!(config.contains("url = \"http://127.0.0.1:4545/mcp\""));
+        assert!(config.contains("enabled = true"));
+
+        assert_eq!(
+            hooks["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
+            Value::String(build_hook_command(
+                &paths.binary_path(HOOK_BINARY_NAME),
+                "codex",
+                "UserPromptSubmit",
+                "http://127.0.0.1:4545",
+            ))
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["matcher"],
+            Value::String("Bash".to_string())
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"],
+            Value::from(10)
+        );
+    }
+
+    #[test]
+    fn configure_codex_preserves_unrelated_entries_and_repairs_owned_config() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let config_path = paths.home_dir.join(".codex/config.toml");
+        let hooks_path = paths.home_dir.join(".codex/hooks.json");
+        fs::create_dir_all(config_path.parent().expect("parent")).expect("parent");
+        fs::write(
+            &config_path,
+            r#"# keep me
+model = "gpt-5.4"
+features = []
+
+[mcp_servers.context7]
+command = "npx"
+
+[mcp_servers.memory-bank]
+url = "http://stale/mcp"
+enabled = false
+"#,
+        )
+        .expect("seed config");
+        fs::write(
+            &hooks_path,
+            json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "old --agent codex --event PreToolUse",
+                                    "timeout": 5
+                                }
+                            ]
+                        }
+                    ],
+                    "SessionStart": [
+                        {
+                            "matcher": "startup|resume",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 ~/.codex/hooks/session_start.py"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed hooks");
+
+        configure_codex(&paths, "http://127.0.0.1:6000").expect("configure codex");
+
+        let config = fs::read_to_string(&config_path).expect("read codex config");
+        let hooks = load_json_config(&hooks_path).expect("load hooks");
+
+        assert!(config.contains("# keep me"));
+        assert!(config.contains("[mcp_servers.context7]"));
+        assert!(config.contains("command = \"npx\""));
+        assert!(config.contains("codex_hooks = true"));
+        assert!(config.contains("url = \"http://127.0.0.1:6000/mcp\""));
+        assert!(config_path.with_extension("toml.mb_backup").exists());
+
+        assert_eq!(
+            hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            Value::String("python3 ~/.codex/hooks/session_start.py".to_string())
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            Value::String(build_hook_command(
+                &paths.binary_path(HOOK_BINARY_NAME),
+                "codex",
+                "PreToolUse",
+                "http://127.0.0.1:6000",
+            ))
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"],
+            Value::from(10)
+        );
+        assert!(hooks_path.with_extension("json.mb_backup").exists());
+    }
+
+    #[test]
+    fn configure_codex_repairs_malformed_hook_groups_and_keeps_unrelated_entries() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let hooks_path = paths.home_dir.join(".codex/hooks.json");
+        fs::create_dir_all(hooks_path.parent().expect("parent")).expect("parent");
+        fs::write(
+            &hooks_path,
+            json!({
+                "hooks": {
+                    "UserPromptSubmit": "bad-shape",
+                    "PreToolUse": [
+                        "broken",
+                        {
+                            "matcher": "Bash",
+                            "hooks": "bad-shape"
+                        },
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 ~/.codex/hooks/keep.py"
+                                },
+                                17,
+                                {
+                                    "type": "command",
+                                    "command": "old --agent codex --event PreToolUse",
+                                    "timeout": 5
+                                }
+                            ]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed malformed hooks");
+
+        configure_codex(&paths, "http://127.0.0.1:8123").expect("configure codex");
+
+        let hooks = load_json_config(&hooks_path).expect("load hooks");
+        let pre_tool_groups = hooks["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("pre-tool groups");
+        assert_eq!(pre_tool_groups.len(), 2);
+        assert_eq!(
+            pre_tool_groups[0]["hooks"][0]["command"],
+            Value::String("python3 ~/.codex/hooks/keep.py".to_string())
+        );
+        assert_eq!(
+            pre_tool_groups[1]["hooks"][0]["command"],
+            Value::String(build_hook_command(
+                &paths.binary_path(HOOK_BINARY_NAME),
+                "codex",
+                "PreToolUse",
+                "http://127.0.0.1:8123",
+            ))
+        );
+        assert_eq!(
+            hooks["hooks"]["UserPromptSubmit"]
+                .as_array()
+                .expect("user prompt groups")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn configure_codex_is_idempotent_across_reruns() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+
+        configure_codex(&paths, "http://127.0.0.1:3737").expect("first configure");
+        configure_codex(&paths, "http://127.0.0.1:3737").expect("second configure");
+
+        let config = fs::read_to_string(paths.home_dir.join(".codex/config.toml"))
+            .expect("read codex config");
+        let hooks = load_json_config(&paths.home_dir.join(".codex/hooks.json")).expect("hooks");
+
+        assert_eq!(config.matches("[mcp_servers.memory-bank]").count(), 1);
+        assert_eq!(config.matches("codex_hooks = true").count(), 1);
+        assert_eq!(
+            hooks["hooks"]["UserPromptSubmit"]
+                .as_array()
+                .expect("user prompt groups")
+                .len(),
+            1
+        );
+        assert_eq!(
+            hooks["hooks"]["PreToolUse"]
+                .as_array()
+                .expect("pre tool groups")
+                .len(),
+            1
+        );
+        assert_eq!(
+            hooks["hooks"]["PostToolUse"]
+                .as_array()
+                .expect("post tool groups")
+                .len(),
+            1
+        );
+        assert_eq!(
+            hooks["hooks"]["Stop"]
+                .as_array()
+                .expect("stop groups")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn detect_installed_agents_includes_codex_when_present() {
+        let detected = detect_installed_agents_with(|agent| {
+            matches!(agent, AgentKind::ClaudeCode | AgentKind::Codex)
+        });
+
+        assert_eq!(detected, vec![AgentKind::ClaudeCode, AgentKind::Codex]);
     }
 
     #[test]
@@ -671,5 +1021,25 @@ mod tests {
         assert!(settings.contains("memory-bank-mcp-proxy"));
         assert!(settings.contains("memory-bank-hook"));
         assert!(settings.contains("http://127.0.0.1:3737"));
+    }
+
+    #[test]
+    fn real_codex_configuration_round_trip() {
+        let Some(env) = RealBinaryTestEnv::for_binary("codex") else {
+            return;
+        };
+        env.seed_agent_artifacts().expect("agent artifacts");
+
+        configure_codex(&env.paths, "http://127.0.0.1:3737").expect("configure codex");
+
+        let config = fs::read_to_string(env.paths.home_dir.join(".codex/config.toml"))
+            .expect("codex config");
+        let hooks =
+            fs::read_to_string(env.paths.home_dir.join(".codex/hooks.json")).expect("codex hooks");
+
+        assert!(config.contains("codex_hooks = true"));
+        assert!(config.contains("http://127.0.0.1:3737/mcp"));
+        assert!(hooks.contains("--agent codex --event UserPromptSubmit"));
+        assert!(hooks.contains("--agent codex --event Stop"));
     }
 }

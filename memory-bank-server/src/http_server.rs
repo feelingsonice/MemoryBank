@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_ingest_rejects_turn_ids_for_now() {
+    async fn post_ingest_accepts_turn_ids() {
         let app = app().await;
         let mut payload = sample_payload();
         payload.scope.turn_id = Some("turn-1".to_string());
@@ -228,7 +228,137 @@ mod tests {
             .await
             .expect("response");
 
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn post_ingest_rejects_late_fragments_for_closed_external_turns() {
+        let app = app().await;
+        let mut first = sample_payload();
+        first.source.agent = "codex".to_string();
+        first.source.event = "Stop".to_string();
+        first.scope.turn_id = Some("turn-1".to_string());
+        first.fragment.terminality = Terminality::Hard;
+        first.fragment.body = FragmentBody::AssistantMessage {
+            text: "done".to_string(),
+        };
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::post("/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&first).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+
+        let mut late = sample_payload();
+        late.source.agent = "codex".to_string();
+        late.source.event = "UserPromptSubmit".to_string();
+        late.scope.turn_id = Some("turn-1".to_string());
+        late.scope.fragment_id = format!("fragment-{}", unique_suffix());
+
+        let response = app
+            .oneshot(
+                Request::post("/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&late).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn post_ingest_accepts_duplicate_replay_for_closed_external_turn() {
+        let app = app().await;
+        let mut payload = sample_payload();
+        payload.source.agent = "codex".to_string();
+        payload.source.event = "Stop".to_string();
+        payload.scope.turn_id = Some("turn-1".to_string());
+        payload.fragment.terminality = Terminality::Hard;
+        payload.fragment.body = FragmentBody::AssistantMessage {
+            text: "done".to_string(),
+        };
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::post("/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+
+        let duplicate_response = app
+            .oneshot(
+                Request::post("/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(duplicate_response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn post_ingest_scopes_identical_turn_ids_by_conversation() {
+        let app = app().await;
+        let mut first = sample_payload();
+        first.source.agent = "codex".to_string();
+        first.source.event = "Stop".to_string();
+        first.scope.turn_id = Some("turn-1".to_string());
+        first.scope.conversation_id = "conversation-a".to_string();
+        first.raw = json!({"session_id": "conversation-a", "turn_id": "turn-1"});
+        first.fragment.terminality = Terminality::Hard;
+        first.fragment.body = FragmentBody::AssistantMessage {
+            text: "done a".to_string(),
+        };
+
+        let mut second = sample_payload();
+        second.source.agent = "codex".to_string();
+        second.source.event = "Stop".to_string();
+        second.scope.turn_id = Some("turn-1".to_string());
+        second.scope.conversation_id = "conversation-b".to_string();
+        second.scope.fragment_id = format!("fragment-{}", unique_suffix());
+        second.raw = json!({"session_id": "conversation-b", "turn_id": "turn-1"});
+        second.fragment.terminality = Terminality::Hard;
+        second.fragment.body = FragmentBody::AssistantMessage {
+            text: "done b".to_string(),
+        };
+
+        let first_response = app
+            .clone()
+            .oneshot(
+                Request::post("/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&first).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let second_response = app
+            .oneshot(
+                Request::post("/ingest")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&second).expect("json")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(first_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(second_response.status(), StatusCode::ACCEPTED);
     }
 
     #[tokio::test]

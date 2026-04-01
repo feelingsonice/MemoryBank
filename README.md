@@ -5,7 +5,7 @@
 
 Memory Bank gives coding agents shared, long-term memory across sessions and across tools.
 
-It runs locally, stores memory in your own namespaced SQLite databases, and works with Claude Code, Gemini CLI, OpenCode, and OpenClaw.
+It runs locally, stores memory in your own namespaced SQLite databases, and works with Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw.
 
 ## Why Memory Bank
 
@@ -75,6 +75,7 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 | Agent | Recall path | Capture path | Guide |
 | --- | --- | --- | --- |
 | Claude Code | HTTP MCP | Claude hooks -> `memory-bank-hook` | [Claude Code](./docs/claude-code.md) |
+| Codex | HTTP MCP | Codex hooks -> `memory-bank-hook` | [Codex](./docs/codex.md) |
 | Gemini CLI | HTTP MCP | Gemini hooks -> `memory-bank-hook` | [Gemini CLI](./docs/gemini-cli.md) |
 | OpenCode | HTTP MCP | OpenCode plugin -> `memory-bank-hook` | [OpenCode](./docs/opencode.md) |
 | OpenClaw | stdio MCP proxy -> HTTP MCP | OpenClaw extension -> `memory-bank-hook` | [OpenClaw](./docs/openclaw.md) |
@@ -85,6 +86,7 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 - [Architecture](./docs/architecture.md)
 - [Requirements](./docs/requirements.md)
 - [Claude Code Guide](./docs/claude-code.md)
+- [Codex Guide](./docs/codex.md)
 - [Gemini CLI Guide](./docs/gemini-cli.md)
 - [OpenCode Guide](./docs/opencode.md)
 - [OpenClaw Guide](./docs/openclaw.md)

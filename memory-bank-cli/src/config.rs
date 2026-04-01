@@ -56,6 +56,7 @@ impl FromStr for ConfigKey {
             "integrations.claude_code.configured" => {
                 Ok(Self::IntegrationConfigured(AgentKind::ClaudeCode))
             }
+            "integrations.codex.configured" => Ok(Self::IntegrationConfigured(AgentKind::Codex)),
             "integrations.gemini_cli.configured" => {
                 Ok(Self::IntegrationConfigured(AgentKind::GeminiCli))
             }
@@ -509,19 +510,17 @@ mod tests {
     fn config_set_integration_flags_round_trip() {
         let mut settings = AppSettings::default();
 
-        set_config_value(&mut settings, "integrations.openclaw.configured", "true")
+        set_config_value(&mut settings, "integrations.codex.configured", "true")
             .expect("set integration");
         assert_eq!(
-            get_config_value(&settings, "integrations.openclaw.configured")
-                .expect("get integration"),
+            get_config_value(&settings, "integrations.codex.configured").expect("get integration"),
             "true"
         );
 
-        set_config_value(&mut settings, "integrations.openclaw.configured", "false")
+        set_config_value(&mut settings, "integrations.codex.configured", "false")
             .expect("unset integration");
         assert_eq!(
-            get_config_value(&settings, "integrations.openclaw.configured")
-                .expect("get integration"),
+            get_config_value(&settings, "integrations.codex.configured").expect("get integration"),
             "false"
         );
     }

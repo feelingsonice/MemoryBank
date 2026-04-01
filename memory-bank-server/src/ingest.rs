@@ -271,6 +271,14 @@ impl IngestStore {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now().to_rfc3339();
 
+        if let Some(existing) = self
+            .load_existing_fragment_in_tx(&mut tx, &envelope.scope.fragment_id)
+            .await?
+        {
+            tx.rollback().await?;
+            return Ok(staged_fragment_from_existing(existing));
+        }
+
         let turn = self.resolve_turn(&mut tx, envelope, &now).await?;
         let fragment_json = serde_json::to_string(&envelope.fragment)?;
         let raw_json = serde_json::to_string(&envelope.raw)?;
@@ -306,19 +314,7 @@ impl IngestStore {
             let existing = self
                 .load_existing_fragment(&envelope.scope.fragment_id)
                 .await?;
-            return Ok(StagedFragment {
-                conversation_id: existing.conversation_id,
-                fragment_id: existing.fragment_id,
-                turn_index: existing.turn_index,
-                duplicate: true,
-                finalized: matches!(
-                    existing.status,
-                    IngestTurnStatus::Finalized
-                        | IngestTurnStatus::Processing
-                        | IngestTurnStatus::Stored
-                        | IngestTurnStatus::Failed
-                ),
-            });
+            return Ok(staged_fragment_from_existing(existing));
         }
 
         let reduced = self.rebuild_projection(&mut tx, turn.id).await?;
@@ -361,7 +357,13 @@ impl IngestStore {
                 .load_turn_by_external_id(tx, &envelope.scope.conversation_id, external_turn_id)
                 .await?
             {
-                return Ok(turn);
+                return match turn.status {
+                    IngestTurnStatus::Open => Ok(turn.into_turn_ref()),
+                    closed_status => Err(IngestError::Validation(format!(
+                        "fragment references closed external turn '{}' in conversation '{}' with status '{}'",
+                        external_turn_id, envelope.scope.conversation_id, closed_status
+                    ))),
+                };
             }
             return self
                 .create_turn(
@@ -564,12 +566,14 @@ impl IngestStore {
         tx: &mut Transaction<'_, sqlx::Sqlite>,
         conversation_id: &str,
         external_turn_id: &str,
-    ) -> Result<Option<TurnRef>, IngestError> {
-        Ok(sqlx::query_as::<_, TurnRef>(SELECT_TURN_BY_EXTERNAL_ID_SQL)
-            .bind(conversation_id)
-            .bind(external_turn_id)
-            .fetch_optional(&mut **tx)
-            .await?)
+    ) -> Result<Option<ExternalTurnRef>, IngestError> {
+        Ok(
+            sqlx::query_as::<_, ExternalTurnRef>(SELECT_TURN_BY_EXTERNAL_ID_SQL)
+                .bind(conversation_id)
+                .bind(external_turn_id)
+                .fetch_optional(&mut **tx)
+                .await?,
+        )
     }
 
     async fn load_open_turn(
@@ -592,6 +596,19 @@ impl IngestStore {
             sqlx::query_as::<_, ExistingFragmentRow>(SELECT_EXISTING_FRAGMENT_SQL)
                 .bind(fragment_id)
                 .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    async fn load_existing_fragment_in_tx(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Sqlite>,
+        fragment_id: &str,
+    ) -> Result<Option<ExistingFragmentRow>, IngestError> {
+        Ok(
+            sqlx::query_as::<_, ExistingFragmentRow>(SELECT_EXISTING_FRAGMENT_SQL)
+                .bind(fragment_id)
+                .fetch_optional(&mut **tx)
                 .await?,
         )
     }
@@ -995,6 +1012,22 @@ struct TurnRef {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+struct ExternalTurnRef {
+    id: i64,
+    turn_index: i64,
+    status: IngestTurnStatus,
+}
+
+impl ExternalTurnRef {
+    fn into_turn_ref(self) -> TurnRef {
+        TurnRef {
+            id: self.id,
+            turn_index: self.turn_index,
+        }
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
 struct StoredFragmentRow {
     fragment_json: String,
 }
@@ -1015,6 +1048,22 @@ struct ExistingFragmentRow {
     fragment_id: String,
     turn_index: i64,
     status: IngestTurnStatus,
+}
+
+fn staged_fragment_from_existing(existing: ExistingFragmentRow) -> StagedFragment {
+    StagedFragment {
+        conversation_id: existing.conversation_id,
+        fragment_id: existing.fragment_id,
+        turn_index: existing.turn_index,
+        duplicate: true,
+        finalized: matches!(
+            existing.status,
+            IngestTurnStatus::Finalized
+                | IngestTurnStatus::Processing
+                | IngestTurnStatus::Stored
+                | IngestTurnStatus::Failed
+        ),
+    }
 }
 
 #[derive(Debug)]
@@ -1138,13 +1187,7 @@ fn parse_retry_deadline(value: &str) -> Result<Instant, DispatcherError> {
     Ok(Instant::now() + wait)
 }
 
-fn validate_runtime_constraints(envelope: &IngestEnvelope) -> Result<(), IngestError> {
-    if envelope.scope.turn_id.is_some() {
-        return Err(IngestError::Validation(
-            "scope.turn_id is not supported yet; omit turn_id for now".to_string(),
-        ));
-    }
-
+fn validate_runtime_constraints(_envelope: &IngestEnvelope) -> Result<(), IngestError> {
     Ok(())
 }
 
@@ -1219,7 +1262,7 @@ const CREATE_INGEST_FRAGMENTS_CONVERSATION_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ingest_fragments_conversation
     ON ingest_fragments (conversation_id, turn_id, id);";
 
-const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index
+const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index, status
     FROM ingest_turns
     WHERE conversation_id = ? AND external_turn_id = ?
     LIMIT 1;";
@@ -1433,7 +1476,7 @@ mod tests {
         MemoryHandle, ProcessTurnError, RetryableProcessTurnError, TestStoreTurnRequest,
     };
     use crate::error::AppError;
-    use crate::memory_window::MemoryProjection;
+    use crate::memory_window::{MemoryProjection, MemoryStep};
     use memory_bank_protocol::{
         ConversationFragment, ConversationScope, FragmentBody, INGEST_PROTOCOL_VERSION,
         IngestEnvelope, SourceMeta,
@@ -1656,7 +1699,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_constraints_reject_turn_ids_for_now() {
+    fn runtime_constraints_allow_turn_ids() {
         let envelope = IngestEnvelope {
             protocol_version: INGEST_PROTOCOL_VERSION,
             source: SourceMeta {
@@ -1679,14 +1722,7 @@ mod tests {
             raw: json!({"session_id": "session-1"}),
         };
 
-        let error =
-            validate_runtime_constraints(&envelope).expect_err("turn_id should be rejected");
-
-        assert!(matches!(
-            error,
-            super::IngestError::Validation(message)
-                if message == "scope.turn_id is not supported yet; omit turn_id for now"
-        ));
+        validate_runtime_constraints(&envelope).expect("turn_id should be accepted");
     }
 
     #[tokio::test]
@@ -1863,6 +1899,391 @@ mod tests {
 
         assert_eq!(turn_count, 1);
         assert_eq!(open_turns, 0);
+    }
+
+    #[tokio::test]
+    async fn external_turn_id_coalesces_fragments_into_one_turn() {
+        let db_path = test_db_path("external_turn_coalesce");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        let first = store
+            .stage_fragment(&external_user_envelope(
+                "session-external",
+                "turn-1",
+                "fragment-1",
+                "hello",
+            ))
+            .await
+            .expect("stage first fragment");
+        let second = store
+            .stage_fragment(&external_hard_assistant_envelope(
+                "session-external",
+                "turn-1",
+                "fragment-2",
+                "done",
+            ))
+            .await
+            .expect("stage second fragment");
+
+        assert_eq!(first.turn_index, 1);
+        assert_eq!(second.turn_index, 1);
+        assert!(!first.finalized);
+        assert!(second.finalized);
+
+        let turn_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
+                .bind("session-external")
+                .fetch_one(&store.pool)
+                .await
+                .expect("turn count");
+        assert_eq!(turn_count, 1);
+    }
+
+    #[tokio::test]
+    async fn different_external_turn_ids_create_new_turns() {
+        let db_path = test_db_path("external_turn_split");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        let first = store
+            .stage_fragment(&external_hard_assistant_envelope(
+                "session-external",
+                "turn-1",
+                "fragment-1",
+                "first",
+            ))
+            .await
+            .expect("stage first turn");
+        let second = store
+            .stage_fragment(&external_hard_assistant_envelope(
+                "session-external",
+                "turn-2",
+                "fragment-2",
+                "second",
+            ))
+            .await
+            .expect("stage second turn");
+
+        assert_eq!(first.turn_index, 1);
+        assert_eq!(second.turn_index, 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_fragment_for_closed_external_turn_returns_duplicate_success() {
+        let db_path = test_db_path("external_turn_duplicate");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+        let envelope =
+            external_hard_assistant_envelope("session-external", "turn-1", "fragment-1", "done");
+
+        let first = store.stage_fragment(&envelope).await.expect("first stage");
+        let duplicate = store
+            .stage_fragment(&envelope)
+            .await
+            .expect("duplicate stage");
+
+        assert!(first.finalized);
+        assert!(duplicate.duplicate);
+        assert!(duplicate.finalized);
+        assert_eq!(duplicate.turn_index, first.turn_index);
+    }
+
+    #[tokio::test]
+    async fn late_fragments_for_closed_external_turns_are_rejected() {
+        let db_path = test_db_path("external_turn_closed");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        for (index, status) in [
+            IngestTurnStatus::Finalized,
+            IngestTurnStatus::Processing,
+            IngestTurnStatus::Stored,
+            IngestTurnStatus::Failed,
+            IngestTurnStatus::Aborted,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let conversation_id = format!("session-closed-{index}");
+            let turn_id = format!("turn-{index}");
+            let (next_attempt_at, stored_at, finalized_at, processing_started_at) = match status {
+                IngestTurnStatus::Finalized => (
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                ),
+                IngestTurnStatus::Processing => (
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                    Some("2026-03-05T00:00:00Z"),
+                    Some("2026-03-05T00:00:00Z"),
+                ),
+                IngestTurnStatus::Stored => (
+                    None,
+                    Some("2026-03-05T00:00:00Z"),
+                    Some("2026-03-05T00:00:00Z"),
+                    None,
+                ),
+                IngestTurnStatus::Failed => (None, None, Some("2026-03-05T00:00:00Z"), None),
+                IngestTurnStatus::Aborted => (None, None, None, None),
+                IngestTurnStatus::Open => unreachable!("test only covers closed turns"),
+            };
+            insert_turn_row_with_external_id(
+                &store.pool,
+                &conversation_id,
+                Some(&turn_id),
+                1,
+                status,
+                &projection_json("user", "assistant"),
+                next_attempt_at,
+                stored_at,
+                finalized_at,
+                processing_started_at,
+                0,
+            )
+            .await;
+
+            let error = store
+                .stage_fragment(&external_user_envelope(
+                    &conversation_id,
+                    &turn_id,
+                    &format!("fragment-late-{index}"),
+                    "late fragment",
+                ))
+                .await
+                .expect_err("closed external turn should reject late fragment");
+
+            assert!(matches!(
+                error,
+                super::IngestError::Validation(message)
+                    if message.contains("fragment references closed external turn")
+                        && message.contains(&turn_id)
+                        && message.contains(status.as_str())
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn service_duplicate_replay_of_closed_external_fragment_reports_duplicate() {
+        let db_path = test_db_path("service_external_duplicate");
+        let service = IngestService::open(&db_path, MemoryHandle::closed_for_tests(), 0)
+            .await
+            .expect("open service");
+        let envelope =
+            external_hard_assistant_envelope("session-service", "turn-1", "fragment-1", "done");
+
+        let first = service
+            .ingest(envelope.clone())
+            .await
+            .expect("first ingest");
+        let duplicate = service.ingest(envelope).await.expect("duplicate ingest");
+
+        assert_eq!(first.turn_index, 1);
+        assert!(!first.duplicate);
+        assert!(first.finalized);
+        assert_eq!(duplicate.turn_index, 1);
+        assert!(duplicate.duplicate);
+        assert!(duplicate.finalized);
+    }
+
+    #[tokio::test]
+    async fn service_scopes_external_turn_ids_by_conversation() {
+        let db_path = test_db_path("service_external_scope");
+        let service = IngestService::open(&db_path, MemoryHandle::closed_for_tests(), 0)
+            .await
+            .expect("open service");
+
+        let first = service
+            .ingest(external_hard_assistant_envelope(
+                "conversation-a",
+                "turn-1",
+                "fragment-1",
+                "first",
+            ))
+            .await
+            .expect("first ingest");
+        let second = service
+            .ingest(external_hard_assistant_envelope(
+                "conversation-b",
+                "turn-1",
+                "fragment-2",
+                "second",
+            ))
+            .await
+            .expect("second ingest");
+
+        assert_eq!(first.turn_index, 1);
+        assert_eq!(second.turn_index, 1);
+
+        let pool = open_file_pool(&db_path).await;
+        let first_count = turn_count_for_conversation(&pool, "conversation-a").await;
+        let second_count = turn_count_for_conversation(&pool, "conversation-b").await;
+        assert_eq!(first_count, 1);
+        assert_eq!(second_count, 1);
+    }
+
+    #[tokio::test]
+    async fn service_external_turn_window_preserves_steps_and_messages() {
+        let db_path = test_db_path("service_external_window");
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let service = IngestService::open(&db_path, memory, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open service");
+
+        service
+            .ingest(external_user_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-1",
+                "remember this",
+            ))
+            .await
+            .expect("user fragment");
+        service
+            .ingest(external_tool_call_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-2",
+                "tool-1",
+                "Bash",
+                json!({"command": "pwd"}),
+            ))
+            .await
+            .expect("tool call fragment");
+        service
+            .ingest(external_tool_result_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-3",
+                "tool-1",
+                "Bash",
+                json!({"stdout": "/tmp"}),
+            ))
+            .await
+            .expect("tool result fragment");
+        let outcome = service
+            .ingest(external_hard_assistant_envelope(
+                "session-window",
+                "turn-1",
+                "fragment-4",
+                "done",
+            ))
+            .await
+            .expect("assistant fragment");
+
+        assert!(outcome.finalized);
+
+        let request = recv_store_request(&mut requests).await;
+        assert_eq!(request.window.previous_turns.len(), 0);
+        assert_eq!(request.window.current_turn.user_message, "remember this");
+        assert_eq!(request.window.current_turn.assistant_reply, "done");
+        assert_eq!(
+            request.window.current_turn.steps,
+            vec![
+                MemoryStep::ToolCall {
+                    name: "Bash".to_string(),
+                    input: "{\"command\":\"pwd\"}".to_string(),
+                },
+                MemoryStep::ToolResult {
+                    name: "Bash".to_string(),
+                    output: "{\"stdout\":\"/tmp\"}".to_string(),
+                },
+            ]
+        );
+
+        let pool = open_file_pool(&db_path).await;
+        mark_processing_turn_stored(&pool, request.turn_id).await;
+        request.responder.send(Ok(())).expect("ack success");
+        let stored = wait_for_turn_status(&pool, request.turn_id, IngestTurnStatus::Stored).await;
+        assert_eq!(stored.status, IngestTurnStatus::Stored);
+    }
+
+    #[tokio::test]
+    async fn service_rejects_late_external_fragments_while_processing() {
+        let db_path = test_db_path("service_external_processing_reject");
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let service = IngestService::open(&db_path, memory, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open service");
+
+        service
+            .ingest(external_hard_assistant_envelope(
+                "session-processing",
+                "turn-1",
+                "fragment-1",
+                "done",
+            ))
+            .await
+            .expect("finalizing ingest");
+
+        let request = recv_store_request(&mut requests).await;
+        let error = service
+            .ingest(external_user_envelope(
+                "session-processing",
+                "turn-1",
+                "fragment-2",
+                "late user",
+            ))
+            .await
+            .expect_err("processing turn should reject late fragment");
+        assert!(matches!(
+            error,
+            super::IngestError::Validation(message)
+                if message.contains("closed external turn 'turn-1'")
+                    && message.contains("processing")
+        ));
+
+        let pool = open_file_pool(&db_path).await;
+        mark_processing_turn_stored(&pool, request.turn_id).await;
+        request.responder.send(Ok(())).expect("ack success");
+        wait_for_turn_status(&pool, request.turn_id, IngestTurnStatus::Stored).await;
+    }
+
+    #[tokio::test]
+    async fn service_rejects_late_external_fragments_after_stored() {
+        let db_path = test_db_path("service_external_stored_reject");
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let service = IngestService::open(&db_path, memory, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open service");
+
+        service
+            .ingest(external_hard_assistant_envelope(
+                "session-stored",
+                "turn-1",
+                "fragment-1",
+                "done",
+            ))
+            .await
+            .expect("finalizing ingest");
+
+        let request = recv_store_request(&mut requests).await;
+        let pool = open_file_pool(&db_path).await;
+        mark_processing_turn_stored(&pool, request.turn_id).await;
+        request.responder.send(Ok(())).expect("ack success");
+        wait_for_turn_status(&pool, request.turn_id, IngestTurnStatus::Stored).await;
+
+        let error = service
+            .ingest(external_user_envelope(
+                "session-stored",
+                "turn-1",
+                "fragment-2",
+                "late user",
+            ))
+            .await
+            .expect_err("stored turn should reject late fragment");
+        assert!(matches!(
+            error,
+            super::IngestError::Validation(message)
+                if message.contains("closed external turn 'turn-1'")
+                    && message.contains("stored")
+        ));
     }
 
     #[tokio::test]
@@ -2366,6 +2787,35 @@ mod tests {
         }
     }
 
+    fn external_hard_assistant_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        text: &str,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "Stop".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::Hard,
+                body: FragmentBody::AssistantMessage {
+                    text: text.to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id, "turn_id": turn_id}),
+        }
+    }
+
     fn user_envelope(
         conversation_id: &str,
         fragment_id: &str,
@@ -2395,6 +2845,113 @@ mod tests {
         }
     }
 
+    fn external_user_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        text: &str,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "UserPromptSubmit".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::UserMessage {
+                    text: text.to_string(),
+                },
+            },
+            raw: json!({"session_id": conversation_id, "turn_id": turn_id}),
+        }
+    }
+
+    fn external_tool_call_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "PreToolUse".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::ToolCall {
+                    name: tool_name.to_string(),
+                    input_json: serde_json::to_string(&input).expect("tool input json"),
+                    tool_use_id: Some(tool_use_id.to_string()),
+                },
+            },
+            raw: json!({
+                "session_id": conversation_id,
+                "turn_id": turn_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_input": input
+            }),
+        }
+    }
+
+    fn external_tool_result_envelope(
+        conversation_id: &str,
+        turn_id: &str,
+        fragment_id: &str,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: serde_json::Value,
+    ) -> IngestEnvelope {
+        IngestEnvelope {
+            protocol_version: INGEST_PROTOCOL_VERSION,
+            source: SourceMeta {
+                agent: "codex".to_string(),
+                event: "PostToolUse".to_string(),
+            },
+            scope: ConversationScope {
+                conversation_id: conversation_id.to_string(),
+                turn_id: Some(turn_id.to_string()),
+                fragment_id: fragment_id.to_string(),
+                sequence_hint: None,
+                emitted_at_rfc3339: None,
+            },
+            fragment: ConversationFragment {
+                terminality: Terminality::None,
+                body: FragmentBody::ToolResult {
+                    name: tool_name.to_string(),
+                    output_json: serde_json::to_string(&output).expect("tool output json"),
+                    tool_use_id: Some(tool_use_id.to_string()),
+                },
+            },
+            raw: json!({
+                "session_id": conversation_id,
+                "turn_id": turn_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "tool_response": output
+            }),
+        }
+    }
+
     fn projection_json(user_message: &str, assistant_reply: &str) -> String {
         serde_json::to_string(&MemoryProjection {
             user_message: user_message.to_string(),
@@ -2416,9 +2973,39 @@ mod tests {
         processing_started_at: Option<&str>,
         attempt_count: i64,
     ) -> i64 {
+        insert_turn_row_with_external_id(
+            pool,
+            conversation_id,
+            None,
+            turn_index,
+            status,
+            projection_json,
+            next_attempt_at,
+            stored_at,
+            finalized_at,
+            processing_started_at,
+            attempt_count,
+        )
+        .await
+    }
+
+    async fn insert_turn_row_with_external_id(
+        pool: &SqlitePool,
+        conversation_id: &str,
+        external_turn_id: Option<&str>,
+        turn_index: i64,
+        status: IngestTurnStatus,
+        projection_json: &str,
+        next_attempt_at: Option<&str>,
+        stored_at: Option<&str>,
+        finalized_at: Option<&str>,
+        processing_started_at: Option<&str>,
+        attempt_count: i64,
+    ) -> i64 {
         let result = sqlx::query(
             "INSERT INTO ingest_turns (
                 conversation_id,
+                external_turn_id,
                 turn_index,
                 status,
                 projection_json,
@@ -2431,9 +3018,10 @@ mod tests {
                 next_attempt_at,
                 processing_started_at,
                 stored_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(conversation_id)
+        .bind(external_turn_id)
         .bind(turn_index)
         .bind(status)
         .bind(projection_json)
@@ -2462,6 +3050,33 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("turn state")
+    }
+
+    async fn turn_count_for_conversation(pool: &SqlitePool, conversation_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM ingest_turns WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await
+            .expect("turn count")
+    }
+
+    async fn mark_processing_turn_stored(pool: &SqlitePool, turn_id: i64) {
+        sqlx::query(
+            "UPDATE ingest_turns
+             SET status = 'stored',
+                 last_error = NULL,
+                 next_attempt_at = NULL,
+                 processing_started_at = NULL,
+                 stored_at = ?,
+                 updated_at = ?
+             WHERE id = ? AND status = 'processing'",
+        )
+        .bind("2026-03-05T00:00:05Z")
+        .bind("2026-03-05T00:00:05Z")
+        .bind(turn_id)
+        .execute(pool)
+        .await
+        .expect("mark turn stored");
     }
 
     async fn recv_store_request(

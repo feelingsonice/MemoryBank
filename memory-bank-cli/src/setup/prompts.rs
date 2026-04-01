@@ -16,6 +16,8 @@ use std::io::{self, IsTerminal};
 use super::plan::{AdvancedSettings, SecretChoice, SetupPlan};
 use super::render::{print_setup_intro, print_setup_section};
 
+const NO_SUPPORTED_AGENTS_MESSAGE: &str = "No supported agents were detected on PATH. You can rerun `mb setup` later after installing Claude Code, Codex, Gemini CLI, OpenCode, or OpenClaw.";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SecretPromptPlan {
     NotRequired,
@@ -364,12 +366,7 @@ fn prompt_autostart(current: Option<bool>) -> Result<WizardStep<bool>, AppError>
 
 fn prompt_agents(detected: &[AgentKind]) -> Result<WizardStep<Vec<AgentKind>>, AppError> {
     if detected.is_empty() {
-        println!(
-            "{}",
-            styled_warning(
-                "No supported agents were detected on PATH. You can rerun `mb setup` later after installing Claude Code, Gemini CLI, OpenCode, or OpenClaw."
-            )
-        );
+        println!("{}", styled_warning(NO_SUPPORTED_AGENTS_MESSAGE));
         return Ok(WizardStep::Continue(Vec::new()));
     }
 
@@ -567,6 +564,11 @@ fn prompt_advanced_settings(
 mod tests {
     use super::*;
     use crate::command_utils::yes_no;
+
+    #[test]
+    fn no_supported_agents_message_mentions_codex() {
+        assert!(NO_SUPPORTED_AGENTS_MESSAGE.contains("Codex"));
+    }
 
     #[test]
     fn secret_prompt_plan_prefers_shell_key_over_stored_secret() {

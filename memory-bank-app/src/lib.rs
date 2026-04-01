@@ -343,6 +343,8 @@ pub struct IntegrationsSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code: Option<IntegrationState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<IntegrationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemini_cli: Option<IntegrationState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode: Option<IntegrationState>,
@@ -353,6 +355,7 @@ pub struct IntegrationsSettings {
 impl IntegrationsSettings {
     pub fn is_empty(&self) -> bool {
         self.claude_code.is_none()
+            && self.codex.is_none()
             && self.gemini_cli.is_none()
             && self.opencode.is_none()
             && self.openclaw.is_none()

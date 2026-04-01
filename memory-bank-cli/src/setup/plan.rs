@@ -262,6 +262,7 @@ mod tests {
         let current = AppSettings {
             integrations: Some(memory_bank_app::IntegrationsSettings {
                 claude_code: Some(memory_bank_app::IntegrationState { configured: true }),
+                codex: Some(memory_bank_app::IntegrationState { configured: true }),
                 gemini_cli: Some(memory_bank_app::IntegrationState { configured: false }),
                 opencode: Some(memory_bank_app::IntegrationState { configured: true }),
                 openclaw: Some(memory_bank_app::IntegrationState { configured: true }),
@@ -287,6 +288,10 @@ mod tests {
                 .claude_code
                 .as_ref()
                 .map(|state| state.configured),
+            Some(true)
+        );
+        assert_eq!(
+            integrations.codex.as_ref().map(|state| state.configured),
             Some(true)
         );
         assert_eq!(
