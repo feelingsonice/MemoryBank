@@ -744,13 +744,14 @@ where
                 .iter()
                 .find(|neighbor| neighbor.id == evolved.id)
             {
-                if orig.context == evolved.context && orig.tags == evolved.tags {
+                let next_context = evolved.context.unwrap_or_else(|| orig.context.clone());
+                if orig.context == next_context && orig.tags == evolved.tags {
                     continue;
                 }
                 neighbor_updates.push(NeighborUpdate {
                     id: orig.id,
                     content: orig.content.clone(),
-                    context: evolved.context,
+                    context: next_context,
                     keywords: orig.keywords.clone(),
                     tags: evolved.tags,
                 });
@@ -1401,6 +1402,70 @@ mod tests {
         assert!(error.to_string().contains("refined tag encoding failed"));
         assert_eq!(memory_count(&db).await, 1, "should not insert a new memory");
         assert_eq!(turn_status(&db, 7).await, "processing");
+    }
+
+    #[tokio::test]
+    async fn neighbor_tag_only_updates_preserve_existing_context() {
+        let db = open_memory_db().await;
+        create_processing_turn_table(&db).await;
+        insert_processing_turn(&db, 8).await;
+        let neighbor_id = insert_memory_with_embedding(
+            &db,
+            "existing",
+            "original context",
+            &["neighbor-kw"],
+            &["neighbor-tag"],
+            &[0.1, 0.2],
+        )
+        .await;
+
+        let llm = FakeAnalyzer::with_evolution(
+            ExtractedMemoryAnalysis {
+                context: "conversation context".to_string(),
+                keywords: vec!["kw".to_string()],
+                tags: vec!["initial-tag".to_string()],
+            },
+            MemoryEvolution {
+                suggested_connections: Vec::new(),
+                updated_new_memory_tags: Vec::new(),
+                neighbor_updates: vec![crate::llm::EvolvedNeighbor {
+                    id: neighbor_id,
+                    context: None,
+                    tags: vec!["updated-tag".to_string()],
+                }],
+            },
+        );
+        let encoder = FakeEncoder {
+            encode_results: Arc::new(Mutex::new(Vec::new())),
+            encode_memory_results: Arc::new(Mutex::new(vec![Ok(vec![0.4, 0.6])])),
+            encode_memories_results: Arc::new(Mutex::new(vec![Ok(vec![vec![0.9, 0.1]])])),
+        };
+
+        process_turn_with_clients(
+            &db,
+            &llm,
+            &encoder,
+            10,
+            8,
+            ProjectedConversationWindow {
+                previous_turns: Vec::new(),
+                current_turn: current_projection(),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("tag-only neighbor update should succeed");
+
+        assert_eq!(memory_count(&db).await, 2, "new memory should be stored");
+        assert_eq!(turn_status(&db, 8).await, "stored");
+
+        let row = sqlx::query("SELECT context, tags FROM memories WHERE id = ?")
+            .bind(neighbor_id)
+            .fetch_one(db.pool_for_tests())
+            .await
+            .expect("neighbor row");
+        assert_eq!(row.get::<String, _>("context"), "original context");
+        assert_eq!(row.get::<String, _>("tags"), "[\"updated-tag\"]");
     }
 
     #[tokio::test]

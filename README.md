@@ -3,7 +3,7 @@
   Memory Bank
 </h1>
 
-Memory Bank gives coding agents shared, long-term memory across sessions and across tools.
+Memory Bank gives agents shared, long-term memory across sessions and across tools.
 
 It runs locally, stores memory in your own namespaced SQLite databases, and works with Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw.
 
@@ -98,7 +98,7 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 3. The service assembles finalized turns, analyzes them with your configured provider, and stores memory notes plus local embeddings.
 4. Agents call `retrieve_memory` over MCP when prior context could improve the answer.
 
-Important: the coding agent you use directly is separate from the internal provider Memory Bank uses for memory analysis. For example, you can use Claude Code while Memory Bank runs on Gemini, OpenAI, Anthropic, or Ollama.
+Important: the agent you use directly is separate from the internal provider Memory Bank uses for memory analysis. For example, you can use Claude Code or OpenClaw while Memory Bank runs on Gemini, OpenAI, Anthropic, or Ollama.
 
 ## Advanced
 
