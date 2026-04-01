@@ -210,7 +210,7 @@ impl IngestService {
         if recovered_turns > 0 {
             warn!(
                 recovered_turns,
-                "Recovered interrupted ingest turns and re-queued them for processing"
+                "Recovered interrupted ingest turns and queued them to resume processing"
             );
         }
 
@@ -252,7 +252,7 @@ impl IngestService {
                 conversation_id = %envelope.scope.conversation_id,
                 turn_index = staged.turn_index,
                 duplicate = staged.duplicate,
-                "Queued finalized turn for background memory extraction"
+                "Queued finalized turn for background memory processing"
             );
             self.dispatcher_notify.notify_one();
         }
@@ -448,7 +448,7 @@ impl IngestStore {
                     previous_turn_id = open_turn.id,
                     previous_turn_index = open_turn.turn_index,
                     fragment_id = %envelope.scope.fragment_id,
-                    "Aborting incomplete open turn because a new user message started a replacement turn"
+                    "Aborted an incomplete open turn because a new user message started the next turn"
                 );
                 self.abort_turn(tx, open_turn.id, now).await?;
                 return self
@@ -905,7 +905,7 @@ impl IngestDispatcher {
                 attempt_count = turn.attempt_count,
                 max_processing_attempts = self.max_processing_attempts,
                 error = %exhausted_error,
-                "Processing retry cap reached before memory extraction; exhausting turn"
+                "Finalized turn had already reached the retry limit; marking it exhausted"
             );
             self.store
                 .mark_exhausted(turn.id, &exhausted_error, turn.attempt_count, &now)
@@ -921,7 +921,7 @@ impl IngestDispatcher {
                     conversation_id = %turn.conversation_id,
                     turn_index = turn.turn_index,
                     error = %error,
-                    "Claimed turn has invalid finalized timestamp; marking it failed"
+                    "Finalized turn has an invalid timestamp; marking it failed"
                 );
                 self.store
                     .mark_failed(turn.id, &error.to_string(), &Utc::now().to_rfc3339())
@@ -937,7 +937,7 @@ impl IngestDispatcher {
                     conversation_id = %turn.conversation_id,
                     turn_index = turn.turn_index,
                     error = %error,
-                    "Failed to rebuild conversation window for claimed turn; marking it failed"
+                    "Failed to rebuild the stored conversation window; marking turn failed"
                 );
                 self.store
                     .mark_failed(turn.id, &error.to_string(), &Utc::now().to_rfc3339())
@@ -952,7 +952,7 @@ impl IngestDispatcher {
             turn_index = turn.turn_index,
             attempt = turn.attempt_count + 1,
             history_turns = window.previous_turns.len(),
-            "Dispatching finalized turn for memory extraction"
+            "Dispatching finalized turn for memory processing"
         );
 
         match self
@@ -974,7 +974,7 @@ impl IngestDispatcher {
                         attempt_count = next_attempt_count,
                         next_attempt_at = %next_attempt_at,
                         error = %error,
-                        "Memory extraction failed; rescheduling turn"
+                        "Memory processing failed; scheduling a retry"
                     );
                     self.store
                         .mark_retryable_failure(
@@ -993,7 +993,7 @@ impl IngestDispatcher {
                         attempt_count = next_attempt_count,
                         max_processing_attempts = self.max_processing_attempts,
                         error = %error,
-                        "Memory extraction retry cap reached; exhausting turn"
+                        "Memory processing reached the retry limit; marking turn exhausted"
                     );
                     self.store
                         .mark_exhausted(turn.id, &error, next_attempt_count, &now)
@@ -1007,7 +1007,7 @@ impl IngestDispatcher {
                     conversation_id = %turn.conversation_id,
                     turn_index = turn.turn_index,
                     error = %error,
-                    "Memory extraction failed permanently; marking turn failed"
+                    "Memory processing failed permanently; marking turn failed"
                 );
                 self.store
                     .mark_failed(turn.id, &error.to_string(), &Utc::now().to_rfc3339())

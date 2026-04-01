@@ -382,7 +382,7 @@ fn register_sqlite_vec() {
     static SQLITE_VEC_REGISTRATION: Once = Once::new();
 
     SQLITE_VEC_REGISTRATION.call_once(|| {
-        info!("Registering sqlite-vec SQLite extension");
+        debug!("Registering sqlite-vec SQLite extension");
 
         // SAFETY: sqlite3_auto_extension expects a C-compatible initialization
         // function pointer. sqlite-vec exposes that symbol, but Rust cannot
@@ -426,7 +426,7 @@ async fn create_pool(db_path: &Path, max_connections: u32) -> Result<SqlitePool,
 }
 
 async fn create_schema(pool: &SqlitePool) -> Result<(), AppError> {
-    info!("Ensuring core SQLite schema exists");
+    debug!("Ensuring core SQLite schema exists");
 
     for (table_name, statement) in [
         ("memories", CREATE_MEMORIES_TABLE_SQL),
@@ -463,8 +463,8 @@ async fn ensure_vec_table(
         VecTableMode::EnsureExists => {
             create_vec_table(pool, plan.dimension).await?;
             debug!(
-                "Verified 'vec_memories' virtual table (dimension: {}).",
-                plan.dimension
+                dimension = plan.dimension,
+                "Verified vec_memories virtual table"
             );
         }
     }
@@ -511,7 +511,7 @@ fn determine_vec_table_mode(
         match previous_config {
             Some(previous) => warn!(
                 encoder_model = %previous.encoder_model,
-                "Vector index is missing; rebuilding embeddings to recover it"
+                "Vector index table is missing; rebuilding embeddings to restore it"
             ),
             None => info!("Initializing vector index for a new memory store"),
         }
@@ -524,7 +524,7 @@ fn determine_vec_table_mode(
                 warn!(
                     previous_llm_model = %previous.llm_model,
                     llm_model = %llm_model_id,
-                    "LLM model changed; future memory extraction may differ from existing memories"
+                    "LLM model changed; new memories may be shaped differently from existing ones"
                 );
             }
 
@@ -613,7 +613,7 @@ async fn migrate_embeddings(
 ) -> Result<(), AppError> {
     let memories = load_memories_for_migration(pool).await?;
     if memories.is_empty() {
-        info!("Vector index ready with no existing memories to migrate");
+        info!("Vector index is ready; no existing memories needed re-encoding");
         return Ok(());
     }
 
@@ -624,7 +624,7 @@ async fn migrate_embeddings(
     info!(
         memory_count = memories.len(),
         chunk_size = MIGRATION_CHUNK_SIZE,
-        "Re-encoding stored memories for vector index migration"
+        "Rebuilding the vector index from stored memories"
     );
 
     for chunk in memories.chunks(MIGRATION_CHUNK_SIZE) {
@@ -647,7 +647,7 @@ async fn migrate_embeddings(
 
     info!(
         memory_count = memories.len(),
-        "Completed vector index migration"
+        "Finished rebuilding the vector index"
     );
     Ok(())
 }

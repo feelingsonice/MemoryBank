@@ -392,13 +392,13 @@ impl MemoryActor {
                         warn!(
                             turn_id,
                             error = %error,
-                            "Failed to store finalized turn in memory graph"
+                            "Failed to store finalized turn in long-term memory"
                         );
                     }
                     if responder.send(result).is_err() {
                         warn!(
                             turn_id,
-                            "Finished processing turn, but the caller dropped the response channel"
+                            "Finished processing turn, but the caller was no longer waiting for the result"
                         );
                     }
                 }
@@ -437,9 +437,9 @@ impl MemoryActor {
     ) {
         let result = self.retrieve(query).await;
         if responder.send(result).is_err() {
-            warn!("Retrieve request completed, but the caller dropped the response channel");
+            warn!("retrieve_memory finished, but the caller was no longer waiting for the result");
         } else {
-            debug!("Retrieve results sent to caller");
+            debug!("Sent retrieve_memory results to caller");
         }
     }
 
@@ -459,7 +459,7 @@ pub(crate) async fn retrieve_with_encoder<E>(
 where
     E: MemoryEncoderClient + ?Sized,
 {
-    debug!("Encoding retrieve_memory query");
+    debug!("Encoding retrieve_memory query text");
 
     // 1. Encode the query text
     let embeddings = encoder
@@ -482,7 +482,7 @@ where
         info!(
             knn_matches = 0,
             returned = 0,
-            "Memory retrieval produced no matches"
+            "No stored memories matched the retrieve_memory query"
         );
         return Ok(RetrievalOutcome {
             notes: Vec::new(),
@@ -508,7 +508,7 @@ where
                 knn_matches = knn_count,
                 expanded_matches = expanded_count,
                 returned = notes.len(),
-                "Memory retrieval completed",
+                "Completed retrieve_memory request",
             );
             RetrievalOutcome {
                 notes,
@@ -595,13 +595,13 @@ where
     let estimated_prompt_tokens =
         estimate_token_count(&previous_turns) + estimate_token_count(&content);
 
-    info!(
+    debug!(
         history_turns = window.previous_turns.len(),
         history_chars,
         current_turn_chars,
         total_prompt_chars,
         estimated_prompt_tokens,
-        "Prepared memory analysis prompt",
+        "Prepared prompt for memory analysis",
     );
     let analysis_result = tokio::time::timeout(
         LLM_TIMEOUT,
@@ -643,16 +643,16 @@ where
 {
     debug!(
         previous_turns = window.previous_turns.len(),
-        "Processing finalized turn into memory graph"
+        "Starting memory processing for finalized turn"
     );
 
     let prepared_memory = prepare_memory_for_storage(llm, &window, timestamp).await?;
 
-    info!(
+    debug!(
         keyword_count = prepared_memory.keywords.len(),
         tag_count = prepared_memory.tags.len(),
         context_chars = prepared_memory.conversation_context.chars().count(),
-        "Extracted candidate memory from finalized turn",
+        "Generated candidate memory note from finalized turn",
     );
     debug!(
         keywords = ?prepared_memory.keywords,
@@ -684,9 +684,9 @@ where
         neighbor_ids.insert(row.id);
         neighbor_contexts.push(row.into());
     }
-    info!(
+    debug!(
         neighbor_count = neighbor_contexts.len(),
-        "Loaded nearest memory neighbors for graph evolution"
+        "Loaded nearest memory neighbors for graph updates"
     );
     let neighbors_json = if neighbor_contexts.is_empty() {
         String::new()
@@ -737,7 +737,10 @@ where
             .filter(|target_id| {
                 let known = neighbor_ids.contains(target_id);
                 if !known {
-                    warn!(target_id, "Ignoring LLM-suggested link to unknown neighbor");
+                    warn!(
+                        target_id,
+                        "Ignoring graph link suggested for an unknown neighbor memory"
+                    );
                 }
                 known
             })
@@ -766,16 +769,16 @@ where
             } else {
                 warn!(
                     target_id = evolved.id,
-                    "Ignoring LLM-suggested update for unknown neighbor"
+                    "Ignoring graph update suggested for an unknown neighbor memory"
                 );
             }
         }
 
-        info!(
+        debug!(
             suggested_links = link_ids.len(),
             neighbor_updates = neighbor_updates.len(),
             tags_changed = refined_tags.is_some(),
-            "Graph evolution completed",
+            "Completed graph update planning",
         );
     }
 
@@ -950,7 +953,7 @@ async fn persist_prepared_turn(
         memory_id = new_id,
         links_added = link_count,
         neighbor_updates = neighbor_update_count,
-        "Stored memory and committed graph updates",
+        "Stored memory note and committed graph updates",
     );
     Ok(())
 }

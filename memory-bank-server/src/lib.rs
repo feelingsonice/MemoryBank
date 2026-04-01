@@ -54,14 +54,14 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
     info!(
         encoder_provider = %encoder,
         models_dir = %dirs.models.display(),
-        "Initializing encoder provider",
+        "Loading encoder provider",
     );
     let encoder = encoder::initialize(encoder, &dirs.models)?;
-    info!(encoder_model = %encoder.model_id, "Encoder provider ready");
+    info!(encoder_model = %encoder.model_id, "Encoder provider is ready");
 
-    info!(llm_provider = %llm, "Initializing LLM provider");
+    info!(llm_provider = %llm, "Loading LLM provider");
     let llm = llm::initialize(llm)?;
-    info!(llm_model = %llm.model_id, "LLM provider ready");
+    info!(llm_model = %llm.model_id, "LLM provider is ready");
 
     info!(
         db_path = %dirs.db.display(),

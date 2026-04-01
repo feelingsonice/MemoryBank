@@ -47,7 +47,7 @@ impl McpServer {
         let RetrieveMemoryArgs { query } = args.0;
         info!(
             query_chars = query.chars().count(),
-            "Received retrieve_memory tool call"
+            "Running retrieve_memory request"
         );
 
         let notes = self.memory.retrieve(query).await?;
