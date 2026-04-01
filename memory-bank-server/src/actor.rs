@@ -462,12 +462,12 @@ where
     debug!("Encoding retrieve_memory query");
 
     // 1. Encode the query text
-    let mut embeddings = encoder
+    let embeddings = encoder
         .encode(vec![query.to_string()])
         .await
         .map_err(|e| McpError::internal_error(format!("Encoder error: {}", e), None))?;
 
-    let embedding = take_single_embedding(std::mem::take(&mut embeddings), "query encoding")
+    let embedding = take_single_embedding(embeddings, "query encoding")
         .map_err(|e| McpError::internal_error(format!("Encoder error: {}", e), None))?;
 
     let embedding_bytes = embedding_to_bytes(&embedding);
@@ -525,7 +525,10 @@ fn estimate_token_count(text: &str) -> usize {
     if chars == 0 { 0 } else { chars.div_ceil(4) }
 }
 
-fn serialize_json<T: Serialize>(value: &T, label: &str) -> Result<String, ProcessTurnError> {
+fn serialize_json<T: Serialize + ?Sized>(
+    value: &T,
+    label: &str,
+) -> Result<String, ProcessTurnError> {
     serde_json::to_string(value).map_err(|error| {
         RetryableProcessTurnError::Serialization(format!("Failed to serialize {label}: {error}"))
             .into()
@@ -693,7 +696,7 @@ where
 
     let mut link_ids = Vec::new();
     let mut neighbor_updates = Vec::new();
-    let mut refined_tags = prepared_memory.tags.clone();
+    let mut refined_tags = None;
 
     if !neighbors_json.is_empty() {
         debug!(
@@ -723,8 +726,13 @@ where
             }
         };
 
-        link_ids = evolution
-            .suggested_connections
+        let MemoryEvolution {
+            suggested_connections,
+            updated_new_memory_tags,
+            neighbor_updates: evolved_neighbors,
+        } = evolution;
+
+        link_ids = suggested_connections
             .into_iter()
             .filter(|target_id| {
                 let known = neighbor_ids.contains(target_id);
@@ -735,11 +743,11 @@ where
             })
             .collect();
 
-        if !evolution.updated_new_memory_tags.is_empty() {
-            refined_tags = evolution.updated_new_memory_tags;
+        if !updated_new_memory_tags.is_empty() && updated_new_memory_tags != prepared_memory.tags {
+            refined_tags = Some(updated_new_memory_tags);
         }
 
-        for evolved in evolution.neighbor_updates {
+        for evolved in evolved_neighbors {
             if let Some(orig) = neighbor_contexts
                 .iter()
                 .find(|neighbor| neighbor.id == evolved.id)
@@ -766,16 +774,16 @@ where
         info!(
             suggested_links = link_ids.len(),
             neighbor_updates = neighbor_updates.len(),
-            tags_changed = (refined_tags != prepared_memory.tags),
+            tags_changed = refined_tags.is_some(),
             "Graph evolution completed",
         );
     }
 
-    if refined_tags != prepared_memory.tags {
+    if let Some(refined_tags) = refined_tags.as_ref() {
         let updated_payload = EmbeddingInput {
             content: &prepared_memory.content,
             keywords: &prepared_memory.keywords,
-            tags: &refined_tags,
+            tags: refined_tags,
             context: &prepared_memory.conversation_context,
         };
         let refined_embedding = encoder
@@ -785,15 +793,16 @@ where
         embedding_bytes = embedding_to_bytes(&refined_embedding);
     }
 
+    let tags_for_storage = refined_tags.as_deref().unwrap_or(&prepared_memory.tags);
     let prepared_turn = PreparedTurnWrite {
         content: prepared_memory.content,
         memory_timestamp: timestamp.to_rfc3339(),
         conversation_context: prepared_memory.conversation_context,
         keywords_json: serialize_json(&prepared_memory.keywords, "memory keywords")?,
-        tags_json: serialize_json(&refined_tags, "memory tags")?,
+        tags_json: serialize_json(tags_for_storage, "memory tags")?,
         embedding_bytes,
         link_ids,
-        neighbor_updates: prepare_neighbor_writes(encoder, &neighbor_updates, neighbor_ids.len())
+        neighbor_updates: prepare_neighbor_writes(encoder, neighbor_updates, neighbor_ids.len())
             .await?,
     };
 
@@ -824,7 +833,7 @@ pub(crate) async fn process_turn_for_real_clients(
 
 async fn prepare_neighbor_writes<E>(
     encoder: &E,
-    neighbor_updates: &[NeighborUpdate],
+    neighbor_updates: Vec<NeighborUpdate>,
     expected_neighbor_count: usize,
 ) -> Result<Vec<PreparedNeighborUpdate>, ProcessTurnError>
 where
@@ -834,32 +843,35 @@ where
         return Ok(Vec::new());
     }
 
-    let payloads: Vec<EmbeddingInput<'_>> = neighbor_updates
-        .iter()
-        .map(|update| EmbeddingInput {
-            content: &update.content,
-            keywords: &update.keywords,
-            tags: &update.tags,
-            context: &update.context,
-        })
-        .collect();
+    let neighbor_update_count = neighbor_updates.len();
+    let embeddings = {
+        let payloads: Vec<EmbeddingInput<'_>> = neighbor_updates
+            .iter()
+            .map(|update| EmbeddingInput {
+                content: &update.content,
+                keywords: &update.keywords,
+                tags: &update.tags,
+                context: &update.context,
+            })
+            .collect();
 
-    let embeddings = encoder
-        .encode_memories(&payloads)
-        .await
-        .map_err(|error| RetryableProcessTurnError::Encoder(error.to_string()))?;
+        encoder
+            .encode_memories(&payloads)
+            .await
+            .map_err(|error| RetryableProcessTurnError::Encoder(error.to_string()))?
+    };
     validate_embedding_count(
         embeddings.len(),
-        neighbor_updates.len(),
+        neighbor_update_count,
         "neighbor re-encoding",
     )
     .map_err(|error| RetryableProcessTurnError::Encoder(error.to_string()))?;
 
-    let mut prepared_updates = Vec::with_capacity(neighbor_updates.len());
-    for (update, embedding) in neighbor_updates.iter().zip(embeddings) {
+    let mut prepared_updates = Vec::with_capacity(neighbor_update_count);
+    for (update, embedding) in neighbor_updates.into_iter().zip(embeddings) {
         prepared_updates.push(PreparedNeighborUpdate {
             id: update.id,
-            context: update.context.clone(),
+            context: update.context,
             keywords_json: serialize_json(&update.keywords, "neighbor keywords")?,
             tags_json: serialize_json(&update.tags, "neighbor tags")?,
             embedding_bytes: embedding_to_bytes(&embedding),
@@ -1466,6 +1478,66 @@ mod tests {
             .expect("neighbor row");
         assert_eq!(row.get::<String, _>("context"), "original context");
         assert_eq!(row.get::<String, _>("tags"), "[\"updated-tag\"]");
+    }
+
+    #[tokio::test]
+    async fn identical_refined_tags_do_not_trigger_reencoding() {
+        let db = open_memory_db().await;
+        create_processing_turn_table(&db).await;
+        insert_processing_turn(&db, 9).await;
+        insert_memory_with_embedding(
+            &db,
+            "existing",
+            "neighbor context",
+            &["neighbor-kw"],
+            &["neighbor-tag"],
+            &[0.1, 0.2],
+        )
+        .await;
+
+        let llm = FakeAnalyzer::with_evolution(
+            ExtractedMemoryAnalysis {
+                context: "conversation context".to_string(),
+                keywords: vec!["kw".to_string()],
+                tags: vec!["initial-tag".to_string()],
+            },
+            MemoryEvolution {
+                suggested_connections: Vec::new(),
+                updated_new_memory_tags: vec!["initial-tag".to_string()],
+                neighbor_updates: Vec::new(),
+            },
+        );
+        let encoder = FakeEncoder {
+            encode_results: Arc::new(Mutex::new(Vec::new())),
+            encode_memory_results: Arc::new(Mutex::new(vec![Ok(vec![0.4, 0.6])])),
+            encode_memories_results: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        process_turn_with_clients(
+            &db,
+            &llm,
+            &encoder,
+            10,
+            9,
+            ProjectedConversationWindow {
+                previous_turns: Vec::new(),
+                current_turn: current_projection(),
+            },
+            Utc::now(),
+        )
+        .await
+        .expect("unchanged refined tags should reuse the original embedding");
+
+        assert_eq!(memory_count(&db).await, 2, "new memory should be stored");
+        assert_eq!(turn_status(&db, 9).await, "stored");
+        assert!(
+            encoder
+                .encode_memory_results
+                .lock()
+                .expect("lock")
+                .is_empty(),
+            "the initial memory encoding should be consumed exactly once"
+        );
     }
 
     #[tokio::test]

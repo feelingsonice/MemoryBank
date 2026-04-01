@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fmt::Write;
 
 const MAX_TOOL_INPUT_CHARS: usize = 1000;
@@ -33,19 +34,7 @@ pub(crate) fn render_projection_markdown(projection: &MemoryProjection) -> Strin
             + projection.assistant_reply.len()
             + projection.steps.len() * 48,
     );
-    rendered.push_str("## User\n");
-    rendered.push_str(&projection.user_message);
-
-    if !projection.steps.is_empty() {
-        rendered.push_str("\n\n## Steps");
-        for step in &projection.steps {
-            rendered.push_str("\n\n");
-            rendered.push_str(&render_step(step));
-        }
-    }
-
-    rendered.push_str("\n\n## Assistant\n");
-    rendered.push_str(&projection.assistant_reply);
+    append_projection_markdown(&mut rendered, projection);
     rendered
 }
 
@@ -56,34 +45,63 @@ pub(crate) fn render_projection_history(turns: &[MemoryProjection]) -> String {
             rendered.push_str("\n\n");
         }
 
-        let _ = write!(rendered, "# Previous Turn {}\n", index + 1);
-        rendered.push_str(&render_projection_markdown(turn));
+        let _ = writeln!(rendered, "# Previous Turn {}", index + 1);
+        append_projection_markdown(&mut rendered, turn);
     }
 
     rendered
 }
 
-fn render_step(step: &MemoryStep) -> String {
+fn append_projection_markdown(rendered: &mut String, projection: &MemoryProjection) {
+    rendered.push_str("## User\n");
+    rendered.push_str(&projection.user_message);
+
+    if !projection.steps.is_empty() {
+        rendered.push_str("\n\n## Steps");
+        for step in &projection.steps {
+            rendered.push_str("\n\n");
+            append_step(rendered, step);
+        }
+    }
+
+    rendered.push_str("\n\n## Assistant\n");
+    rendered.push_str(&projection.assistant_reply);
+}
+
+fn append_step(rendered: &mut String, step: &MemoryStep) {
     match step {
         MemoryStep::ToolCall { name, input } => {
-            render_code_step("Tool Call", name, input, MAX_TOOL_INPUT_CHARS)
+            append_code_step(rendered, "Tool Call", name, input, MAX_TOOL_INPUT_CHARS)
         }
         MemoryStep::ToolResult { name, output } => {
-            render_code_step("Tool Result", name, output, MAX_TOOL_RESULT_CHARS)
+            append_code_step(rendered, "Tool Result", name, output, MAX_TOOL_RESULT_CHARS)
         }
         MemoryStep::Thinking { text } => {
-            format!(
-                "### Thinking\n{}",
-                truncate_context(text, MAX_THINKING_CHARS)
-            )
+            rendered.push_str("### Thinking\n");
+            rendered.push_str(truncate_context(text, MAX_THINKING_CHARS).as_ref());
         }
     }
 }
 
-fn render_code_step(label: &str, name: &str, payload: &str, max_chars: usize) -> String {
+fn append_code_step(
+    rendered: &mut String,
+    label: &str,
+    name: &str,
+    payload: &str,
+    max_chars: usize,
+) {
     let payload = truncate_context(payload, max_chars);
-    let language = code_block_language(&payload);
-    format!("### {label}: {name}\n```{language}\n{payload}\n```")
+    let language = code_block_language(payload.as_ref());
+
+    rendered.push_str("### ");
+    rendered.push_str(label);
+    rendered.push_str(": ");
+    rendered.push_str(name);
+    rendered.push_str("\n```");
+    rendered.push_str(language);
+    rendered.push('\n');
+    rendered.push_str(payload.as_ref());
+    rendered.push_str("\n```");
 }
 
 fn code_block_language(payload: &str) -> &'static str {
@@ -94,11 +112,14 @@ fn code_block_language(payload: &str) -> &'static str {
     }
 }
 
-fn truncate_context(s: &str, max_chars: usize) -> String {
+fn truncate_context(s: &str, max_chars: usize) -> Cow<'_, str> {
     if s.len() <= max_chars {
-        s.to_string()
+        Cow::Borrowed(s)
     } else {
-        format!("{}...[truncated]", &s[..s.floor_char_boundary(max_chars)])
+        Cow::Owned(format!(
+            "{}...[truncated]",
+            &s[..s.floor_char_boundary(max_chars)]
+        ))
     }
 }
 
@@ -175,6 +196,15 @@ mod tests {
 
         let rendered = render_projection_markdown(&projection);
         assert!(rendered.contains("...[truncated]"));
+    }
+
+    #[test]
+    fn renders_steps_without_output_changes() {
+        let rendered = render_projection_markdown(&projection_with_steps());
+        assert_eq!(
+            rendered,
+            "## User\nWhat time is it?\n\n## Steps\n\n### Tool Call: shell\n```json\n{\"command\":\"date\"}\n```\n\n### Tool Result: shell\n```text\nTue Mar  3 12:00:00 PST 2026\n```\n\n### Thinking\nChecking the local timezone.\n\n## Assistant\nIt is noon."
+        );
     }
 
     #[test]

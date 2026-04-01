@@ -204,7 +204,7 @@ impl IngestService {
 
         if staged.finalized {
             debug!(
-                conversation_id = %staged.conversation_id,
+                conversation_id = %envelope.scope.conversation_id,
                 turn_index = staged.turn_index,
                 duplicate = staged.duplicate,
                 "Queued finalized turn for background memory extraction"
@@ -212,11 +212,12 @@ impl IngestService {
             self.dispatcher_notify.notify_one();
         }
 
+        let IngestEnvelope { source, scope, .. } = envelope;
         Ok(IngestOutcome {
-            agent: envelope.source.agent,
-            event: envelope.source.event,
-            conversation_id: staged.conversation_id,
-            fragment_id: staged.fragment_id,
+            agent: source.agent,
+            event: source.event,
+            conversation_id: scope.conversation_id,
+            fragment_id: scope.fragment_id,
             turn_index: staged.turn_index,
             duplicate: staged.duplicate,
             finalized: staged.finalized,
@@ -359,8 +360,6 @@ impl IngestStore {
         tx.commit().await?;
 
         Ok(StagedFragment {
-            conversation_id: envelope.scope.conversation_id.clone(),
-            fragment_id: envelope.scope.fragment_id.clone(),
             turn_index: turn.turn_index,
             duplicate: false,
             finalized,
@@ -1023,8 +1022,6 @@ fn compact_sql(sql: &str) -> String {
 
 #[derive(Debug)]
 struct StagedFragment {
-    conversation_id: String,
-    fragment_id: String,
     turn_index: i64,
     duplicate: bool,
     finalized: bool,
@@ -1069,16 +1066,12 @@ struct ClaimedTurnRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct ExistingFragmentRow {
-    conversation_id: String,
-    fragment_id: String,
     turn_index: i64,
     status: IngestTurnStatus,
 }
 
 fn staged_fragment_from_existing(existing: ExistingFragmentRow) -> StagedFragment {
     StagedFragment {
-        conversation_id: existing.conversation_id,
-        fragment_id: existing.fragment_id,
         turn_index: existing.turn_index,
         duplicate: true,
         finalized: matches!(
@@ -1152,8 +1145,7 @@ fn append_message_fragment(target: &mut String, fragment: String) {
 
 fn compute_next_attempt_at(attempt_count: i64) -> String {
     let delay = retry_delay_for_attempt(attempt_count, RETRY_BASE_DELAY, RETRY_MAX_DELAY);
-    (Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::MAX))
-        .to_rfc3339()
+    (Utc::now() + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX)).to_rfc3339()
 }
 
 fn parse_turn_timestamp(value: Option<&str>) -> Result<DateTime<Utc>, ProcessTurnError> {
@@ -1317,11 +1309,7 @@ const SELECT_OPEN_TURN_SQL: &str = "SELECT id, turn_index
     FROM ingest_turns
     WHERE conversation_id = ? AND status = ? AND external_turn_id IS NULL
     LIMIT 1;";
-const SELECT_EXISTING_FRAGMENT_SQL: &str = "SELECT
-        f.conversation_id,
-        f.fragment_id,
-        t.turn_index,
-        t.status
+const SELECT_EXISTING_FRAGMENT_SQL: &str = "SELECT t.turn_index, t.status
     FROM ingest_fragments f
     JOIN ingest_turns t ON t.id = f.turn_id
     WHERE f.fragment_id = ?
