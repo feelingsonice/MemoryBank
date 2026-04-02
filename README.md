@@ -124,6 +124,17 @@ For example, to troubleshoot MCP session behavior with extra detail, start the s
 RUST_LOG=memory_bank_server=debug,rmcp=info cargo run -p memory-bank-server -- --help
 ```
 
+## Citation
+
+```bibtex
+@article{xu2025mem,
+  title={A-mem: Agentic memory for llm agents},
+  author={Xu, Wujiang and Liang, Zujie and Mei, Kai and Gao, Hang and Tan, Juntao and Zhang, Yongfeng},
+  journal={arXiv preprint arXiv:2502.12110},
+  year={2025}
+}
+```
+
 ## License
 
 Memory Bank is licensed under `MIT`. See [LICENSE](./LICENSE).
