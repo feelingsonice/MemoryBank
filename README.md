@@ -10,6 +10,7 @@ It runs locally, stores memory in your own namespaced SQLite databases, and work
 ## Why Memory Bank
 
 - Shared memory across supported agents instead of siloed memory per tool.
+- Structured knowledge graph of memory that continuously evolve as opposed a text file.
 - Local ownership of storage, namespaces, and internal model choice.
 - Better continuity from captured user prompts, tool calls, tool results, and assistant replies.
 - A simple day-to-day control surface through `mb` instead of manual server management.
