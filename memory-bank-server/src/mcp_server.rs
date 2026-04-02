@@ -8,12 +8,14 @@ use rmcp::{
     ErrorData as McpError, Json, ServerHandler,
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::*,
+    service::ServiceError,
     tool, tool_handler, tool_router,
 };
 use tokio::sync::broadcast;
-use tracing::info;
+use tracing::{debug, warn};
 
 use crate::actor::MemoryHandle;
+use crate::logging::INTERNAL_LOG_STREAM_TARGET;
 
 pub struct McpServer {
     tool_router: ToolRouter<Self>,
@@ -45,9 +47,9 @@ impl McpServer {
         args: Parameters<RetrieveMemoryArgs>,
     ) -> Result<Json<RetrieveMemoryResult>, McpError> {
         let RetrieveMemoryArgs { query } = args.0;
-        info!(
+        debug!(
             query_chars = query.chars().count(),
-            "Received retrieve_memory tool call"
+            "Running retrieve_memory request"
         );
 
         let notes = self.memory.retrieve(query).await?;
@@ -84,15 +86,29 @@ impl ServerHandler for McpServer {
             loop {
                 match log_rx.recv().await {
                     Ok(param) => {
-                        if let Err(e) = peer.notify_logging_message(param).await {
-                            eprintln!(
-                                "Stopping MCP log stream because a log notification failed to send: {e}"
-                            );
+                        if let Err(error) = peer.notify_logging_message(param).await {
+                            if is_expected_log_stream_disconnect(&error) {
+                                debug!(
+                                    target: INTERNAL_LOG_STREAM_TARGET,
+                                    error = %error,
+                                    "MCP client disconnected; stopping log stream"
+                                );
+                            } else {
+                                warn!(
+                                    target: INTERNAL_LOG_STREAM_TARGET,
+                                    error = %error,
+                                    "Stopping MCP log stream because sending a log notification failed"
+                                );
+                            }
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        eprintln!("MCP log stream fell behind and dropped {n} buffered message(s)");
+                        warn!(
+                            target: INTERNAL_LOG_STREAM_TARGET,
+                            dropped_messages = n,
+                            "MCP log stream fell behind and dropped buffered messages"
+                        );
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -101,14 +117,23 @@ impl ServerHandler for McpServer {
     }
 }
 
+fn is_expected_log_stream_disconnect(error: &ServiceError) -> bool {
+    match error {
+        ServiceError::TransportClosed => true,
+        ServiceError::TransportSend(error) => error.error.to_string() == "Transport closed",
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::McpServer;
+    use super::{McpServer, is_expected_log_stream_disconnect};
     use crate::actor::MemoryHandle;
     use memory_bank_protocol::{
         MEMORY_BANK_SERVER_INSTRUCTIONS, RETRIEVE_MEMORY_TOOL_NAME, RETRIEVE_MEMORY_TOOL_TITLE,
     };
-    use rmcp::ServerHandler;
+    use rmcp::{ServerHandler, service::ServiceError, transport::DynamicTransportError};
+    use std::{any::TypeId, borrow::Cow, io};
     use tokio::sync::broadcast;
 
     const SERVER_RETRIEVE_MEMORY_TOOL_DESCRIPTION: &str = "Search long-term memory for any previously learned context that could materially improve the current answer. Call this BEFORE answering whenever prior conversations, user or project context, earlier decisions, constraints, or learned facts might help you answer more accurately, consistently, or personally. Use it even when the user does not explicitly ask you to recall something and even when the request is indirect, transformed, or requires you to apply or synthesize prior context rather than repeat it verbatim. If the answer could plausibly change after checking memory, retrieve first. Returns a ranked list of memory notes, each containing the original content, conversation context distilled from the captured conversation window, keywords, tags, and links to related memories. Prefer specific queries over vague ones for better results.";
@@ -190,5 +215,29 @@ mod tests {
             "The current request asks you to apply, interpret, or synthesize what was learned earlier"
         ));
         assert_eq!(instructions, MEMORY_BANK_SERVER_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn transport_closed_errors_are_treated_as_expected_disconnects() {
+        assert!(is_expected_log_stream_disconnect(
+            &ServiceError::TransportClosed
+        ));
+
+        let error = ServiceError::TransportSend(DynamicTransportError {
+            transport_name: Cow::Borrowed("test"),
+            transport_type_id: TypeId::of::<()>(),
+            error: Box::new(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Transport closed",
+            )),
+        });
+        assert!(is_expected_log_stream_disconnect(&error));
+    }
+
+    #[test]
+    fn unexpected_log_stream_errors_remain_actionable() {
+        assert!(!is_expected_log_stream_disconnect(
+            &ServiceError::UnexpectedResponse
+        ));
     }
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use libsqlite3_sys::{SQLITE_BUSY, SQLITE_LOCKED};
+use memory_bank_app::DEFAULT_MAX_PROCESSING_ATTEMPTS;
 use memory_bank_protocol::{ConversationFragment, FragmentBody, IngestEnvelope, Terminality};
 use sqlx::{SqlitePool, Transaction};
 use thiserror::Error;
@@ -35,6 +36,7 @@ enum IngestTurnStatus {
     Stored,
     Aborted,
     Failed,
+    Exhausted,
 }
 
 impl IngestTurnStatus {
@@ -46,6 +48,7 @@ impl IngestTurnStatus {
             Self::Stored => "stored",
             Self::Aborted => "aborted",
             Self::Failed => "failed",
+            Self::Exhausted => "exhausted",
         }
     }
 }
@@ -67,6 +70,7 @@ impl FromStr for IngestTurnStatus {
             "stored" => Ok(Self::Stored),
             "aborted" => Ok(Self::Aborted),
             "failed" => Ok(Self::Failed),
+            "exhausted" => Ok(Self::Exhausted),
             other => Err(format!("invalid ingest turn status '{other}'")),
         }
     }
@@ -131,6 +135,24 @@ impl From<&FragmentBody> for IngestFragmentKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::Type)]
+#[sqlx(rename_all = "snake_case")]
+enum StoredTerminality {
+    None,
+    Soft,
+    Hard,
+}
+
+impl StoredTerminality {
+    const fn into_terminality(self) -> Terminality {
+        match self {
+            Self::None => Terminality::None,
+            Self::Soft => Terminality::Soft,
+            Self::Hard => Terminality::Hard,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IngestOutcome {
     pub agent: String,
@@ -165,17 +187,39 @@ impl IngestService {
         memory: MemoryHandle,
         history_window_size: u32,
     ) -> Result<Self, AppError> {
+        Self::open_with_runtime_and_max_processing_attempts(
+            runtime,
+            db_path,
+            memory,
+            history_window_size,
+            DEFAULT_MAX_PROCESSING_ATTEMPTS,
+        )
+        .await
+    }
+
+    pub(crate) async fn open_with_runtime_and_max_processing_attempts(
+        runtime: SqliteRuntime,
+        db_path: &Path,
+        memory: MemoryHandle,
+        history_window_size: u32,
+        max_processing_attempts: u32,
+    ) -> Result<Self, AppError> {
         let store = Arc::new(IngestStore::open_with_runtime(runtime, history_window_size).await?);
         let dispatcher_notify = Arc::new(Notify::new());
         let recovered_turns = store.recover_processing_turns().await?;
         if recovered_turns > 0 {
             warn!(
                 recovered_turns,
-                "Recovered interrupted ingest turns and re-queued them for processing"
+                "Recovered interrupted ingest turns and queued them to resume processing"
             );
         }
 
-        let dispatcher = IngestDispatcher::new(store.clone(), memory, dispatcher_notify.clone());
+        let dispatcher = IngestDispatcher::new_with_max_processing_attempts(
+            store.clone(),
+            memory,
+            dispatcher_notify.clone(),
+            max_processing_attempts,
+        );
         tokio::spawn(async move {
             dispatcher.run().await;
         });
@@ -183,6 +227,7 @@ impl IngestService {
         info!(
             db_path = %db_path.display(),
             history_window_size,
+            max_processing_attempts,
             history_window_mode = if history_window_size == 0 {
                 "unlimited"
             } else {
@@ -204,19 +249,20 @@ impl IngestService {
 
         if staged.finalized {
             debug!(
-                conversation_id = %staged.conversation_id,
+                conversation_id = %envelope.scope.conversation_id,
                 turn_index = staged.turn_index,
                 duplicate = staged.duplicate,
-                "Queued finalized turn for background memory extraction"
+                "Queued finalized turn for background memory processing"
             );
             self.dispatcher_notify.notify_one();
         }
 
+        let IngestEnvelope { source, scope, .. } = envelope;
         Ok(IngestOutcome {
-            agent: envelope.source.agent,
-            event: envelope.source.event,
-            conversation_id: staged.conversation_id,
-            fragment_id: staged.fragment_id,
+            agent: source.agent,
+            event: source.event,
+            conversation_id: scope.conversation_id,
+            fragment_id: scope.fragment_id,
             turn_index: staged.turn_index,
             duplicate: staged.duplicate,
             finalized: staged.finalized,
@@ -338,29 +384,23 @@ impl IngestStore {
             return Ok(staged_fragment_from_existing(existing));
         }
 
-        let reduced = self.rebuild_projection(&mut tx, turn.id).await?;
-        let finalized = reduced.terminality == Terminality::Hard;
-        let turn_status = if finalized {
-            IngestTurnStatus::Finalized
+        let finalized = if envelope.fragment.terminality == Terminality::Hard {
+            let reduced = self.rebuild_projection(&mut tx, turn.id).await?;
+            self.update_turn_after_reduce(&mut tx, turn.id, reduced, &now)
+                .await?
         } else {
-            IngestTurnStatus::Open
+            let terminality = merge_terminality(
+                turn.terminality.into_terminality(),
+                envelope.fragment.terminality,
+            );
+            self.update_open_turn_after_insert(&mut tx, turn.id, terminality, &now)
+                .await?;
+            false
         };
-        sqlx::query(UPDATE_TURN_AFTER_REDUCE_SQL)
-            .bind(serde_json::to_string(&reduced.projection)?)
-            .bind(reduced.terminality.as_str())
-            .bind(turn_status)
-            .bind(if finalized { Some(now.as_str()) } else { None })
-            .bind(if finalized { Some(now.as_str()) } else { None })
-            .bind(&now)
-            .bind(turn.id)
-            .execute(&mut *tx)
-            .await?;
 
         tx.commit().await?;
 
         Ok(StagedFragment {
-            conversation_id: envelope.scope.conversation_id.clone(),
-            fragment_id: envelope.scope.fragment_id.clone(),
             turn_index: turn.turn_index,
             duplicate: false,
             finalized,
@@ -408,7 +448,7 @@ impl IngestStore {
                     previous_turn_id = open_turn.id,
                     previous_turn_index = open_turn.turn_index,
                     fragment_id = %envelope.scope.fragment_id,
-                    "Aborting incomplete open turn because a new user message started a replacement turn"
+                    "Aborted an incomplete open turn because a new user message started the next turn"
                 );
                 self.abort_turn(tx, open_turn.id, now).await?;
                 return self
@@ -445,6 +485,56 @@ impl IngestStore {
             projection,
             terminality,
         })
+    }
+
+    async fn update_open_turn_after_insert(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Sqlite>,
+        turn_id: i64,
+        terminality: Terminality,
+        now: &str,
+    ) -> Result<(), IngestError> {
+        let result = sqlx::query(UPDATE_OPEN_TURN_AFTER_INSERT_SQL)
+            .bind(terminality.as_str())
+            .bind(now)
+            .bind(turn_id)
+            .bind(IngestTurnStatus::Open)
+            .execute(&mut **tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::RowNotFound.into());
+        }
+        Ok(())
+    }
+
+    async fn update_turn_after_reduce(
+        &self,
+        tx: &mut Transaction<'_, sqlx::Sqlite>,
+        turn_id: i64,
+        reduced: ReducedProjection,
+        now: &str,
+    ) -> Result<bool, IngestError> {
+        let finalized = reduced.terminality == Terminality::Hard;
+        let turn_status = if finalized {
+            IngestTurnStatus::Finalized
+        } else {
+            IngestTurnStatus::Open
+        };
+        let result = sqlx::query(UPDATE_TURN_AFTER_REDUCE_SQL)
+            .bind(serde_json::to_string(&reduced.projection)?)
+            .bind(reduced.terminality.as_str())
+            .bind(turn_status)
+            .bind(if finalized { Some(now) } else { None })
+            .bind(if finalized { Some(now) } else { None })
+            .bind(now)
+            .bind(turn_id)
+            .bind(IngestTurnStatus::Open)
+            .execute(&mut **tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::RowNotFound.into());
+        }
+        Ok(finalized)
     }
 
     async fn claim_next_due_turn(&self, now: &str) -> Result<Option<ClaimedTurnRow>, sqlx::Error> {
@@ -572,6 +662,31 @@ impl IngestStore {
         Ok(())
     }
 
+    async fn mark_exhausted(
+        &self,
+        turn_id: i64,
+        error: &str,
+        attempt_count: i64,
+        now: &str,
+    ) -> Result<(), DispatcherError> {
+        let _write_permit = self.acquire_write_permit().await;
+        let result = sqlx::query(MARK_TURN_EXHAUSTED_SQL)
+            .bind(IngestTurnStatus::Exhausted)
+            .bind(attempt_count)
+            .bind(error)
+            .bind(now)
+            .bind(turn_id)
+            .bind(IngestTurnStatus::Processing)
+            .execute(self.pool())
+            .await?;
+        if result.rows_affected() != 1 {
+            return Err(DispatcherError::Invariant(format!(
+                "expected to exhaust processing turn {turn_id}, but no row was updated"
+            )));
+        }
+        Ok(())
+    }
+
     async fn recover_processing_turns(&self) -> Result<u64, sqlx::Error> {
         let _write_permit = self.acquire_write_permit().await;
         let now = Utc::now().to_rfc3339();
@@ -674,6 +789,7 @@ impl IngestStore {
         Ok(TurnRef {
             id: turn_id,
             turn_index,
+            terminality: StoredTerminality::None,
         })
     }
 
@@ -709,14 +825,31 @@ struct IngestDispatcher {
     store: Arc<IngestStore>,
     memory: MemoryHandle,
     notify: Arc<Notify>,
+    max_processing_attempts: i64,
 }
 
 impl IngestDispatcher {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(store: Arc<IngestStore>, memory: MemoryHandle, notify: Arc<Notify>) -> Self {
+        Self::new_with_max_processing_attempts(
+            store,
+            memory,
+            notify,
+            DEFAULT_MAX_PROCESSING_ATTEMPTS,
+        )
+    }
+
+    fn new_with_max_processing_attempts(
+        store: Arc<IngestStore>,
+        memory: MemoryHandle,
+        notify: Arc<Notify>,
+        max_processing_attempts: u32,
+    ) -> Self {
         Self {
             store,
             memory,
             notify,
+            max_processing_attempts: i64::from(max_processing_attempts),
         }
     }
 
@@ -759,6 +892,27 @@ impl IngestDispatcher {
     }
 
     async fn process_claimed_turn(&self, turn: ClaimedTurnRow) -> Result<(), DispatcherError> {
+        if turn.attempt_count >= self.max_processing_attempts {
+            let exhausted_error = turn
+                .last_error
+                .clone()
+                .unwrap_or_else(|| exhausted_attempts_message(self.max_processing_attempts));
+            let now = Utc::now().to_rfc3339();
+            warn!(
+                turn_id = turn.id,
+                conversation_id = %turn.conversation_id,
+                turn_index = turn.turn_index,
+                attempt_count = turn.attempt_count,
+                max_processing_attempts = self.max_processing_attempts,
+                error = %exhausted_error,
+                "Finalized turn had already reached the retry limit; marking it exhausted"
+            );
+            self.store
+                .mark_exhausted(turn.id, &exhausted_error, turn.attempt_count, &now)
+                .await?;
+            return Ok(());
+        }
+
         let finalized_at = match parse_turn_timestamp(turn.finalized_at.as_deref()) {
             Ok(timestamp) => timestamp,
             Err(error) => {
@@ -767,7 +921,7 @@ impl IngestDispatcher {
                     conversation_id = %turn.conversation_id,
                     turn_index = turn.turn_index,
                     error = %error,
-                    "Claimed turn has invalid finalized timestamp; marking it failed"
+                    "Finalized turn has an invalid timestamp; marking it failed"
                 );
                 self.store
                     .mark_failed(turn.id, &error.to_string(), &Utc::now().to_rfc3339())
@@ -783,7 +937,7 @@ impl IngestDispatcher {
                     conversation_id = %turn.conversation_id,
                     turn_index = turn.turn_index,
                     error = %error,
-                    "Failed to rebuild conversation window for claimed turn; marking it failed"
+                    "Failed to rebuild the stored conversation window; marking turn failed"
                 );
                 self.store
                     .mark_failed(turn.id, &error.to_string(), &Utc::now().to_rfc3339())
@@ -798,7 +952,7 @@ impl IngestDispatcher {
             turn_index = turn.turn_index,
             attempt = turn.attempt_count + 1,
             history_turns = window.previous_turns.len(),
-            "Dispatching finalized turn for memory extraction"
+            "Dispatching finalized turn for memory processing"
         );
 
         match self
@@ -808,26 +962,43 @@ impl IngestDispatcher {
         {
             Ok(()) => Ok(()),
             Err(ProcessTurnError::Retryable(error)) => {
-                let attempt_count = turn.attempt_count + 1;
-                let next_attempt_at = compute_next_attempt_at(attempt_count);
-                warn!(
-                    turn_id = turn.id,
-                    conversation_id = %turn.conversation_id,
-                    turn_index = turn.turn_index,
-                    attempt_count,
-                    next_attempt_at = %next_attempt_at,
-                    error = %error,
-                    "Memory extraction failed; rescheduling turn"
-                );
-                self.store
-                    .mark_retryable_failure(
-                        turn.id,
-                        &error.to_string(),
-                        attempt_count,
-                        &next_attempt_at,
-                        &Utc::now().to_rfc3339(),
-                    )
-                    .await?;
+                let next_attempt_count = turn.attempt_count + 1;
+                let error = error.to_string();
+                let now = Utc::now().to_rfc3339();
+                if next_attempt_count < self.max_processing_attempts {
+                    let next_attempt_at = compute_next_attempt_at(next_attempt_count);
+                    warn!(
+                        turn_id = turn.id,
+                        conversation_id = %turn.conversation_id,
+                        turn_index = turn.turn_index,
+                        attempt_count = next_attempt_count,
+                        next_attempt_at = %next_attempt_at,
+                        error = %error,
+                        "Memory processing failed; scheduling a retry"
+                    );
+                    self.store
+                        .mark_retryable_failure(
+                            turn.id,
+                            &error,
+                            next_attempt_count,
+                            &next_attempt_at,
+                            &now,
+                        )
+                        .await?;
+                } else {
+                    warn!(
+                        turn_id = turn.id,
+                        conversation_id = %turn.conversation_id,
+                        turn_index = turn.turn_index,
+                        attempt_count = next_attempt_count,
+                        max_processing_attempts = self.max_processing_attempts,
+                        error = %error,
+                        "Memory processing reached the retry limit; marking turn exhausted"
+                    );
+                    self.store
+                        .mark_exhausted(turn.id, &error, next_attempt_count, &now)
+                        .await?;
+                }
                 Ok(())
             }
             Err(ProcessTurnError::Unrecoverable(error)) => {
@@ -836,7 +1007,7 @@ impl IngestDispatcher {
                     conversation_id = %turn.conversation_id,
                     turn_index = turn.turn_index,
                     error = %error,
-                    "Memory extraction failed permanently; marking turn failed"
+                    "Memory processing failed permanently; marking turn failed"
                 );
                 self.store
                     .mark_failed(turn.id, &error.to_string(), &Utc::now().to_rfc3339())
@@ -962,6 +1133,7 @@ async fn validate_invalid_turn_status(pool: &SqlitePool) -> Result<(), AppError>
         .bind(IngestTurnStatus::Stored)
         .bind(IngestTurnStatus::Aborted)
         .bind(IngestTurnStatus::Failed)
+        .bind(IngestTurnStatus::Exhausted)
         .fetch_optional(pool)
         .await?;
 
@@ -1023,8 +1195,6 @@ fn compact_sql(sql: &str) -> String {
 
 #[derive(Debug)]
 struct StagedFragment {
-    conversation_id: String,
-    fragment_id: String,
     turn_index: i64,
     duplicate: bool,
     finalized: bool,
@@ -1034,6 +1204,7 @@ struct StagedFragment {
 struct TurnRef {
     id: i64,
     turn_index: i64,
+    terminality: StoredTerminality,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1041,6 +1212,7 @@ struct ExternalTurnRef {
     id: i64,
     turn_index: i64,
     status: IngestTurnStatus,
+    terminality: StoredTerminality,
 }
 
 impl ExternalTurnRef {
@@ -1048,6 +1220,7 @@ impl ExternalTurnRef {
         TurnRef {
             id: self.id,
             turn_index: self.turn_index,
+            terminality: self.terminality,
         }
     }
 }
@@ -1065,20 +1238,17 @@ struct ClaimedTurnRow {
     projection_json: String,
     finalized_at: Option<String>,
     attempt_count: i64,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct ExistingFragmentRow {
-    conversation_id: String,
-    fragment_id: String,
     turn_index: i64,
     status: IngestTurnStatus,
 }
 
 fn staged_fragment_from_existing(existing: ExistingFragmentRow) -> StagedFragment {
     StagedFragment {
-        conversation_id: existing.conversation_id,
-        fragment_id: existing.fragment_id,
         turn_index: existing.turn_index,
         duplicate: true,
         finalized: matches!(
@@ -1087,6 +1257,7 @@ fn staged_fragment_from_existing(existing: ExistingFragmentRow) -> StagedFragmen
                 | IngestTurnStatus::Processing
                 | IngestTurnStatus::Stored
                 | IngestTurnStatus::Failed
+                | IngestTurnStatus::Exhausted
         ),
     }
 }
@@ -1150,10 +1321,21 @@ fn append_message_fragment(target: &mut String, fragment: String) {
     target.push_str(&fragment);
 }
 
+const fn merge_terminality(current: Terminality, next: Terminality) -> Terminality {
+    if next.rank() > current.rank() {
+        next
+    } else {
+        current
+    }
+}
+
 fn compute_next_attempt_at(attempt_count: i64) -> String {
     let delay = retry_delay_for_attempt(attempt_count, RETRY_BASE_DELAY, RETRY_MAX_DELAY);
-    (Utc::now() + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::MAX))
-        .to_rfc3339()
+    (Utc::now() + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::MAX)).to_rfc3339()
+}
+
+fn exhausted_attempts_message(max_processing_attempts: i64) -> String {
+    format!("processing retries exhausted after {max_processing_attempts} attempts")
 }
 
 fn parse_turn_timestamp(value: Option<&str>) -> Result<DateTime<Utc>, ProcessTurnError> {
@@ -1251,7 +1433,7 @@ const CREATE_INGEST_TURNS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS ingest_t
     conversation_id TEXT NOT NULL,
     external_turn_id TEXT,
     turn_index INTEGER NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('open','finalized','processing','stored','aborted','failed')),
+    status TEXT NOT NULL CHECK(status IN ('open','finalized','processing','stored','aborted','failed','exhausted')),
     projection_json TEXT NOT NULL,
     terminality TEXT NOT NULL DEFAULT 'none' CHECK(terminality IN ('none','soft','hard')),
     created_at TEXT NOT NULL,
@@ -1268,7 +1450,8 @@ const CREATE_INGEST_TURNS_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS ingest_t
         (status = 'processing' AND finalized_at IS NOT NULL AND next_attempt_at IS NOT NULL AND processing_started_at IS NOT NULL AND stored_at IS NULL) OR
         (status = 'stored' AND finalized_at IS NOT NULL AND next_attempt_at IS NULL AND processing_started_at IS NULL AND stored_at IS NOT NULL) OR
         (status = 'aborted' AND finalized_at IS NULL AND next_attempt_at IS NULL AND processing_started_at IS NULL AND stored_at IS NULL) OR
-        (status = 'failed' AND finalized_at IS NOT NULL AND next_attempt_at IS NULL AND processing_started_at IS NULL AND stored_at IS NULL)
+        (status = 'failed' AND finalized_at IS NOT NULL AND next_attempt_at IS NULL AND processing_started_at IS NULL AND stored_at IS NULL) OR
+        (status = 'exhausted' AND finalized_at IS NOT NULL AND next_attempt_at IS NULL AND processing_started_at IS NULL AND stored_at IS NULL)
     )
 );";
 
@@ -1309,19 +1492,15 @@ const CREATE_INGEST_FRAGMENTS_CONVERSATION_INDEX_SQL: &str =
     "CREATE INDEX IF NOT EXISTS idx_ingest_fragments_conversation
     ON ingest_fragments (conversation_id, turn_id, id);";
 
-const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index, status
+const SELECT_TURN_BY_EXTERNAL_ID_SQL: &str = "SELECT id, turn_index, status, terminality
     FROM ingest_turns
     WHERE conversation_id = ? AND external_turn_id = ?
     LIMIT 1;";
-const SELECT_OPEN_TURN_SQL: &str = "SELECT id, turn_index
+const SELECT_OPEN_TURN_SQL: &str = "SELECT id, turn_index, terminality
     FROM ingest_turns
     WHERE conversation_id = ? AND status = ? AND external_turn_id IS NULL
     LIMIT 1;";
-const SELECT_EXISTING_FRAGMENT_SQL: &str = "SELECT
-        f.conversation_id,
-        f.fragment_id,
-        t.turn_index,
-        t.status
+const SELECT_EXISTING_FRAGMENT_SQL: &str = "SELECT t.turn_index, t.status
     FROM ingest_fragments f
     JOIN ingest_turns t ON t.id = f.turn_id
     WHERE f.fragment_id = ?
@@ -1368,6 +1547,11 @@ const SELECT_TURN_FRAGMENTS_SQL: &str = "SELECT fragment_json
     WHERE turn_id = ?
     ORDER BY CASE WHEN sequence_hint IS NULL THEN 1 ELSE 0 END, sequence_hint, id;";
 
+const UPDATE_OPEN_TURN_AFTER_INSERT_SQL: &str = "UPDATE ingest_turns
+    SET terminality = ?,
+        updated_at = ?
+    WHERE id = ? AND status = ?;";
+
 const UPDATE_TURN_AFTER_REDUCE_SQL: &str = "UPDATE ingest_turns
     SET projection_json = ?,
         terminality = ?,
@@ -1378,7 +1562,7 @@ const UPDATE_TURN_AFTER_REDUCE_SQL: &str = "UPDATE ingest_turns
         processing_started_at = NULL,
         stored_at = NULL,
         updated_at = ?
-    WHERE id = ?;";
+    WHERE id = ? AND status = ?;";
 
 const CLAIM_NEXT_DUE_TURN_SQL: &str = "UPDATE ingest_turns
     SET status = ?,
@@ -1399,7 +1583,7 @@ const CLAIM_NEXT_DUE_TURN_SQL: &str = "UPDATE ingest_turns
         ORDER BY candidate.next_attempt_at ASC, candidate.id ASC
         LIMIT 1
     )
-    RETURNING id, conversation_id, turn_index, projection_json, finalized_at, attempt_count;";
+    RETURNING id, conversation_id, turn_index, projection_json, finalized_at, attempt_count, last_error;";
 
 const SELECT_NEXT_DUE_TURN_AT_SQL: &str = "SELECT candidate.next_attempt_at
     FROM ingest_turns candidate
@@ -1448,6 +1632,16 @@ const MARK_TURN_FAILED_SQL: &str = "UPDATE ingest_turns
         updated_at = ?
     WHERE id = ? AND status = ?;";
 
+const MARK_TURN_EXHAUSTED_SQL: &str = "UPDATE ingest_turns
+    SET status = ?,
+        attempt_count = ?,
+        last_error = ?,
+        next_attempt_at = NULL,
+        processing_started_at = NULL,
+        stored_at = NULL,
+        updated_at = ?
+    WHERE id = ? AND status = ?;";
+
 const RECOVER_PROCESSING_TURNS_SQL: &str = "UPDATE ingest_turns
     SET status = ?,
         attempt_count = attempt_count + 1,
@@ -1461,7 +1655,7 @@ const RECOVER_PROCESSING_TURNS_SQL: &str = "UPDATE ingest_turns
 const SELECT_TABLE_SCHEMA_SQL: &str =
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1;";
 const SELECT_INVALID_TURN_STATUS_SQL: &str =
-    "SELECT status FROM ingest_turns WHERE status NOT IN (?, ?, ?, ?, ?, ?) LIMIT 1;";
+    "SELECT status FROM ingest_turns WHERE status NOT IN (?, ?, ?, ?, ?, ?, ?) LIMIT 1;";
 const SELECT_INVALID_TURN_TERMINALITY_SQL: &str =
     "SELECT terminality FROM ingest_turns WHERE terminality NOT IN (?, ?, ?) LIMIT 1;";
 const SELECT_INVALID_FRAGMENT_KIND_SQL: &str =
@@ -1472,7 +1666,7 @@ const SELECT_INVALID_FRAGMENT_TERMINALITY_SQL: &str =
 const INGEST_TURNS_SCHEMA_REQUIREMENTS: &[SchemaConstraintRequirement] = &[
     SchemaConstraintRequirement {
         description: "status CHECK constraint",
-        sql_fragment: "check(statusin('open','finalized','processing','stored','aborted','failed'))",
+        sql_fragment: "check(statusin('open','finalized','processing','stored','aborted','failed','exhausted'))",
     },
     SchemaConstraintRequirement {
         description: "terminality CHECK constraint",
@@ -1516,8 +1710,8 @@ mod tests {
     use super::{
         ClaimedTurnRow, INGEST_FRAGMENTS_SCHEMA_REQUIREMENTS, INGEST_TURNS_SCHEMA_REQUIREMENTS,
         IngestDispatcher, IngestFragmentKind, IngestService, IngestStore, IngestTurnStatus,
-        SELECT_TABLE_SCHEMA_SQL, Terminality, apply_fragment_to_projection, compact_sql,
-        should_retry_stage_error, validate_runtime_constraints,
+        SELECT_TABLE_SCHEMA_SQL, StoredTerminality, Terminality, apply_fragment_to_projection,
+        compact_sql, should_retry_stage_error, validate_runtime_constraints,
     };
     use crate::actor::{
         MemoryHandle, ProcessTurnError, RetryableProcessTurnError, TestStoreTurnRequest,
@@ -1592,6 +1786,14 @@ mod tests {
         stored_at: Option<String>,
     }
 
+    #[derive(Debug, sqlx::FromRow)]
+    struct TurnProjectionRow {
+        id: i64,
+        status: IngestTurnStatus,
+        terminality: StoredTerminality,
+        projection_json: String,
+    }
+
     #[test]
     fn ingest_turn_status_round_trips_strings() {
         for status in [
@@ -1601,6 +1803,7 @@ mod tests {
             IngestTurnStatus::Stored,
             IngestTurnStatus::Aborted,
             IngestTurnStatus::Failed,
+            IngestTurnStatus::Exhausted,
         ] {
             assert_eq!(status.to_string(), status.as_str());
             assert_eq!(status.as_str().parse::<IngestTurnStatus>().unwrap(), status);
@@ -1890,24 +2093,34 @@ mod tests {
                 .expect("turn count");
         assert_eq!(turn_count, 1);
 
-        let projection_json: String = sqlx::query_scalar(
-            "SELECT projection_json
-             FROM ingest_turns
-             WHERE conversation_id = ? AND external_turn_id = ?
-             LIMIT 1",
-        )
-        .bind("session-concurrent")
-        .bind("turn-1")
-        .fetch_one(store.pool())
-        .await
-        .expect("projection json");
-        let projection: MemoryProjection =
-            serde_json::from_str(&projection_json).expect("projection");
+        let turn = load_turn_projection_row(store.pool(), "session-concurrent", "turn-1").await;
+        assert_eq!(turn.status, IngestTurnStatus::Open);
+        assert_eq!(turn.terminality.into_terminality(), Terminality::None);
 
-        assert_eq!(projection.user_message, "hello");
-        assert!(projection.assistant_reply.is_empty());
+        let fragment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ingest_fragments WHERE turn_id = ?")
+                .bind(turn.id)
+                .fetch_one(store.pool())
+                .await
+                .expect("fragment count");
+        assert_eq!(fragment_count, 2);
+
+        let mut tx = store
+            .pool()
+            .begin()
+            .await
+            .expect("begin replay transaction");
+        let reduced = store
+            .rebuild_projection(&mut tx, turn.id)
+            .await
+            .expect("rebuild projection");
+        tx.rollback().await.expect("rollback replay transaction");
+
+        assert_eq!(reduced.terminality, Terminality::None);
+        assert_eq!(reduced.projection.user_message, "hello");
+        assert!(reduced.projection.assistant_reply.is_empty());
         assert_eq!(
-            projection.steps,
+            reduced.projection.steps,
             vec![MemoryStep::ToolCall {
                 name: "Bash".to_string(),
                 input: "{\"command\":\"pwd\"}".to_string(),
@@ -2169,6 +2382,16 @@ mod tests {
                 .await
                 .expect("turn count");
         assert_eq!(turn_count, 1);
+
+        let turn = load_turn_projection_row(store.pool(), "session-external", "turn-1").await;
+        assert_eq!(turn.status, IngestTurnStatus::Finalized);
+        assert_eq!(turn.terminality.into_terminality(), Terminality::Hard);
+
+        let projection: MemoryProjection =
+            serde_json::from_str(&turn.projection_json).expect("finalized projection");
+        assert_eq!(projection.user_message, "hello");
+        assert_eq!(projection.assistant_reply, "done");
+        assert!(projection.steps.is_empty());
     }
 
     #[tokio::test]
@@ -2199,6 +2422,28 @@ mod tests {
 
         assert_eq!(first.turn_index, 1);
         assert_eq!(second.turn_index, 2);
+    }
+
+    #[tokio::test]
+    async fn soft_terminality_keeps_turn_open_and_updates_turn_metadata() {
+        let db_path = test_db_path("soft_terminality_metadata");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        let mut envelope = external_user_envelope("session-soft", "turn-1", "fragment-1", "hello");
+        envelope.fragment.terminality = Terminality::Soft;
+
+        let staged = store
+            .stage_fragment(&envelope)
+            .await
+            .expect("stage soft-terminal fragment");
+
+        assert!(!staged.finalized);
+
+        let turn = load_turn_projection_row(store.pool(), "session-soft", "turn-1").await;
+        assert_eq!(turn.status, IngestTurnStatus::Open);
+        assert_eq!(turn.terminality.into_terminality(), Terminality::Soft);
     }
 
     #[tokio::test]
@@ -2234,6 +2479,7 @@ mod tests {
             IngestTurnStatus::Processing,
             IngestTurnStatus::Stored,
             IngestTurnStatus::Failed,
+            IngestTurnStatus::Exhausted,
             IngestTurnStatus::Aborted,
         ]
         .into_iter()
@@ -2261,6 +2507,7 @@ mod tests {
                     None,
                 ),
                 IngestTurnStatus::Failed => (None, None, Some("2026-03-05T00:00:00Z"), None),
+                IngestTurnStatus::Exhausted => (None, None, Some("2026-03-05T00:00:00Z"), None),
                 IngestTurnStatus::Aborted => (None, None, None, None),
                 IngestTurnStatus::Open => unreachable!("test only covers closed turns"),
             };
@@ -2622,6 +2869,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claim_next_due_turn_skips_exhausted_blockers() {
+        let db_path = test_db_path("claim_exhausted_non_blocking");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        insert_turn_row(
+            store.pool(),
+            "session-exhausted-order",
+            1,
+            IngestTurnStatus::Exhausted,
+            &projection_json("first question", "first answer"),
+            None,
+            None,
+            Some("2026-03-05T00:00:00Z"),
+            None,
+            10,
+        )
+        .await;
+        insert_turn_row(
+            store.pool(),
+            "session-exhausted-order",
+            2,
+            IngestTurnStatus::Finalized,
+            &projection_json("second question", "second answer"),
+            Some("2026-03-05T00:00:01Z"),
+            None,
+            Some("2026-03-05T00:00:01Z"),
+            None,
+            0,
+        )
+        .await;
+
+        let claimed = store
+            .claim_next_due_turn("2026-03-05T00:00:02Z")
+            .await
+            .expect("claim next due")
+            .expect("second turn should be claimable");
+        assert_eq!(claimed.turn_index, 2);
+    }
+
+    #[tokio::test]
+    async fn claim_next_due_turn_keeps_failed_blockers() {
+        let db_path = test_db_path("claim_failed_blocking");
+        let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+            .await
+            .expect("open store");
+
+        insert_turn_row(
+            store.pool(),
+            "session-failed-order",
+            1,
+            IngestTurnStatus::Failed,
+            &projection_json("first question", "first answer"),
+            None,
+            None,
+            Some("2026-03-05T00:00:00Z"),
+            None,
+            3,
+        )
+        .await;
+        insert_turn_row(
+            store.pool(),
+            "session-failed-order",
+            2,
+            IngestTurnStatus::Finalized,
+            &projection_json("second question", "second answer"),
+            Some("2026-03-05T00:00:01Z"),
+            None,
+            Some("2026-03-05T00:00:01Z"),
+            None,
+            0,
+        )
+        .await;
+
+        let claimed = store
+            .claim_next_due_turn("2026-03-05T00:00:02Z")
+            .await
+            .expect("claim next due");
+        assert!(
+            claimed.is_none(),
+            "failed turns should keep later turns blocked"
+        );
+    }
+
+    #[tokio::test]
     async fn build_window_uses_all_stored_previous_turns_when_history_is_unlimited() {
         let db_path = test_db_path("history_window");
         let store = IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
@@ -2693,6 +3026,7 @@ mod tests {
                 projection_json: current_projection.clone(),
                 finalized_at: Some("2026-03-05T00:02:00Z".to_string()),
                 attempt_count: 0,
+                last_error: None,
             })
             .await
             .expect("build window");
@@ -2759,6 +3093,7 @@ mod tests {
                 projection_json: current_projection.clone(),
                 finalized_at: Some("2026-03-05T00:02:00Z".to_string()),
                 attempt_count: 0,
+                last_error: None,
             })
             .await
             .expect("build window");
@@ -2809,6 +3144,112 @@ mod tests {
             Some("encoder error: temporary encoder failure")
         );
         assert!(row.next_attempt_at.is_some());
+        assert!(row.processing_started_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exhausts_turn_when_retryable_failure_reaches_cap() {
+        let db_path = test_db_path("dispatcher_exhausted");
+        let store = Arc::new(
+            IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+                .await
+                .expect("open store"),
+        );
+        store
+            .stage_fragment(&hard_assistant_envelope(
+                "session-exhausted",
+                "fragment-1",
+                1,
+                "Done.",
+            ))
+            .await
+            .expect("stage finalized turn");
+
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let dispatcher = IngestDispatcher::new_with_max_processing_attempts(
+            store.clone(),
+            memory,
+            Arc::new(Notify::new()),
+            1,
+        );
+
+        let run = tokio::spawn(async move { dispatcher.run_once().await });
+        let request = recv_store_request(&mut requests).await;
+        request
+            .responder
+            .send(Err(ProcessTurnError::Retryable(
+                RetryableProcessTurnError::Encoder("temporary encoder failure".to_string()),
+            )))
+            .expect("send retryable failure");
+        run.await.expect("join").expect("dispatcher result");
+
+        let row = load_turn_state(store.pool(), request.turn_id).await;
+        assert_eq!(row.status, IngestTurnStatus::Exhausted);
+        assert_eq!(row.attempt_count, 1);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("encoder error: temporary encoder failure")
+        );
+        assert!(row.next_attempt_at.is_none());
+        assert!(row.processing_started_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_exhausts_recovered_turn_before_invoking_actor() {
+        let db_path = test_db_path("dispatcher_recovered_cap");
+        let store = Arc::new(
+            IngestStore::open(&db_path, TEST_HISTORY_WINDOW_SIZE)
+                .await
+                .expect("open store"),
+        );
+        store
+            .stage_fragment(&hard_assistant_envelope(
+                "session-recovered-cap",
+                "fragment-1",
+                1,
+                "Recovered turn",
+            ))
+            .await
+            .expect("stage finalized turn");
+        let claimed = store
+            .claim_next_due_turn(&chrono::Utc::now().to_rfc3339())
+            .await
+            .expect("claim turn")
+            .expect("processing turn");
+        assert_eq!(claimed.attempt_count, 0);
+        assert_eq!(
+            store
+                .recover_processing_turns()
+                .await
+                .expect("recover turns"),
+            1
+        );
+
+        let (memory, mut requests) = MemoryHandle::channel_for_tests(1).await;
+        let dispatcher = IngestDispatcher::new_with_max_processing_attempts(
+            store.clone(),
+            memory,
+            Arc::new(Notify::new()),
+            1,
+        );
+
+        dispatcher.run_once().await.expect("dispatcher result");
+
+        assert!(
+            timeout(Duration::from_millis(100), requests.recv())
+                .await
+                .is_err(),
+            "dispatcher should not invoke the actor once the cap is reached"
+        );
+
+        let row = load_turn_state(store.pool(), claimed.id).await;
+        assert_eq!(row.status, IngestTurnStatus::Exhausted);
+        assert_eq!(row.attempt_count, 1);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("processing interrupted before completion")
+        );
+        assert!(row.next_attempt_at.is_none());
         assert!(row.processing_started_at.is_none());
     }
 
@@ -3313,6 +3754,24 @@ mod tests {
         .fetch_one(pool)
         .await
         .expect("turn state")
+    }
+
+    async fn load_turn_projection_row(
+        pool: &SqlitePool,
+        conversation_id: &str,
+        external_turn_id: &str,
+    ) -> TurnProjectionRow {
+        sqlx::query_as::<_, TurnProjectionRow>(
+            "SELECT id, status, terminality, projection_json
+             FROM ingest_turns
+             WHERE conversation_id = ? AND external_turn_id = ?
+             LIMIT 1",
+        )
+        .bind(conversation_id)
+        .bind(external_turn_id)
+        .fetch_one(pool)
+        .await
+        .expect("turn projection row")
     }
 
     async fn turn_count_for_conversation(pool: &SqlitePool, conversation_id: &str) -> i64 {

@@ -117,6 +117,7 @@ Supported keys:
   server.fastembed_model
   server.history_window_size
   server.nearest_neighbor_count
+  server.max_processing_attempts
   server.local_encoder_url
   server.remote_encoder_url
   integrations.claude_code.configured
@@ -150,6 +151,7 @@ Supported keys:
   server.fastembed_model
   server.history_window_size
   server.nearest_neighbor_count
+  server.max_processing_attempts
   server.local_encoder_url
   server.remote_encoder_url
   integrations.claude_code.configured

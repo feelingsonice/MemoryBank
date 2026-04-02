@@ -24,8 +24,10 @@ pub struct ExtractedMemoryAnalysis {
 pub struct EvolvedNeighbor {
     /// The exact integer ID of the existing neighbor memory to update.
     pub id: i64,
-    /// The newly updated context for this neighbor.
-    pub context: String,
+    /// The newly updated context for this neighbor. Omit to preserve the
+    /// existing stored context when only tags need to change.
+    #[serde(default)]
+    pub context: Option<String>,
     /// The newly updated tags for this neighbor.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -103,6 +105,7 @@ Your task is to determine how the knowledge graph should evolve by analyzing the
 CRITICAL RULES:
 - Use the exact integer `id` to refer to existing neighbor memories.
 - ONLY output neighbor updates for neighbors that ACTUALLY require modification. If a neighbor does not need its context or tags updated, completely omit it.
+- Within a neighbor update, omit `context` if the existing context should stay unchanged.
 - Format your response exactly according to the provided JSON schema."#;
 
 pub(crate) struct RigStructuredLlm<M: CompletionModel> {
@@ -459,7 +462,7 @@ fn ollama_model_matches(requested: &str, available: &str) -> bool {
 mod tests {
     use super::{
         ExtractedMemoryAnalysis, InitializedLlm, LlmClient, MEMORY_ANALYSIS_PREAMBLE,
-        MemoryAnalysisPrompt, OllamaTagsResponse, anthropic_completion_model,
+        MemoryAnalysisPrompt, MemoryEvolution, OllamaTagsResponse, anthropic_completion_model,
         llm_client_from_config, validate_ollama_url, verify_ollama_model,
     };
     use crate::config::LlmProviderConfig;
@@ -534,6 +537,28 @@ mod tests {
                 "tags": ["two"]
             })
         );
+    }
+
+    #[test]
+    fn memory_evolution_allows_tag_only_neighbor_updates() {
+        let evolution = serde_json::from_value::<MemoryEvolution>(serde_json::json!({
+            "suggested_connections": [7],
+            "updated_new_memory_tags": ["refined"],
+            "neighbor_updates": [
+                {
+                    "id": 42,
+                    "tags": ["updated-tag"]
+                }
+            ]
+        }))
+        .expect("deserialize evolution");
+
+        assert_eq!(evolution.suggested_connections, vec![7]);
+        assert_eq!(evolution.updated_new_memory_tags, vec!["refined"]);
+        assert_eq!(evolution.neighbor_updates.len(), 1);
+        assert_eq!(evolution.neighbor_updates[0].id, 42);
+        assert_eq!(evolution.neighbor_updates[0].context, None);
+        assert_eq!(evolution.neighbor_updates[0].tags, vec!["updated-tag"]);
     }
 
     #[test]

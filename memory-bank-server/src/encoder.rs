@@ -3,7 +3,6 @@ use fastembed::{
     UserDefinedEmbeddingModel,
 };
 use hf_hub::api::sync::{ApiBuilder, ApiRepo};
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -26,16 +25,6 @@ pub struct EmbeddingInput<'a> {
     pub keywords: &'a [String],
     pub tags: &'a [String],
     pub context: &'a str,
-}
-
-impl fmt::Display for EmbeddingInput<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Content: {}\nKeywords: ", self.content)?;
-        write_joined(f, self.keywords)?;
-        f.write_str("\nTags: ")?;
-        write_joined(f, self.tags)?;
-        write!(f, "\nContext: {}", self.context)
-    }
 }
 
 pub enum EncoderClient {
@@ -199,9 +188,36 @@ impl FastEmbedEncoder {
 fn payloads_to_texts(payloads: &[EmbeddingInput<'_>]) -> Vec<String> {
     let mut texts = Vec::with_capacity(payloads.len());
     for payload in payloads {
-        texts.push(payload.to_string());
+        texts.push(embedding_input_to_text(payload));
     }
     texts
+}
+
+fn embedding_input_to_text(payload: &EmbeddingInput<'_>) -> String {
+    const CONTENT_PREFIX: &str = "Content: ";
+    const KEYWORDS_PREFIX: &str = "\nKeywords: ";
+    const TAGS_PREFIX: &str = "\nTags: ";
+    const CONTEXT_PREFIX: &str = "\nContext: ";
+
+    let mut text = String::with_capacity(
+        CONTENT_PREFIX.len()
+            + payload.content.len()
+            + KEYWORDS_PREFIX.len()
+            + joined_values_len(payload.keywords)
+            + TAGS_PREFIX.len()
+            + joined_values_len(payload.tags)
+            + CONTEXT_PREFIX.len()
+            + payload.context.len(),
+    );
+    text.push_str(CONTENT_PREFIX);
+    text.push_str(payload.content);
+    text.push_str(KEYWORDS_PREFIX);
+    append_joined_values(&mut text, payload.keywords);
+    text.push_str(TAGS_PREFIX);
+    append_joined_values(&mut text, payload.tags);
+    text.push_str(CONTEXT_PREFIX);
+    text.push_str(payload.context);
+    text
 }
 
 pub(crate) fn validate_embedding_count(
@@ -330,19 +346,21 @@ fn read_model_file(path: PathBuf, name: &str) -> Result<Vec<u8>, EncoderError> {
     std::fs::read(&path).map_err(|e| EncoderError::Init(format!("Failed to read {}: {}", name, e)))
 }
 
-fn write_joined(f: &mut fmt::Formatter<'_>, values: &[String]) -> fmt::Result {
+fn joined_values_len(values: &[String]) -> usize {
+    values.iter().map(String::len).sum::<usize>() + values.len().saturating_sub(1) * 2
+}
+
+fn append_joined_values(target: &mut String, values: &[String]) {
     let mut values = values.iter();
     let Some(first) = values.next() else {
-        return Ok(());
+        return;
     };
 
-    f.write_str(first)?;
+    target.push_str(first);
     for value in values {
-        f.write_str(", ")?;
-        f.write_str(value)?;
+        target.push_str(", ");
+        target.push_str(value);
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

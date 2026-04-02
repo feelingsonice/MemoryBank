@@ -15,7 +15,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::actor::MemoryHandle;
 use crate::error::AppError;
@@ -128,14 +128,14 @@ async fn handle_ingest(
     let Json(request) = match payload {
         Ok(payload) => payload,
         Err(err) => {
-            warn!(error = %err, "Rejected ingest request with invalid JSON body");
+            warn!(error = %err, "Rejected /ingest request with invalid JSON");
             return StatusCode::BAD_REQUEST;
         }
     };
 
     match state.ingest.ingest(request).await {
         Ok(outcome) => {
-            info!(
+            debug!(
                 agent = %outcome.agent,
                 event = %outcome.event,
                 conversation_id = %outcome.conversation_id,
@@ -143,23 +143,23 @@ async fn handle_ingest(
                 turn_index = outcome.turn_index,
                 duplicate = outcome.duplicate,
                 finalized = outcome.finalized,
-                "Accepted ingest fragment",
+                "Staged ingest fragment",
             );
             StatusCode::ACCEPTED
         }
         Err(IngestError::Validation(error)) => {
-            warn!(error = %error, "Rejected ingest fragment after validation");
+            warn!(error = %error, "Rejected ingest fragment because the payload was invalid");
             StatusCode::UNPROCESSABLE_ENTITY
         }
         Err(error) if error.is_sqlite_lock_contention() => {
             warn!(
                 error = %error,
-                "Failed to stage ingest fragment because SQLite remained locked after in-process writer serialization; this usually indicates another process is writing the same namespace database"
+                "Failed to stage ingest fragment because the namespace database stayed locked; another process may be writing to the same namespace"
             );
             StatusCode::SERVICE_UNAVAILABLE
         }
         Err(error) => {
-            warn!(error = %error, "Failed to stage ingest fragment");
+            warn!(error = %error, "Failed to stage ingest fragment in the durable ingest queue");
             StatusCode::SERVICE_UNAVAILABLE
         }
     }
@@ -182,11 +182,11 @@ pub struct HealthResponse {
 async fn shutdown_signal(shutdown: CancellationToken) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            info!("Shutdown signal received; waiting for in-flight requests to finish");
+            info!("Received shutdown signal; waiting for in-flight HTTP requests to finish");
             shutdown.cancel();
         }
         _ = shutdown.cancelled() => {
-            info!("HTTP server shutdown requested; waiting for in-flight requests to finish");
+            info!("HTTP shutdown requested; waiting for in-flight HTTP requests to finish");
         }
     }
 }

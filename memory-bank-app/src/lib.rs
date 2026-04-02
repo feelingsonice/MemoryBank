@@ -18,6 +18,9 @@ pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
 pub const DEFAULT_FASTEMBED_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
+pub const DEFAULT_HISTORY_WINDOW_SIZE: u32 = 0;
+pub const OLLAMA_HISTORY_WINDOW_SIZE: u32 = 5;
+pub const DEFAULT_MAX_PROCESSING_ATTEMPTS: u32 = 10;
 pub const SERVER_STARTUP_STATE_FILE_NAME: &str = "server-startup.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -319,6 +322,8 @@ pub struct ServerSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nearest_neighbor_count: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_processing_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_encoder_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_encoder_url: Option<String>,
@@ -333,6 +338,7 @@ impl ServerSettings {
             && self.fastembed_model.is_none()
             && self.history_window_size.is_none()
             && self.nearest_neighbor_count.is_none()
+            && self.max_processing_attempts.is_none()
             && self.local_encoder_url.is_none()
             && self.remote_encoder_url.is_none()
     }

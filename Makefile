@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help fmt fmt-check check build build-release test test-ci test-cli test-cli-blackbox test-cli-real test-cli-all test-server-retrieval-evals test-server-llm-evals validate install-from-source
+.PHONY: help fmt fmt-check check build build-release test test-ci test-cli test-cli-blackbox test-cli-real test-cli-all test-server-retrieval-evals test-server-llm-evals validate install
 
 ifneq ($(filter test-server-llm-evals,$(firstword $(MAKECMDGOALS))),)
 LLM_EVAL_PROVIDER_ARG := $(word 2,$(MAKECMDGOALS))
@@ -35,7 +35,7 @@ help:
 		"  make test-server-retrieval-evals  Run opt-in real-encoder retrieval evals for memory-bank-server" \
 		"  make test-server-llm-evals [provider] [model]  Run opt-in real LLM functional evals for memory-bank-server" \
 		"  make validate          Run fmt-check, check, and test-ci" \
-		"  make install-from-source  Build and install this checkout into ~/.memory_bank"
+		"  make install           Build and install this checkout into ~/.memory_bank"
 
 fmt:
 	cargo fmt --all
@@ -79,5 +79,5 @@ test-server-llm-evals:
 
 validate: fmt-check check test-ci
 
-install-from-source:
+install:
 	./install.sh --from-source

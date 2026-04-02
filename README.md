@@ -3,7 +3,7 @@
   Memory Bank
 </h1>
 
-Memory Bank gives coding agents shared, long-term memory across sessions and across tools.
+Memory Bank gives agents shared, long-term memory across sessions and across tools.
 
 It runs locally, stores memory in your own namespaced SQLite databases, and works with Claude Code, Codex, Gemini CLI, OpenCode, and OpenClaw.
 
@@ -54,6 +54,10 @@ If the installer finished in a non-interactive shell and skipped setup, just run
 
 If you later change `server.fastembed_model` with `mb config set`, the CLI will ask you to confirm it. The next service start will rebuild the vector index for the active namespace and re-encode any existing memories with the new embedding model. While that runs, `mb status` and `mb service status` will report that Memory Bank is not up yet because it is reindexing.
 
+If you need to cap how many times finalized turns retry after retryable provider failures, use `mb config set server.max_processing_attempts <N>` or change it in `mb setup` advanced settings. The default is `10`. Once a turn hits that cap it moves to `exhausted` instead of retrying forever, and later turns in the same conversation can continue processing.
+
+Important: this retry-cap release updates the ingest turn-status schema. Existing namespace databases created before this change must be recreated or migrated externally before the new server will open them.
+
 ### Smoke Test
 
 In a fresh agent session, ask it to remember something memorable and do at least one tool call:
@@ -98,7 +102,7 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 3. The service assembles finalized turns, analyzes them with your configured provider, and stores memory notes plus local embeddings.
 4. Agents call `retrieve_memory` over MCP when prior context could improve the answer.
 
-Important: the coding agent you use directly is separate from the internal provider Memory Bank uses for memory analysis. For example, you can use Claude Code while Memory Bank runs on Gemini, OpenAI, Anthropic, or Ollama.
+Important: the agent you use directly is separate from the internal provider Memory Bank uses for memory analysis. For example, you can use Claude Code or OpenClaw while Memory Bank runs on Gemini, OpenAI, Anthropic, or Ollama.
 
 ## Advanced
 
@@ -109,6 +113,16 @@ If you want to build from source instead of downloading a release, use:
 ```
 
 That is the advanced path. The lower-level binaries still exist, but `mb` and the built-in `--help` pages are the intended user interface.
+
+### Logging
+
+By default, the server keeps `INFO` logs focused on Memory Bank's own lifecycle and work-queue events. Dependency session chatter such as `rmcp` connect/disconnect logs is hidden unless you opt in with `RUST_LOG`.
+
+For example, to troubleshoot MCP session behavior with extra detail, start the server with:
+
+```bash
+RUST_LOG=memory_bank_server=debug,rmcp=info cargo run -p memory-bank-server -- --help
+```
 
 ## License
 

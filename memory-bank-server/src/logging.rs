@@ -6,9 +6,12 @@ use tracing_subscriber::fmt::FormattedFields;
 use tracing_subscriber::fmt::format::{DefaultFields, FormatFields, Writer};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::{EnvFilter, Layer, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, Layer, filter::LevelFilter, fmt, prelude::*};
 
 use crate::error::AppError;
+
+pub(crate) const INTERNAL_LOG_STREAM_TARGET: &str = "memory_bank_server::internal::mcp_log_stream";
+const DEFAULT_LOG_DIRECTIVES: &str = "memory_bank_server=info";
 
 pub struct Logging {
     sender: broadcast::Sender<LoggingMessageNotificationParam>,
@@ -21,7 +24,7 @@ impl Logging {
         tracing_subscriber::registry()
             .with(fmt::layer().compact().with_writer(std::io::stderr))
             .with(McpLoggerLayer::new(sender.clone()))
-            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+            .with(env_filter())
             .try_init()?;
 
         Ok(Self { sender })
@@ -30,6 +33,21 @@ impl Logging {
     pub fn sender(&self) -> broadcast::Sender<LoggingMessageNotificationParam> {
         self.sender.clone()
     }
+}
+
+fn env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| default_env_filter())
+}
+
+fn default_env_filter() -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::WARN.into())
+        .parse_lossy("")
+        .add_directive(
+            DEFAULT_LOG_DIRECTIVES
+                .parse()
+                .expect("default log directives should be valid"),
+        )
 }
 
 pub struct McpLoggerLayer {
@@ -153,6 +171,71 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        if event.metadata().target() == INTERNAL_LOG_STREAM_TARGET {
+            return;
+        }
         let _ = self.sender.send(self.notification_for(event, ctx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INTERNAL_LOG_STREAM_TARGET, default_env_filter};
+    use std::sync::{Arc, Mutex};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::{Layer, registry};
+
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        targets: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CaptureLayer {
+        fn recorded_targets(&self) -> Vec<String> {
+            self.targets.lock().expect("targets lock").clone()
+        }
+    }
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            self.targets
+                .lock()
+                .expect("targets lock")
+                .push(event.metadata().target().to_string());
+        }
+    }
+
+    #[test]
+    fn default_env_filter_prefers_first_party_info_logs() {
+        let capture = CaptureLayer::default();
+        let subscriber = registry().with(default_env_filter()).with(capture.clone());
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "memory_bank_server::actor", "server info");
+            tracing::info!(target: "rmcp::service", "dependency info");
+            tracing::warn!(target: "rmcp::service", "dependency warn");
+        });
+
+        assert_eq!(
+            capture.recorded_targets(),
+            vec![
+                "memory_bank_server::actor".to_string(),
+                "rmcp::service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn internal_log_stream_target_is_reserved_for_non_forwarded_logs() {
+        assert_eq!(
+            INTERNAL_LOG_STREAM_TARGET,
+            "memory_bank_server::internal::mcp_log_stream"
+        );
     }
 }

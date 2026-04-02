@@ -1,6 +1,6 @@
 # Architecture
 
-Memory Bank is a local memory service for coding agents.
+Memory Bank is a local memory service for agents.
 
 At a high level, it separates memory into two paths:
 
@@ -82,15 +82,15 @@ When you switch namespaces, Memory Bank starts using a different local database 
 
 ## What Memory Bank Is Not
 
-Memory Bank is not a reverse proxy sitting in front of your coding agent's model traffic.
+Memory Bank is not a reverse proxy sitting in front of your agent's model traffic.
 
 Instead:
 
 - capture comes from agent hooks, plugins, or extensions
 - recall comes from the `retrieve_memory` MCP tool
-- the internal Memory Bank provider is separate from the coding agent you use directly
+- the internal Memory Bank provider is separate from the agent you use directly
 
-That separation is what makes cross-agent memory possible. You can use one tool as your coding agent and a different provider for Memory Bank's internal memory analysis.
+That separation is what makes cross-agent memory possible. You can use one tool as your agent and a different provider for Memory Bank's internal memory analysis.
 
 ## Related Docs
 
