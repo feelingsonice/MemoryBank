@@ -114,6 +114,16 @@ If you want to build from source instead of downloading a release, use:
 
 That is the advanced path. The lower-level binaries still exist, but `mb` and the built-in `--help` pages are the intended user interface.
 
+### Logging
+
+By default, the server keeps `INFO` logs focused on Memory Bank's own lifecycle and work-queue events. Dependency session chatter such as `rmcp` connect/disconnect logs is hidden unless you opt in with `RUST_LOG`.
+
+For example, to troubleshoot MCP session behavior with extra detail, start the server with:
+
+```bash
+RUST_LOG=memory_bank_server=debug,rmcp=info cargo run -p memory-bank-server -- --help
+```
+
 ## License
 
 Memory Bank is licensed under `MIT`. See [LICENSE](./LICENSE).

@@ -410,7 +410,7 @@ impl MemoryActor {
         info!("Memory actor stopped because its work queue closed");
     }
 
-    #[tracing::instrument(skip(self, window))]
+    #[tracing::instrument(skip(self, window, turn_id, timestamp), fields(turn_id = turn_id))]
     async fn handle_add(
         &self,
         turn_id: i64,
@@ -429,7 +429,7 @@ impl MemoryActor {
         .await
     }
 
-    #[tracing::instrument(skip(self, responder), fields(query_chars = query.chars().count()))]
+    #[tracing::instrument(skip(self, query, responder), fields(query_chars = query.chars().count()))]
     async fn handle_retrieve(
         &self,
         query: String,
@@ -479,7 +479,7 @@ where
         .map_err(|e| McpError::internal_error(format!("DB query error: {}", e), None))?;
 
     if top_ids.is_empty() {
-        info!(
+        debug!(
             knn_matches = 0,
             returned = 0,
             "No stored memories matched the retrieve_memory query"
@@ -504,7 +504,7 @@ where
         .map(|mut rows| {
             sort_retrieval_rows(&mut rows, &ordered_ids);
             let notes: Vec<MemoryNote> = rows.into_iter().map(MemoryNote::from).collect();
-            info!(
+            debug!(
                 knn_matches = knn_count,
                 expanded_matches = expanded_count,
                 returned = notes.len(),
@@ -949,7 +949,6 @@ async fn persist_prepared_turn(
 
     tx.commit().await?;
     info!(
-        turn_id,
         memory_id = new_id,
         links_added = link_count,
         neighbor_updates = neighbor_update_count,
