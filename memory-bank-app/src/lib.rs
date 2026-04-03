@@ -15,6 +15,7 @@ pub const SETTINGS_FILE_NAME: &str = "settings.toml";
 pub const DEFAULT_GEMINI_MODEL: &str = "gemini-3-flash-preview";
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4-6";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-mini";
+pub const DEFAULT_OPENAI_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
 pub const DEFAULT_FASTEMBED_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
@@ -314,6 +315,8 @@ pub struct ServerSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ollama_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoder_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fastembed_model: Option<String>,
@@ -334,6 +337,7 @@ impl ServerSettings {
         self.llm_provider.is_none()
             && self.llm_model.is_none()
             && self.ollama_url.is_none()
+            && self.openai_url.is_none()
             && self.encoder_provider.is_none()
             && self.fastembed_model.is_none()
             && self.history_window_size.is_none()

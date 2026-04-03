@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use memory_bank_app::{
     AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL, DEFAULT_GEMINI_MODEL,
     DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_MAX_PROCESSING_ATTEMPTS, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, Namespace, OLLAMA_HISTORY_WINDOW_SIZE,
+    DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_URL, Namespace, OLLAMA_HISTORY_WINDOW_SIZE,
     ServerSettings,
 };
 use std::env;
@@ -58,7 +58,7 @@ impl std::str::FromStr for LlmProviderType {
 pub enum LlmProviderConfig {
     Gemini { api_key: String, model: String },
     Anthropic { api_key: String, model: String },
-    OpenAi { api_key: String, model: String },
+    OpenAi { api_key: String, model: String, base_url: String },
     Ollama { url: String, model: String },
 }
 
@@ -91,6 +91,11 @@ impl LlmProviderConfig {
                     settings.and_then(|s| s.llm_model.as_deref()),
                     DEFAULT_OPENAI_MODEL,
                 ),
+                base_url: env_setting_or_default(
+                    "OPENAI_BASE_URL",
+                    settings.and_then(|s| s.openai_url.as_deref()),
+                    DEFAULT_OPENAI_URL,
+                ),
             }),
             LlmProviderType::Ollama => Ok(Self::Ollama {
                 url: env_setting_or_default(
@@ -122,7 +127,13 @@ impl fmt::Display for LlmProviderConfig {
         match self {
             Self::Gemini { model, .. } => write!(f, "Gemini::{model}"),
             Self::Anthropic { model, .. } => write!(f, "Anthropic::{model}"),
-            Self::OpenAi { model, .. } => write!(f, "OpenAi::{model}"),
+            Self::OpenAi { model, base_url } => {
+                if base_url == DEFAULT_OPENAI_URL {
+                    write!(f, "OpenAi::{model}")
+                } else {
+                    write!(f, "OpenAi::{model}@{base_url}")
+                }
+            }
             Self::Ollama { model, url } => write!(f, "Ollama::{model}@{url}"),
         }
     }
