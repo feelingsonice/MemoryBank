@@ -9,7 +9,8 @@ use crate::domain::{
 use crate::models::default_model_for_provider;
 use memory_bank_app::{
     AppSettings, DEFAULT_FASTEMBED_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_OLLAMA_URL,
-    IntegrationsSettings, Namespace, ServerSettings, ServiceSettings,
+    DEFAULT_OPENAI_URL, IntegrationsSettings, Namespace, ServerSettings, ServiceSettings,
+    format_openai_model_id, normalize_openai_url, normalize_openai_url_override,
 };
 use std::str::FromStr;
 
@@ -22,6 +23,7 @@ enum ConfigKey {
     ServerLlmProvider,
     ServerLlmModel,
     ServerOllamaUrl,
+    ServerOpenAiUrl,
     ServerEncoderProvider,
     ServerFastembedModel,
     ServerHistoryWindowSize,
@@ -50,6 +52,7 @@ impl FromStr for ConfigKey {
             "server.llm_provider" => Ok(Self::ServerLlmProvider),
             "server.llm_model" => Ok(Self::ServerLlmModel),
             "server.ollama_url" => Ok(Self::ServerOllamaUrl),
+            "server.openai_url" => Ok(Self::ServerOpenAiUrl),
             "server.encoder_provider" => Ok(Self::ServerEncoderProvider),
             "server.fastembed_model" => Ok(Self::ServerFastembedModel),
             "server.history_window_size" => Ok(Self::ServerHistoryWindowSize),
@@ -89,6 +92,12 @@ pub(crate) fn get_config_value(settings: &AppSettings, key: &str) -> Result<Stri
                 .as_ref()
                 .and_then(|server| server.ollama_url.as_deref()),
         )),
+        ConfigKey::ServerOpenAiUrl => Ok(resolved_openai_url(
+            settings
+                .server
+                .as_ref()
+                .and_then(|server| server.openai_url.as_deref()),
+        )?),
         ConfigKey::ServerEncoderProvider => Ok(resolved_encoder_provider(settings).to_string()),
         ConfigKey::ServerFastembedModel => Ok(settings
             .server
@@ -175,6 +184,9 @@ pub(crate) fn set_config_value(
             if provider != ProviderId::Ollama {
                 server.ollama_url = None;
             }
+            if provider != ProviderId::OpenAi {
+                server.openai_url = None;
+            }
             set_server(settings, server);
         }
         ConfigKey::ServerLlmModel => {
@@ -199,6 +211,18 @@ pub(crate) fn set_config_value(
                     Some(normalized)
                 }
             });
+            set_server(settings, server);
+        }
+        ConfigKey::ServerOpenAiUrl => {
+            let mut server = settings.server.clone().unwrap_or_default();
+            server.openai_url = normalize_optional_string(value)
+                .map(|value| {
+                    normalize_openai_url_override(&value).map_err(|error| {
+                        AppError::InvalidConfigValue(key.to_string(), error.to_string())
+                    })
+                })
+                .transpose()?
+                .flatten();
             set_server(settings, server);
         }
         ConfigKey::ServerEncoderProvider => {
@@ -315,6 +339,32 @@ pub(crate) fn resolved_llm_model(settings: &AppSettings) -> String {
         .unwrap_or_else(|| default_model_for_provider(llm_provider_value(settings)).to_string())
 }
 
+pub(crate) fn resolved_llm_model_id(settings: &AppSettings) -> Result<String, AppError> {
+    let model = resolved_llm_model(settings);
+    Ok(match llm_provider(settings) {
+        ProviderId::Anthropic => format!("Anthropic::{model}"),
+        ProviderId::Gemini => format!("Gemini::{model}"),
+        ProviderId::OpenAi => format_openai_model_id(
+            &model,
+            &resolved_openai_url(
+                settings
+                    .server
+                    .as_ref()
+                    .and_then(|server| server.openai_url.as_deref()),
+            )?,
+        ),
+        ProviderId::Ollama => format!(
+            "Ollama::{model}@{}",
+            resolved_ollama_url(
+                settings
+                    .server
+                    .as_ref()
+                    .and_then(|server| server.ollama_url.as_deref()),
+            )
+        ),
+    })
+}
+
 pub(crate) fn resolved_fastembed_model(settings: &AppSettings) -> String {
     settings
         .server
@@ -347,6 +397,15 @@ pub(crate) fn resolved_ollama_url(current: Option<&str>) -> String {
     current
         .map(normalize_ollama_url)
         .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string())
+}
+
+pub(crate) fn resolved_openai_url(current: Option<&str>) -> Result<String, AppError> {
+    match current {
+        Some(value) => normalize_openai_url(value).map_err(|error| {
+            AppError::InvalidConfigValue("server.openai_url".to_string(), error.to_string())
+        }),
+        None => Ok(DEFAULT_OPENAI_URL.to_string()),
+    }
 }
 
 pub(crate) fn normalize_ollama_url(value: &str) -> String {
@@ -503,6 +562,46 @@ mod tests {
     }
 
     #[test]
+    fn config_get_uses_default_openai_url_when_unset() {
+        let settings = AppSettings::default();
+
+        let openai_url = get_config_value(&settings, "server.openai_url").expect("openai url");
+
+        assert_eq!(openai_url, DEFAULT_OPENAI_URL);
+    }
+
+    #[test]
+    fn config_set_round_trips_openai_url_and_clears_default() {
+        let mut settings = AppSettings::default();
+
+        set_config_value(
+            &mut settings,
+            "server.openai_url",
+            " https://opencode.ai/zen/v1/ ",
+        )
+        .expect("set openai url");
+        assert_eq!(
+            get_config_value(&settings, "server.openai_url").expect("get openai url"),
+            "https://opencode.ai/zen/v1"
+        );
+        assert_eq!(
+            settings
+                .server
+                .as_ref()
+                .and_then(|server| server.openai_url.as_deref()),
+            Some("https://opencode.ai/zen/v1")
+        );
+
+        set_config_value(&mut settings, "server.openai_url", DEFAULT_OPENAI_URL)
+            .expect("reset openai url");
+        assert_eq!(
+            get_config_value(&settings, "server.openai_url").expect("get default openai url"),
+            DEFAULT_OPENAI_URL
+        );
+        assert!(settings.server.is_none());
+    }
+
+    #[test]
     fn config_set_default_values_clear_overrides_and_sections() {
         let mut settings = AppSettings::default();
 
@@ -529,6 +628,42 @@ mod tests {
         set_config_value(&mut settings, "server.llm_provider", "anthropic").expect("set provider");
 
         assert!(settings.server.is_none());
+    }
+
+    #[test]
+    fn config_set_switching_away_from_openai_clears_saved_openai_url() {
+        let mut settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("open-ai".to_string()),
+                openai_url: Some("https://opencode.ai/zen/v1".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+
+        set_config_value(&mut settings, "server.llm_provider", "anthropic").expect("set provider");
+
+        assert!(settings.server.is_none());
+    }
+
+    #[test]
+    fn resolved_llm_model_id_includes_custom_openai_endpoint() {
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("open-ai".to_string()),
+                llm_model: Some("qwen3.6-plus-free".to_string()),
+                openai_url: Some("https://opencode.ai/zen/v1".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+
+        let model_id = resolved_llm_model_id(&settings).expect("llm model id");
+
+        assert_eq!(
+            model_id,
+            "OpenAi::qwen3.6-plus-free@https://opencode.ai/zen/v1"
+        );
     }
 
     #[test]

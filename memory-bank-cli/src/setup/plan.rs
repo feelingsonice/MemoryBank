@@ -6,7 +6,7 @@ use crate::constants::{
 use crate::domain::{ProviderId, integration_configured, set_integration_configured};
 use memory_bank_app::{
     AppSettings, DEFAULT_FASTEMBED_MODEL, DEFAULT_NAMESPACE_NAME, DEFAULT_OLLAMA_URL, DEFAULT_PORT,
-    Namespace, SETTINGS_SCHEMA_VERSION, SecretStore,
+    Namespace, SETTINGS_SCHEMA_VERSION, SecretStore, normalize_openai_url_override,
 };
 
 #[derive(Debug, Clone)]
@@ -24,6 +24,7 @@ pub(super) struct SetupPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AdvancedSettings {
     pub(super) port: u16,
+    pub(super) openai_url: Option<String>,
     pub(super) fastembed_model: String,
     pub(super) history_window_size: u32,
     pub(super) nearest_neighbor_count: i32,
@@ -43,6 +44,7 @@ impl AdvancedSettings {
         let server = settings.server.as_ref();
         Self {
             port: settings.resolved_port(),
+            openai_url: server.and_then(|server| server.openai_url.clone()),
             fastembed_model: server
                 .and_then(|server| server.fastembed_model.clone())
                 .unwrap_or_else(|| DEFAULT_FASTEMBED_MODEL.to_string()),
@@ -60,6 +62,7 @@ impl AdvancedSettings {
 
     pub(super) fn has_overrides(&self) -> bool {
         self.port != DEFAULT_PORT
+            || self.openai_url.is_some()
             || self.fastembed_model != DEFAULT_FASTEMBED_MODEL
             || self.history_window_size != DEFAULT_HISTORY_WINDOW_SIZE
             || self.nearest_neighbor_count != DEFAULT_NEAREST_NEIGHBOR_COUNT
@@ -70,6 +73,9 @@ impl AdvancedSettings {
         let mut lines = Vec::new();
         if self.port != DEFAULT_PORT {
             lines.push(format!("Port: {}", self.port));
+        }
+        if self.openai_url.is_some() {
+            lines.push("OpenAI URL override configured".to_string());
         }
         if self.fastembed_model != DEFAULT_FASTEMBED_MODEL {
             lines.push(format!("FastEmbed model: {}", self.fastembed_model));
@@ -147,6 +153,18 @@ pub(super) fn build_settings_for_plan(
     } else {
         None
     };
+    server.openai_url = if plan.provider == ProviderId::OpenAi {
+        plan.advanced
+            .openai_url
+            .as_deref()
+            .map(|url| {
+                normalize_openai_url_override(url)
+                    .expect("OpenAI URL should be validated by the setup prompt")
+            })
+            .unwrap_or(None)
+    } else {
+        None
+    };
     server.fastembed_model = if plan.advanced.fastembed_model == DEFAULT_FASTEMBED_MODEL {
         None
     } else {
@@ -218,6 +236,7 @@ mod tests {
             secret_choice: SecretChoice::NotRequired,
             advanced: AdvancedSettings {
                 port: 4545,
+                openai_url: None,
                 fastembed_model: "custom/embed-model".to_string(),
                 history_window_size: 25,
                 nearest_neighbor_count: 15,
@@ -408,6 +427,7 @@ mod tests {
     fn advanced_override_lines_include_max_processing_attempts() {
         let advanced = AdvancedSettings {
             port: DEFAULT_PORT,
+            openai_url: Some("https://opencode.ai/zen/v1".to_string()),
             fastembed_model: DEFAULT_FASTEMBED_MODEL.to_string(),
             history_window_size: DEFAULT_HISTORY_WINDOW_SIZE,
             nearest_neighbor_count: DEFAULT_NEAREST_NEIGHBOR_COUNT,
@@ -416,7 +436,44 @@ mod tests {
 
         assert_eq!(
             advanced.override_lines(),
-            vec!["Max processing attempts: 14".to_string()]
+            vec![
+                "OpenAI URL override configured".to_string(),
+                "Max processing attempts: 14".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn build_settings_for_openai_plan_persists_non_default_url() {
+        let plan = SetupPlan {
+            namespace: Namespace::new("default"),
+            provider: ProviderId::OpenAi,
+            model: "qwen3.6-plus-free".to_string(),
+            ollama_url: None,
+            autostart: false,
+            selected_agents: Vec::new(),
+            secret_choice: SecretChoice::ManualEntry {
+                key: "OPENAI_API_KEY",
+                value: "secret".to_string(),
+            },
+            advanced: AdvancedSettings {
+                port: DEFAULT_PORT,
+                openai_url: Some("https://opencode.ai/zen/v1/".to_string()),
+                fastembed_model: DEFAULT_FASTEMBED_MODEL.to_string(),
+                history_window_size: DEFAULT_HISTORY_WINDOW_SIZE,
+                nearest_neighbor_count: DEFAULT_NEAREST_NEIGHBOR_COUNT,
+                max_processing_attempts: DEFAULT_MAX_PROCESSING_ATTEMPTS,
+            },
+        };
+
+        let settings = build_settings_for_plan(&AppSettings::default(), &plan, &[]);
+        let server = settings.server.expect("server settings");
+
+        assert_eq!(server.llm_provider.as_deref(), Some("open-ai"));
+        assert_eq!(server.llm_model.as_deref(), Some("qwen3.6-plus-free"));
+        assert_eq!(
+            server.openai_url.as_deref(),
+            Some("https://opencode.ai/zen/v1")
         );
     }
 }

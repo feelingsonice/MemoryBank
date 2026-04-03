@@ -9,6 +9,7 @@ use url::Url;
 
 use crate::config::LlmProviderConfig;
 use crate::error::{AppError, LlmError};
+use memory_bank_app::{DEFAULT_OPENAI_URL, format_openai_model_id};
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 pub struct ExtractedMemoryAnalysis {
@@ -299,7 +300,11 @@ fn llm_client_from_config(config: LlmProviderConfig) -> Result<LlmClient, AppErr
     match config {
         LlmProviderConfig::Gemini { api_key, model } => build_gemini_llm(&api_key, &model),
         LlmProviderConfig::Anthropic { api_key, model } => build_anthropic_llm(&api_key, &model),
-        LlmProviderConfig::OpenAi { api_key, model } => build_openai_llm(&api_key, &model),
+        LlmProviderConfig::OpenAi {
+            api_key,
+            model,
+            base_url,
+        } => build_openai_llm(&api_key, &model, &base_url),
         LlmProviderConfig::Ollama { url, model } => build_ollama_llm(&url, &model),
     }
 }
@@ -325,11 +330,23 @@ fn build_anthropic_llm(api_key: &str, model: &str) -> Result<LlmClient, AppError
     )))
 }
 
-fn build_openai_llm(api_key: &str, model: &str) -> Result<LlmClient, AppError> {
-    let client = rig::providers::openai::Client::new(api_key)
-        .map_err(|e| llm_initialization_error(e.to_string()))?;
+fn build_openai_llm(api_key: &str, model: &str, base_url: &str) -> Result<LlmClient, AppError> {
+    let client = if base_url == DEFAULT_OPENAI_URL {
+        rig::providers::openai::Client::new(api_key)
+            .map_err(|e| llm_initialization_error(e.to_string()))?
+    } else {
+        rig::providers::openai::Client::builder()
+            .api_key(api_key)
+            .base_url(base_url)
+            .build()
+            .map_err(|e| llm_initialization_error(e.to_string()))?
+    };
     // OpenAI prompt caching is automatic on supported models.
-    Ok(build_openai_responses_llm(&client, model))
+    Ok(build_openai_responses_llm(
+        &client,
+        model,
+        &format_openai_model_id(model, base_url),
+    ))
 }
 
 fn build_ollama_llm(url: &str, model: &str) -> Result<LlmClient, AppError> {
@@ -347,10 +364,14 @@ fn build_ollama_llm(url: &str, model: &str) -> Result<LlmClient, AppError> {
     )))
 }
 
-fn build_openai_responses_llm(client: &rig::providers::openai::Client, model: &str) -> LlmClient {
+fn build_openai_responses_llm(
+    client: &rig::providers::openai::Client,
+    model: &str,
+    model_label: &str,
+) -> LlmClient {
     LlmClient::OpenAi(build_rig_structured_llm(
         client.completion_model(model),
-        format!("OpenAi::{model}"),
+        model_label,
     ))
 }
 
@@ -467,6 +488,7 @@ mod tests {
     };
     use crate::config::LlmProviderConfig;
     use chrono::Utc;
+    use memory_bank_app::DEFAULT_OPENAI_URL;
     use rig::providers::anthropic::Client;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -596,6 +618,7 @@ mod tests {
             llm_client_from_config(LlmProviderConfig::OpenAi {
                 api_key: "test-key".to_string(),
                 model: "gpt-5-mini".to_string(),
+                base_url: DEFAULT_OPENAI_URL.to_string(),
             })
             .expect("openai client"),
             LlmClient::OpenAi(_)
@@ -607,11 +630,28 @@ mod tests {
         let InitializedLlm { client, model_id } = super::initialize(LlmProviderConfig::OpenAi {
             api_key: "test-key".to_string(),
             model: "gpt-5-mini".to_string(),
+            base_url: DEFAULT_OPENAI_URL.to_string(),
         })
         .expect("initialize openai");
 
         assert!(matches!(client, LlmClient::OpenAi(_)));
         assert_eq!(model_id, "OpenAi::gpt-5-mini");
+    }
+
+    #[tokio::test]
+    async fn initialize_includes_custom_openai_endpoint_in_model_id() {
+        let InitializedLlm { client, model_id } = super::initialize(LlmProviderConfig::OpenAi {
+            api_key: "test-key".to_string(),
+            model: "qwen3.6-plus-free".to_string(),
+            base_url: "https://opencode.ai/zen/v1".to_string(),
+        })
+        .expect("initialize custom openai");
+
+        assert!(matches!(client, LlmClient::OpenAi(_)));
+        assert_eq!(
+            model_id,
+            "OpenAi::qwen3.6-plus-free@https://opencode.ai/zen/v1"
+        );
     }
 
     #[test]

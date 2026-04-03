@@ -10,7 +10,10 @@ use crate::output::{no_color_requested, styled_subtle, styled_warning};
 use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet, Styled};
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, MultiSelect, Select, Text, set_global_render_config};
-use memory_bank_app::{AppSettings, DEFAULT_OLLAMA_URL, Namespace, SecretStore};
+use memory_bank_app::{
+    AppSettings, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_URL, Namespace, SecretStore,
+    normalize_openai_url,
+};
 use std::io::{self, IsTerminal};
 
 use super::plan::{AdvancedSettings, SecretChoice, SetupPlan};
@@ -160,7 +163,8 @@ pub(super) fn collect_setup_plan(
     .into_result()?;
 
     if configure_advanced {
-        advanced = prompt_advanced_settings(settings).and_then(WizardStep::into_result)?;
+        advanced =
+            prompt_advanced_settings(settings, provider).and_then(WizardStep::into_result)?;
     }
 
     Ok(SetupPlan {
@@ -240,6 +244,27 @@ fn prompt_ollama_url(current: Option<&str>) -> Result<WizardStep<String>, AppErr
             })
             .prompt_skippable()?
             .map(|value| normalize_ollama_url(&value)),
+    ))
+}
+
+fn prompt_openai_url(current: Option<&str>) -> Result<WizardStep<String>, AppError> {
+    Ok(WizardStep::from_option(
+        Text::new("OpenAI base URL override")
+            .with_default(current.unwrap_or(DEFAULT_OPENAI_URL))
+            .with_help_message(
+                "Leave this at the default unless you are routing Memory Bank through an OpenAI-compatible endpoint. Custom endpoints may also require a custom model string chosen earlier.",
+            )
+            .with_placeholder("https://api.openai.com/v1")
+            .with_validator(|value: &str| {
+                Ok(match normalize_openai_url(value) {
+                    Ok(_) => Validation::Valid,
+                    Err(error) => Validation::Invalid(error.to_string().into()),
+                })
+            })
+            .prompt_skippable()?
+            .map(|value| {
+                normalize_openai_url(&value).expect("validator should normalize OpenAI URL")
+            }),
     ))
 }
 
@@ -511,6 +536,7 @@ fn manual_secret_choice(secret_key: &'static str) -> Result<WizardStep<SecretCho
 
 fn prompt_advanced_settings(
     settings: &AppSettings,
+    provider: ProviderId,
 ) -> Result<WizardStep<AdvancedSettings>, AppError> {
     let current = AdvancedSettings::from_settings(settings);
 
@@ -528,6 +554,12 @@ fn prompt_advanced_settings(
             .prompt_skippable()?,
     )
     .into_result()?;
+
+    let openai_url = if provider == ProviderId::OpenAi {
+        Some(prompt_openai_url(current.openai_url.as_deref()).and_then(WizardStep::into_result)?)
+    } else {
+        None
+    };
 
     let fastembed_model = WizardStep::from_option(
         Text::new("FastEmbed model override")
@@ -592,6 +624,7 @@ fn prompt_advanced_settings(
 
     Ok(WizardStep::Continue(AdvancedSettings {
         port,
+        openai_url,
         fastembed_model,
         history_window_size,
         nearest_neighbor_count,

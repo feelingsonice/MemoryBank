@@ -8,7 +8,8 @@ use crate::retrieval_eval::real_eval_lock;
 use chrono::Utc;
 use memory_bank_app::{
     AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL, DEFAULT_GEMINI_MODEL,
-    DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL,
+    DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_URL,
+    normalize_openai_url,
 };
 use serde::Serialize;
 use sqlx::Row;
@@ -200,6 +201,12 @@ fn resolve_llm_provider_config(
                 settings.and_then(|value| value.llm_model.as_deref()),
                 DEFAULT_OPENAI_MODEL,
             ),
+            base_url: normalize_openai_url(&env_setting_or_default(
+                "OPENAI_BASE_URL",
+                settings.and_then(|value| value.openai_url.as_deref()),
+                DEFAULT_OPENAI_URL,
+            ))
+            .map_err(|error| crate::error::AppError::Config(error.to_string()))?,
         }),
         LlmProviderType::Ollama => Ok(LlmProviderConfig::Ollama {
             url: env_setting_or_default(
@@ -254,9 +261,13 @@ impl TestLlmConfigExt for LlmProviderConfig {
             LlmProviderConfig::Anthropic { api_key, .. } => {
                 LlmProviderConfig::Anthropic { api_key, model }
             }
-            LlmProviderConfig::OpenAi { api_key, .. } => {
-                LlmProviderConfig::OpenAi { api_key, model }
-            }
+            LlmProviderConfig::OpenAi {
+                api_key, base_url, ..
+            } => LlmProviderConfig::OpenAi {
+                api_key,
+                model,
+                base_url,
+            },
             LlmProviderConfig::Ollama { url, .. } => LlmProviderConfig::Ollama { url, model },
         }
     }

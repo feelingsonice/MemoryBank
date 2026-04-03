@@ -1,7 +1,8 @@
 use crate::AppError;
 use crate::assets::{ExposureCheck, inspect_cli_exposure};
 use crate::config::{
-    llm_provider_value, normalize_ollama_url, validate_encoder_provider, validate_llm_provider,
+    llm_provider_value, normalize_ollama_url, resolved_openai_url, validate_encoder_provider,
+    validate_llm_provider,
 };
 use crate::constants::{
     DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_MAX_PROCESSING_ATTEMPTS, HOOK_BINARY_NAME, MB_BINARY_NAME,
@@ -118,6 +119,17 @@ pub(crate) fn build_server_launch_spec(
                 );
             }
         }
+        ProviderId::OpenAi => {
+            if let Some(model) = server_settings.llm_model.clone() {
+                env.insert("MEMORY_BANK_LLM_MODEL".to_string(), model);
+            }
+            if let Some(url) = server_settings.openai_url.as_deref() {
+                let normalized = resolved_openai_url(Some(url))?;
+                if normalized != memory_bank_app::DEFAULT_OPENAI_URL {
+                    env.insert("OPENAI_BASE_URL".to_string(), normalized);
+                }
+            }
+        }
         _ => {
             if let Some(model) = server_settings.llm_model.clone() {
                 env.insert("MEMORY_BANK_LLM_MODEL".to_string(), model);
@@ -164,6 +176,7 @@ pub(crate) fn build_server_launch_spec(
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
             "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
             "MEMORY_BANK_LLM_MODEL",
             "MEMORY_BANK_FASTEMBED_MODEL",
             "MEMORY_BANK_LOCAL_ENCODER_URL",
@@ -214,6 +227,18 @@ pub(crate) fn collect_doctor_issues(
         && require_non_empty_secret(&secrets, env_key).is_none()
     {
         issues.push(format!("missing {env_key} in ~/.memory_bank/secrets.env"));
+    }
+
+    if matches!(
+        ProviderId::from_config_value(Some(llm_provider_value(settings))),
+        ProviderId::OpenAi
+    ) && let Some(url) = settings
+        .server
+        .as_ref()
+        .and_then(|server| server.openai_url.as_deref())
+        && let Err(error) = resolved_openai_url(Some(url))
+    {
+        issues.push(error.to_string());
     }
 
     match settings

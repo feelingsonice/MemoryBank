@@ -111,6 +111,8 @@ pub async fn run(config: ServeConfig) -> Result<(), error::AppError> {
         port,
         llm_provider: llm_provider_name,
         encoder_provider: encoder_provider_name,
+        llm_model_id: Some(llm.model_id.clone()),
+        encoder_model_id: Some(encoder.model_id.clone()),
         version: env!("CARGO_PKG_VERSION"),
     };
 

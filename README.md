@@ -105,6 +105,45 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 
 Important: the agent you use directly is separate from the internal provider Memory Bank uses for memory analysis. For example, you can use Claude Code or OpenClaw while Memory Bank runs on Gemini, OpenAI, Anthropic, or Ollama.
 
+### Custom OpenAI Endpoints
+
+Memory Bank supports custom OpenAI-compatible endpoints (such as OpenCode Zen, Azure OpenAI, or self-hosted models):
+
+**Supported managed-service path:**
+```bash
+mb setup
+```
+
+Choose `open-ai` as the provider, then open `Advanced settings` and set the `OpenAI base URL override`.
+
+**Or set it directly in managed config:**
+```bash
+mb config set server.llm_provider open-ai
+mb config set server.openai_url https://opencode.ai/zen/v1
+mb service restart
+```
+
+That writes the same saved setting shown below:
+```toml
+[server]
+llm_provider = "open-ai"
+llm_model = "qwen3.6-plus-free"
+openai_url = "https://opencode.ai/zen/v1"
+```
+
+When a custom `openai_url` is configured, Memory Bank will route all OpenAI API requests to that endpoint instead of the default `https://api.openai.com/v1`.
+
+Important: custom OpenAI-compatible endpoints often require a provider-specific model ID as well. If the default OpenAI model does not exist on your endpoint, set `server.llm_model` to the exact model string your endpoint expects.
+
+**Lower-level direct server path:**
+```bash
+OPENAI_API_KEY=your-api-key \
+OPENAI_BASE_URL=https://opencode.ai/zen/v1 \
+cargo run -p memory-bank-server -- --llm-provider open-ai
+```
+
+Use the direct env-var path only when you are running `memory-bank-server` yourself instead of the managed `mb` service.
+
 ## Advanced
 
 If you want to build from source instead of downloading a release, use:

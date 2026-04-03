@@ -7,7 +7,8 @@ use crate::cli::{ConfigCommand, NamespaceCommand, ServiceCommand};
 use crate::command_utils::yes_no;
 use crate::config::{
     FastEmbedReindexChange, fastembed_reindex_change, get_config_value, llm_provider_value,
-    resolved_encoder_provider, resolved_llm_model, resolved_ollama_url, set_config_value,
+    resolved_encoder_provider, resolved_llm_model, resolved_llm_model_id, resolved_ollama_url,
+    resolved_openai_url, set_config_value,
 };
 use crate::output::{
     print_action_start, print_key_value, styled_command, styled_failure, styled_section,
@@ -37,6 +38,7 @@ pub(crate) fn run_status() -> Result<(), AppError> {
     let runtime = service_runtime_summary(&paths, &settings)?;
     let provider = llm_provider_value(&settings);
     let model = resolved_llm_model(&settings);
+    let llm_model_id = resolved_llm_model_id(&settings)?;
     let encoder = resolved_encoder_provider(&settings);
 
     println!("{}", styled_title("Memory Bank"));
@@ -58,6 +60,16 @@ pub(crate) fn run_status() -> Result<(), AppError> {
                     .and_then(|server| server.ollama_url.as_deref()),
             ),
         );
+    } else if provider == "open-ai" {
+        print_key_value(
+            "OpenAI URL",
+            resolved_openai_url(
+                settings
+                    .server
+                    .as_ref()
+                    .and_then(|server| server.openai_url.as_deref()),
+            )?,
+        );
     }
     print_key_value("Log file", paths.log_file.display());
 
@@ -73,7 +85,8 @@ pub(crate) fn run_status() -> Result<(), AppError> {
     }
 
     if let Some(health) = runtime.health.as_ref() {
-        let mismatch_fields = runtime_mismatch_fields(&settings, provider, encoder, health);
+        let mismatch_fields =
+            runtime_mismatch_fields(&settings, provider, encoder, &llm_model_id, health);
         if !mismatch_fields.is_empty() {
             println!();
             println!(
@@ -706,12 +719,55 @@ mod tests {
             port: 3737,
             llm_provider: "gemini".to_string(),
             encoder_provider: "remote-api".to_string(),
+            llm_model_id: None,
+            encoder_model_id: None,
             version: "test".to_string(),
         };
 
-        let fields = runtime_mismatch_fields(&settings, "anthropic", "fast-embed", &health);
+        let fields = runtime_mismatch_fields(
+            &settings,
+            "anthropic",
+            "fast-embed",
+            "Anthropic::claude-sonnet-4-6",
+            &health,
+        );
 
         assert_eq!(fields, vec!["namespace", "port", "provider", "encoder"]);
+    }
+
+    #[test]
+    fn runtime_mismatch_fields_prefers_llm_model_id_when_available() {
+        let settings = AppSettings {
+            server: Some(memory_bank_app::ServerSettings {
+                llm_provider: Some("open-ai".to_string()),
+                llm_model: Some("qwen3.6-plus-free".to_string()),
+                openai_url: Some("https://opencode.ai/zen/v1".to_string()),
+                ..memory_bank_app::ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let health = HealthCheck {
+            ok: true,
+            namespace: "default".to_string(),
+            port: memory_bank_app::DEFAULT_PORT,
+            llm_provider: "open-ai".to_string(),
+            encoder_provider: "fast-embed".to_string(),
+            llm_model_id: Some(
+                "OpenAi::qwen3.6-plus-free@https://other.example.com/v1".to_string(),
+            ),
+            encoder_model_id: None,
+            version: "test".to_string(),
+        };
+
+        let fields = runtime_mismatch_fields(
+            &settings,
+            "open-ai",
+            "fast-embed",
+            "OpenAi::qwen3.6-plus-free@https://opencode.ai/zen/v1",
+            &health,
+        );
+
+        assert_eq!(fields, vec!["llm model"]);
     }
 
     #[test]
