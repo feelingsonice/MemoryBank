@@ -127,7 +127,7 @@ impl fmt::Display for LlmProviderConfig {
         match self {
             Self::Gemini { model, .. } => write!(f, "Gemini::{model}"),
             Self::Anthropic { model, .. } => write!(f, "Anthropic::{model}"),
-            Self::OpenAi { model, base_url } => {
+            Self::OpenAi { model, base_url, .. } => {
                 if base_url == DEFAULT_OPENAI_URL {
                     write!(f, "OpenAi::{model}")
                 } else {
