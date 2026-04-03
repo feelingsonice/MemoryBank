@@ -139,7 +139,9 @@ mod tests {
             ollama_url: None,
             autostart: true,
             selected_agents: vec![AgentKind::Codex],
-            secret_choice: SecretChoice::KeepStored { key: "OPENAI_API_KEY" },
+            secret_choice: SecretChoice::KeepStored {
+                key: "OPENAI_API_KEY",
+            },
             advanced: AdvancedSettings {
                 port: memory_bank_app::DEFAULT_PORT,
                 openai_url: Some("https://opencode.ai/zen/v1".to_string()),
