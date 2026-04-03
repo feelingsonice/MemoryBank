@@ -42,6 +42,10 @@ pub(crate) struct HealthCheck {
     pub(crate) port: u16,
     pub(crate) llm_provider: String,
     pub(crate) encoder_provider: String,
+    #[serde(default)]
+    pub(crate) llm_model_id: Option<String>,
+    #[serde(default)]
+    pub(crate) encoder_model_id: Option<String>,
     pub(crate) version: String,
 }
 
@@ -941,6 +945,92 @@ mod tests {
         assert!(spec.args.contains(&"11".to_string()));
         assert!(spec.args.contains(&OLLAMA_HISTORY_WINDOW_SIZE.to_string()));
         assert!(!spec.args.contains(&"99".to_string()));
+    }
+
+    #[test]
+    fn launch_spec_includes_custom_openai_endpoint_environment() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("open-ai".to_string()),
+                llm_model: Some("qwen3.6-plus-free".to_string()),
+                openai_url: Some("https://opencode.ai/zen/v1/".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let mut secrets = SecretStore::default();
+        secrets.set("OPENAI_API_KEY", "openai-secret");
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let spec = build_server_launch_spec(&paths, &settings, &secrets).expect("spec");
+
+        assert_eq!(
+            spec.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("openai-secret")
+        );
+        assert_eq!(
+            spec.env.get("OPENAI_BASE_URL").map(String::as_str),
+            Some("https://opencode.ai/zen/v1")
+        );
+        assert!(spec.remove_env.contains(&"OPENAI_BASE_URL"));
+    }
+
+    #[test]
+    fn launch_spec_omits_default_openai_endpoint_environment() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("open-ai".to_string()),
+                openai_url: Some(memory_bank_app::DEFAULT_OPENAI_URL.to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let mut secrets = SecretStore::default();
+        secrets.set("OPENAI_API_KEY", "openai-secret");
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let spec = build_server_launch_spec(&paths, &settings, &secrets).expect("spec");
+
+        assert!(!spec.env.contains_key("OPENAI_BASE_URL"));
+        assert!(spec.remove_env.contains(&"OPENAI_BASE_URL"));
+    }
+
+    #[test]
+    fn launch_spec_rejects_invalid_openai_url() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = AppPaths::from_home_dir(temp.path().to_path_buf());
+        let settings = AppSettings {
+            server: Some(ServerSettings {
+                llm_provider: Some("open-ai".to_string()),
+                openai_url: Some("https://opencode.ai/zen/v1?foo=bar".to_string()),
+                ..ServerSettings::default()
+            }),
+            ..AppSettings::default()
+        };
+        let mut secrets = SecretStore::default();
+        secrets.set("OPENAI_API_KEY", "openai-secret");
+
+        fs::create_dir_all(&paths.bin_dir).expect("bin dir");
+        fs::write(paths.binary_path(SERVER_BINARY_NAME), "").expect("server placeholder");
+        #[cfg(unix)]
+        make_runnable(&paths.binary_path(SERVER_BINARY_NAME));
+
+        let error = build_server_launch_spec(&paths, &settings, &secrets)
+            .expect_err("invalid openai url should fail");
+
+        assert!(error.to_string().contains("server.openai_url"));
     }
 
     #[test]

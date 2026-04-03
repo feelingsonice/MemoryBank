@@ -11,6 +11,7 @@ pub(super) fn runtime_mismatch_fields<'a>(
     settings: &'a AppSettings,
     provider: &'a str,
     encoder: &'a str,
+    llm_model_id: &'a str,
     health: &'a HealthCheck,
 ) -> Vec<&'static str> {
     let mut fields = Vec::new();
@@ -20,8 +21,16 @@ pub(super) fn runtime_mismatch_fields<'a>(
     if health.port != settings.resolved_port() {
         fields.push("port");
     }
-    if health.llm_provider != provider {
-        fields.push("provider");
+    match health.llm_model_id.as_deref() {
+        Some(runtime_model_id) => {
+            if runtime_model_id != llm_model_id {
+                fields.push("llm model");
+            }
+        }
+        None if health.llm_provider != provider => {
+            fields.push("provider");
+        }
+        None => {}
     }
     if health.encoder_provider != encoder {
         fields.push("encoder");
@@ -79,6 +88,12 @@ pub(super) fn print_live_runtime_section(runtime: &ServiceRuntimeSummary) {
             print_key_value("Port", health.port);
             print_key_value("Provider", &health.llm_provider);
             print_key_value("Encoder", &health.encoder_provider);
+            if let Some(model_id) = health.llm_model_id.as_deref() {
+                print_key_value("LLM model ID", model_id);
+            }
+            if let Some(model_id) = health.encoder_model_id.as_deref() {
+                print_key_value("Encoder model ID", model_id);
+            }
             print_key_value("Version", &health.version);
         }
         None => {
@@ -162,6 +177,12 @@ pub(super) fn print_start_or_restart_result(report: &ServiceActionReport) {
             print_key_value("Port", health.port);
             print_key_value("Provider", &health.llm_provider);
             print_key_value("Encoder", &health.encoder_provider);
+            if let Some(model_id) = health.llm_model_id.as_deref() {
+                print_key_value("LLM model ID", model_id);
+            }
+            if let Some(model_id) = health.encoder_model_id.as_deref() {
+                print_key_value("Encoder model ID", model_id);
+            }
             print_key_value("Version", &health.version);
         }
         None if report.active_after => {

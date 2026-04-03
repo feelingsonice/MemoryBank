@@ -140,6 +140,21 @@ When a turn reaches that cap, Memory Bank marks it `exhausted`. That turn will n
 
 If you are using a slow local provider such as Ollama, lowering prompt size or increasing model throughput is still the best fix. The retry cap is a guardrail, not a substitute for a healthy provider setup.
 
+## Custom OpenAI Endpoint Is Not Being Used
+
+For managed installs, configure custom OpenAI-compatible endpoints through:
+
+- `mb setup` -> Advanced settings -> `OpenAI base URL override`
+- or `mb config set server.openai_url <URL>`
+
+Then restart the service:
+
+- `mb service restart`
+
+If your endpoint is OpenAI-compatible but does not expose OpenAI's default model IDs, also set the exact model string your endpoint expects:
+
+- `mb config set server.llm_model <MODEL_ID>`
+
 ## Server Fails To Open After Upgrading With An Ingest Schema Error
 
 The ingest retry-cap change adds a new `exhausted` turn status to the SQLite schema.

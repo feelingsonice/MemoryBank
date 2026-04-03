@@ -176,6 +176,10 @@ pub struct HealthResponse {
     pub port: u16,
     pub llm_provider: String,
     pub encoder_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_model_id: Option<String>,
     pub version: &'static str,
 }
 
@@ -197,7 +201,7 @@ mod tests {
     use crate::actor::{MemoryHandle, TestStoreTurnRequest};
     use crate::db::SqliteRuntime;
     use crate::ingest::IngestService;
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use memory_bank_protocol::{
         ConversationFragment, ConversationScope, FragmentBody, INGEST_PROTOCOL_VERSION,
@@ -620,6 +624,12 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("health body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("health json");
+        assert_eq!(json["llm_model_id"], "Anthropic::claude-sonnet-4-6");
+        assert_eq!(json["encoder_model_id"], "FastEmbed::default");
     }
 
     async fn app() -> axum::Router {
@@ -635,6 +645,8 @@ mod tests {
             port: 3737,
             llm_provider: "anthropic".to_string(),
             encoder_provider: "fast-embed".to_string(),
+            llm_model_id: Some("Anthropic::claude-sonnet-4-6".to_string()),
+            encoder_model_id: Some("FastEmbed::default".to_string()),
             version: "test",
         };
         build_app(health, memory, ingest, log_tx, &shutdown)
@@ -859,6 +871,8 @@ mod tests {
             port: 3737,
             llm_provider: "anthropic".to_string(),
             encoder_provider: "fast-embed".to_string(),
+            llm_model_id: Some("Anthropic::claude-sonnet-4-6".to_string()),
+            encoder_model_id: Some("FastEmbed::default".to_string()),
             version: "test",
         }
     }

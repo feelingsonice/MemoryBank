@@ -48,6 +48,11 @@ pub(super) fn render_review_summary(plan: &SetupPlan) -> String {
     if let Some(url) = plan.ollama_url.as_deref() {
         lines.insert(6, format!("    Ollama URL: {url}"));
     }
+    if plan.provider == crate::domain::ProviderId::OpenAi
+        && let Some(url) = plan.advanced.openai_url.as_deref()
+    {
+        lines.insert(6, format!("    OpenAI URL: {url}"));
+    }
 
     let overrides = plan.advanced.override_lines();
     lines.push(String::new());
@@ -129,16 +134,15 @@ mod tests {
     fn render_review_summary_includes_max_processing_attempts_override() {
         let plan = SetupPlan {
             namespace: Namespace::new("default"),
-            provider: ProviderId::Anthropic,
-            model: memory_bank_app::DEFAULT_ANTHROPIC_MODEL.to_string(),
+            provider: ProviderId::OpenAi,
+            model: "qwen3.6-plus-free".to_string(),
             ollama_url: None,
             autostart: true,
             selected_agents: vec![AgentKind::Codex],
-            secret_choice: SecretChoice::KeepStored {
-                key: "ANTHROPIC_API_KEY",
-            },
+            secret_choice: SecretChoice::KeepStored { key: "OPENAI_API_KEY" },
             advanced: AdvancedSettings {
                 port: memory_bank_app::DEFAULT_PORT,
+                openai_url: Some("https://opencode.ai/zen/v1".to_string()),
                 fastembed_model: memory_bank_app::DEFAULT_FASTEMBED_MODEL.to_string(),
                 history_window_size: memory_bank_app::DEFAULT_HISTORY_WINDOW_SIZE,
                 nearest_neighbor_count: crate::constants::DEFAULT_NEAREST_NEIGHBOR_COUNT,
@@ -147,6 +151,8 @@ mod tests {
         };
 
         let summary = render_review_summary(&plan);
+        assert!(summary.contains("OpenAI URL: https://opencode.ai/zen/v1"));
+        assert!(summary.contains("OpenAI URL override configured"));
         assert!(summary.contains("Max processing attempts: 12"));
     }
 

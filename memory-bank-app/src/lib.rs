@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use url::Url;
 
 pub const APP_DIR_NAME: &str = ".memory_bank";
 pub const DEFAULT_NAMESPACE_NAME: &str = "default";
@@ -53,6 +54,62 @@ pub enum AppConfigError {
     TomlEncode(#[from] toml::ser::Error),
     #[error("unsupported settings schema version {0}")]
     UnsupportedSchemaVersion(u32),
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum OpenAiUrlError {
+    #[error("OpenAI URL cannot be empty")]
+    Empty,
+    #[error("OpenAI URL must be a valid absolute URL: {0}")]
+    InvalidUrl(String),
+    #[error("OpenAI URL must use http or https: {0}")]
+    InvalidScheme(String),
+    #[error("OpenAI URL must include a host: {0}")]
+    MissingHost(String),
+    #[error("OpenAI URL must not include query parameters or fragments: {0}")]
+    QueryOrFragment(String),
+}
+
+pub fn normalize_openai_url(value: &str) -> Result<String, OpenAiUrlError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(OpenAiUrlError::Empty);
+    }
+
+    let normalized = trimmed.trim_end_matches('/');
+    let parsed =
+        Url::parse(normalized).map_err(|_| OpenAiUrlError::InvalidUrl(trimmed.to_string()))?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(OpenAiUrlError::InvalidScheme(trimmed.to_string()));
+    }
+
+    if parsed.host_str().is_none() {
+        return Err(OpenAiUrlError::MissingHost(trimmed.to_string()));
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(OpenAiUrlError::QueryOrFragment(trimmed.to_string()));
+    }
+
+    Ok(normalized.to_string())
+}
+
+pub fn normalize_openai_url_override(value: &str) -> Result<Option<String>, OpenAiUrlError> {
+    let normalized = normalize_openai_url(value)?;
+    if normalized == DEFAULT_OPENAI_URL {
+        Ok(None)
+    } else {
+        Ok(Some(normalized))
+    }
+}
+
+pub fn format_openai_model_id(model: &str, base_url: &str) -> String {
+    if base_url == DEFAULT_OPENAI_URL {
+        format!("OpenAi::{model}")
+    } else {
+        format!("OpenAi::{model}@{base_url}")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -598,6 +655,64 @@ mod tests {
         assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(settings.active_namespace(), Namespace::default());
         assert_eq!(settings.resolved_port(), DEFAULT_PORT);
+    }
+
+    #[test]
+    fn openai_url_normalization_trims_and_strips_trailing_slash() {
+        let normalized =
+            normalize_openai_url("  https://api.openai.com/v1/  ").expect("normalize url");
+
+        assert_eq!(normalized, DEFAULT_OPENAI_URL);
+        assert_eq!(
+            normalize_openai_url_override("https://api.openai.com/v1/")
+                .expect("normalize override"),
+            None
+        );
+    }
+
+    #[test]
+    fn openai_url_normalization_allows_custom_paths() {
+        let normalized =
+            normalize_openai_url("https://opencode.ai/zen/v1/").expect("normalize custom path");
+
+        assert_eq!(normalized, "https://opencode.ai/zen/v1");
+        assert_eq!(
+            normalize_openai_url_override("https://opencode.ai/zen/v1")
+                .expect("normalize override"),
+            Some("https://opencode.ai/zen/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn openai_url_normalization_rejects_invalid_shapes() {
+        assert!(matches!(
+            normalize_openai_url(" "),
+            Err(OpenAiUrlError::Empty)
+        ));
+        assert!(matches!(
+            normalize_openai_url("ftp://example.com/v1"),
+            Err(OpenAiUrlError::InvalidScheme(_))
+        ));
+        assert!(matches!(
+            normalize_openai_url("https://example.com/v1?foo=bar"),
+            Err(OpenAiUrlError::QueryOrFragment(_))
+        ));
+        assert!(matches!(
+            normalize_openai_url("https://example.com/v1#frag"),
+            Err(OpenAiUrlError::QueryOrFragment(_))
+        ));
+    }
+
+    #[test]
+    fn openai_model_id_format_hides_default_endpoint() {
+        assert_eq!(
+            format_openai_model_id("gpt-5-mini", DEFAULT_OPENAI_URL),
+            "OpenAi::gpt-5-mini"
+        );
+        assert_eq!(
+            format_openai_model_id("qwen3.6-plus-free", "https://opencode.ai/zen/v1"),
+            "OpenAi::qwen3.6-plus-free@https://opencode.ai/zen/v1"
+        );
     }
 
     #[test]

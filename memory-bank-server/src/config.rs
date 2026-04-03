@@ -3,8 +3,8 @@ use clap::ValueEnum;
 use memory_bank_app::{
     AppPaths, AppSettings, DEFAULT_ANTHROPIC_MODEL, DEFAULT_FASTEMBED_MODEL, DEFAULT_GEMINI_MODEL,
     DEFAULT_HISTORY_WINDOW_SIZE, DEFAULT_MAX_PROCESSING_ATTEMPTS, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_URL, Namespace, OLLAMA_HISTORY_WINDOW_SIZE,
-    ServerSettings,
+    DEFAULT_OLLAMA_URL, DEFAULT_OPENAI_MODEL, Namespace, OLLAMA_HISTORY_WINDOW_SIZE,
+    ServerSettings, format_openai_model_id, normalize_openai_url,
 };
 use std::env;
 use std::fmt;
@@ -56,10 +56,23 @@ impl std::str::FromStr for LlmProviderType {
 
 #[derive(Debug, Clone)]
 pub enum LlmProviderConfig {
-    Gemini { api_key: String, model: String },
-    Anthropic { api_key: String, model: String },
-    OpenAi { api_key: String, model: String, base_url: String },
-    Ollama { url: String, model: String },
+    Gemini {
+        api_key: String,
+        model: String,
+    },
+    Anthropic {
+        api_key: String,
+        model: String,
+    },
+    OpenAi {
+        api_key: String,
+        model: String,
+        base_url: String,
+    },
+    Ollama {
+        url: String,
+        model: String,
+    },
 }
 
 impl LlmProviderConfig {
@@ -91,11 +104,12 @@ impl LlmProviderConfig {
                     settings.and_then(|s| s.llm_model.as_deref()),
                     DEFAULT_OPENAI_MODEL,
                 ),
-                base_url: env_setting_or_default(
+                base_url: normalize_openai_url(&env_setting_or_default(
                     "OPENAI_BASE_URL",
                     settings.and_then(|s| s.openai_url.as_deref()),
-                    DEFAULT_OPENAI_URL,
-                ),
+                    memory_bank_app::DEFAULT_OPENAI_URL,
+                ))
+                .map_err(|error| crate::error::AppError::Config(error.to_string()))?,
             }),
             LlmProviderType::Ollama => Ok(Self::Ollama {
                 url: env_setting_or_default(
@@ -127,12 +141,10 @@ impl fmt::Display for LlmProviderConfig {
         match self {
             Self::Gemini { model, .. } => write!(f, "Gemini::{model}"),
             Self::Anthropic { model, .. } => write!(f, "Anthropic::{model}"),
-            Self::OpenAi { model, base_url, .. } => {
-                if base_url == DEFAULT_OPENAI_URL {
-                    write!(f, "OpenAi::{model}")
-                } else {
-                    write!(f, "OpenAi::{model}@{base_url}")
-                }
+            Self::OpenAi {
+                model, base_url, ..
+            } => {
+                write!(f, "{}", format_openai_model_id(model, base_url))
             }
             Self::Ollama { model, url } => write!(f, "Ollama::{model}@{url}"),
         }
@@ -458,6 +470,90 @@ mod tests {
             LlmProviderConfig::Ollama { url, model }
             if url == "http://127.0.0.1:11434" && model == "qwen3"
         ));
+    }
+
+    #[test]
+    fn openai_provider_uses_default_url() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvVarGuard::new(&["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "secret");
+        }
+
+        let config =
+            LlmProviderConfig::from_resolved(LlmProviderType::OpenAi, None).expect("openai");
+
+        assert!(matches!(
+            config,
+            LlmProviderConfig::OpenAi { ref base_url, .. } if base_url == memory_bank_app::DEFAULT_OPENAI_URL
+        ));
+        assert_eq!(config.to_string(), "OpenAi::gpt-5-mini");
+    }
+
+    #[test]
+    fn openai_provider_normalizes_settings_override() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvVarGuard::new(&["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "secret");
+        }
+
+        let config = LlmProviderConfig::from_resolved(
+            LlmProviderType::OpenAi,
+            Some(&ServerSettings {
+                openai_url: Some(" https://opencode.ai/zen/v1/ ".to_string()),
+                ..ServerSettings::default()
+            }),
+        )
+        .expect("openai");
+
+        assert!(matches!(
+            config,
+            LlmProviderConfig::OpenAi { ref base_url, .. } if base_url == "https://opencode.ai/zen/v1"
+        ));
+        assert_eq!(
+            config.to_string(),
+            "OpenAi::gpt-5-mini@https://opencode.ai/zen/v1"
+        );
+    }
+
+    #[test]
+    fn openai_provider_env_override_takes_precedence() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvVarGuard::new(&["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "secret");
+            env::set_var("OPENAI_BASE_URL", "https://env.example.com/v1/");
+        }
+
+        let config = LlmProviderConfig::from_resolved(
+            LlmProviderType::OpenAi,
+            Some(&ServerSettings {
+                openai_url: Some("https://settings.example.com/v1".to_string()),
+                ..ServerSettings::default()
+            }),
+        )
+        .expect("openai");
+
+        assert!(matches!(
+            config,
+            LlmProviderConfig::OpenAi { ref base_url, .. } if base_url == "https://env.example.com/v1"
+        ));
+    }
+
+    #[test]
+    fn openai_provider_rejects_invalid_base_url() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvVarGuard::new(&["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+        unsafe {
+            env::set_var("OPENAI_API_KEY", "secret");
+            env::set_var("OPENAI_BASE_URL", "https://example.com/v1?foo=bar");
+        }
+
+        let error = LlmProviderConfig::from_resolved(LlmProviderType::OpenAi, None)
+            .expect_err("invalid openai url should fail");
+
+        assert!(error.to_string().contains("query parameters or fragments"));
     }
 
     #[test]
