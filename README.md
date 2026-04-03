@@ -105,6 +105,27 @@ If the setup is working, the agent should call `retrieve_memory` and answer usin
 
 Important: the agent you use directly is separate from the internal provider Memory Bank uses for memory analysis. For example, you can use Claude Code or OpenClaw while Memory Bank runs on Gemini, OpenAI, Anthropic, or Ollama.
 
+### Custom OpenAI Endpoints
+
+Memory Bank supports custom OpenAI-compatible endpoints (such as OpenCode Zen, Azure OpenAI, or self-hosted models):
+
+**Using environment variables:**
+```bash
+export OPENAI_BASE_URL=https://opencode.ai/zen/v1
+export OPENAI_API_KEY=your-api-key
+mb service restart
+```
+
+**Using settings.toml:**
+```toml
+[server]
+llm_provider = "open-ai"
+llm_model = "qwen3.6-plus-free"
+openai_url = "https://opencode.ai/zen/v1"
+```
+
+When a custom `openai_url` is configured, Memory Bank will route all OpenAI API requests to that endpoint instead of the default `https://api.openai.com/v1`.
+
 ## Advanced
 
 If you want to build from source instead of downloading a release, use:

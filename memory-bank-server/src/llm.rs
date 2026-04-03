@@ -299,7 +299,7 @@ fn llm_client_from_config(config: LlmProviderConfig) -> Result<LlmClient, AppErr
     match config {
         LlmProviderConfig::Gemini { api_key, model } => build_gemini_llm(&api_key, &model),
         LlmProviderConfig::Anthropic { api_key, model } => build_anthropic_llm(&api_key, &model),
-        LlmProviderConfig::OpenAi { api_key, model } => build_openai_llm(&api_key, &model),
+        LlmProviderConfig::OpenAi { api_key, model, base_url } => build_openai_llm(&api_key, &model, &base_url),
         LlmProviderConfig::Ollama { url, model } => build_ollama_llm(&url, &model),
     }
 }
@@ -325,9 +325,19 @@ fn build_anthropic_llm(api_key: &str, model: &str) -> Result<LlmClient, AppError
     )))
 }
 
-fn build_openai_llm(api_key: &str, model: &str) -> Result<LlmClient, AppError> {
-    let client = rig::providers::openai::Client::new(api_key)
-        .map_err(|e| llm_initialization_error(e.to_string()))?;
+fn build_openai_llm(api_key: &str, model: &str, base_url: &str) -> Result<LlmClient, AppError> {
+    use memory_bank_app::DEFAULT_OPENAI_URL;
+    
+    let client = if base_url == DEFAULT_OPENAI_URL {
+        rig::providers::openai::Client::new(api_key)
+            .map_err(|e| llm_initialization_error(e.to_string()))?
+    } else {
+        rig::providers::openai::Client::builder()
+            .api_key(api_key)
+            .base_url(base_url)
+            .build()
+            .map_err(|e| llm_initialization_error(e.to_string()))?
+    };
     // OpenAI prompt caching is automatic on supported models.
     Ok(build_openai_responses_llm(&client, model))
 }
@@ -467,6 +477,7 @@ mod tests {
     };
     use crate::config::LlmProviderConfig;
     use chrono::Utc;
+    use memory_bank_app::DEFAULT_OPENAI_URL;
     use rig::providers::anthropic::Client;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -596,6 +607,7 @@ mod tests {
             llm_client_from_config(LlmProviderConfig::OpenAi {
                 api_key: "test-key".to_string(),
                 model: "gpt-5-mini".to_string(),
+                base_url: DEFAULT_OPENAI_URL.to_string(),
             })
             .expect("openai client"),
             LlmClient::OpenAi(_)
@@ -607,6 +619,7 @@ mod tests {
         let InitializedLlm { client, model_id } = super::initialize(LlmProviderConfig::OpenAi {
             api_key: "test-key".to_string(),
             model: "gpt-5-mini".to_string(),
+            base_url: DEFAULT_OPENAI_URL.to_string(),
         })
         .expect("initialize openai");
 
