@@ -116,12 +116,12 @@ describe("Memory Bank OpenCode plugin", () => {
     const harness = await createHarness();
 
     await harness.hooks["tool.execute.before"](
-      { partID: "part_tool", sessionID: "ses_demo", tool: "read" },
+      { callID: "call_tool", sessionID: "ses_demo", tool: "read" },
       { args: { file: "README.md" } },
     );
     await harness.hooks["tool.execute.after"](
-      { partID: "part_tool", sessionID: "ses_demo", tool: "read" },
-      { output: "contents" },
+      { callID: "call_tool", sessionID: "ses_demo", tool: "read" },
+      { metadata: { bytes: 8 }, output: "contents", title: "Read result" },
     );
 
     expect(harness.emitted).toEqual([
@@ -129,7 +129,7 @@ describe("Memory Bank OpenCode plugin", () => {
         event: "tool.execute.before",
         payload: {
           hook_event_name: "tool.execute.before",
-          part_id: "part_tool",
+          part_id: "call_tool",
           session_id: "ses_demo",
           timestamp: harness.emitted[0].payload.timestamp,
           tool_arguments: { file: "README.md" },
@@ -140,14 +140,30 @@ describe("Memory Bank OpenCode plugin", () => {
         event: "tool.execute.after",
         payload: {
           hook_event_name: "tool.execute.after",
-          part_id: "part_tool",
+          part_id: "call_tool",
           session_id: "ses_demo",
           timestamp: harness.emitted[1].payload.timestamp,
           tool_name: "read",
-          tool_output: "contents",
+          tool_output: {
+            metadata: { bytes: 8 },
+            output: "contents",
+            title: "Read result",
+          },
         },
       },
     ]);
+  });
+
+  it("falls back to legacy partID fields for tool payload correlation", async () => {
+    const harness = await createHarness();
+
+    await harness.hooks["tool.execute.before"](
+      { partID: "legacy_part", sessionID: "ses_demo", tool: "read" },
+      { args: { file: "README.md" } },
+    );
+
+    expect(harness.emitted).toHaveLength(1);
+    expect(harness.emitted[0].payload.part_id).toBe("legacy_part");
   });
 
   it("does not create a debug log file by default", async () => {
@@ -183,6 +199,28 @@ describe("Memory Bank OpenCode plugin", () => {
     expect(harness.files.get("/tmp/memory-bank-plugin-debug.log")).toContain(
       "memory-bank-hook binary not found",
     );
+  });
+
+  it("skips summary user messages exposed as summary objects by the SDK", async () => {
+    const harness = await createHarness();
+
+    await harness.hooks["chat.message"](
+      { messageID: "msg_summary", sessionID: "ses_demo" },
+      {
+        message: {
+          id: "msg_summary",
+          role: "user",
+          summary: {
+            body: "summarized user text",
+            diffs: [],
+            title: "Compaction",
+          },
+        },
+        parts: [{ text: "summarized user text", type: "text" }],
+      },
+    );
+
+    expect(harness.emitted).toHaveLength(0);
   });
 
   it("cleans up per-session state after polling times out", async () => {

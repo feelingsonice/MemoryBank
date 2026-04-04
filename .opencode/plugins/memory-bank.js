@@ -417,9 +417,15 @@ function buildToolPayload(eventName, input, output) {
   const payload = {
     hook_event_name: eventName,
     part_id: firstString(
+      input?.callID,
+      input?.callId,
+      input?.call_id,
       input?.partID,
       input?.partId,
       input?.part_id,
+      output?.callID,
+      output?.callId,
+      output?.call_id,
       output?.partID,
       output?.partId,
       output?.part_id,
@@ -442,10 +448,31 @@ function buildToolPayload(eventName, input, output) {
     return payload;
   }
 
-  payload.tool_output = sanitizeForJson(
+  payload.tool_output = buildToolOutputPayload(output);
+  return payload;
+}
+
+function buildToolOutputPayload(output) {
+  if (asObject(output) && hasStructuredToolOutput(output)) {
+    return sanitizeForJson({
+      metadata: output.metadata,
+      output: output.output,
+      title: output.title,
+    });
+  }
+
+  return sanitizeForJson(
     output?.result ?? output?.output ?? output?.response ?? output?.data ?? output?.value ?? output,
   );
-  return payload;
+}
+
+function hasStructuredToolOutput(output) {
+  return (
+    asObject(output) &&
+    (Object.prototype.hasOwnProperty.call(output, "metadata") ||
+      Object.prototype.hasOwnProperty.call(output, "output") ||
+      Object.prototype.hasOwnProperty.call(output, "title"))
+  );
 }
 
 function normalizeMessageRecord(record, fallbackInput = {}) {
@@ -488,7 +515,7 @@ function normalizeMessageRecord(record, fallbackInput = {}) {
     ),
     role: firstString(info.role, candidate.role, fallbackInput?.role),
     sessionId: getSessionId(candidate) || getSessionId(info) || getSessionId(fallbackInput),
-    summary: strictFlagValue(
+    summary: summaryFlagValue(
       info.summary,
       info.isSummary,
       candidate.summary,
@@ -1165,6 +1192,35 @@ function strictFlagValue(...values) {
       if (value === 0) {
         return false;
       }
+    }
+  }
+
+  return false;
+}
+
+function summaryFlagValue(...values) {
+  for (const value of values) {
+    if (typeof value === "boolean") {
+      return value;
+    }
+    if (typeof value === "string") {
+      if (value === "true" || value === "1") {
+        return true;
+      }
+      if (value === "false" || value === "0") {
+        return false;
+      }
+    }
+    if (typeof value === "number") {
+      if (value === 1) {
+        return true;
+      }
+      if (value === 0) {
+        return false;
+      }
+    }
+    if (asObject(value)) {
+      return true;
     }
   }
 

@@ -193,9 +193,9 @@ async function handleToolLifecycle(context, eventName, event, hookContext) {
   };
 
   if (eventName === "before_tool_call") {
-    payload.tool_arguments = resolveToolArguments(event);
+    payload.tool_arguments = sanitizeForJson(resolveToolArguments(event));
   } else {
-    payload.tool_output = resolveToolOutput(event);
+    payload.tool_output = sanitizeForJson(resolveToolOutput(event));
   }
 
   const runIdPart = payload.run_id || "no-run";
@@ -443,6 +443,18 @@ function createHookEmitter(config, logger, platform) {
       return false;
     }
 
+    let serializedPayload;
+    try {
+      serializedPayload = JSON.stringify(sanitizeForJson(payload));
+    } catch (error) {
+      await logger.warn("failed to serialize Memory Bank payload", {
+        error: describeError(error),
+        eventName,
+        sessionId: payload?.session_id,
+      });
+      return false;
+    }
+
     const result = platform.spawnSync(
       config.hookBinary,
       [
@@ -455,7 +467,7 @@ function createHookEmitter(config, logger, platform) {
       ],
       {
         encoding: "utf8",
-        input: JSON.stringify(payload),
+        input: serializedPayload,
       },
     );
 
@@ -480,17 +492,28 @@ function createHookEmitter(config, logger, platform) {
 function createLogger(config, platform) {
   const shouldWriteFile = Boolean(config.debugFile);
   const shouldDebug = Boolean(config.debug) || shouldWriteFile;
+  let warnedDebugFileFailure = false;
 
   async function write(level, message, meta) {
-    const line = JSON.stringify({
+    const line = JSON.stringify(sanitizeForJson({
       level,
       message,
       meta: meta || undefined,
       timestamp: new Date().toISOString(),
-    });
+    }));
 
     if (shouldWriteFile) {
-      platform.appendFile(config.debugFile, `${line}\n`);
+      try {
+        platform.appendFile(config.debugFile, `${line}\n`);
+      } catch (error) {
+        if (!warnedDebugFileFailure) {
+          warnedDebugFileFailure = true;
+          console.warn("[memory-bank-openclaw] Failed to write debug log file", {
+            debugFile: config.debugFile,
+            error: describeError(error),
+          });
+        }
+      }
     }
 
     if (!shouldDebug && level === "debug") {
@@ -789,6 +812,51 @@ function createNow(platform) {
   return () => Date.now();
 }
 
+function sanitizeForJson(value, seen = new WeakSet()) {
+  if (value === null) {
+    return null;
+  }
+
+  if (typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : String(value);
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeForJson(entry, seen));
+  }
+
+  if (typeof value !== "object") {
+    return value == null ? null : String(value);
+  }
+
+  if (seen.has(value)) {
+    return "[circular]";
+  }
+
+  seen.add(value);
+  const result = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry === undefined || typeof entry === "function" || typeof entry === "symbol") {
+      continue;
+    }
+    result[key] = sanitizeForJson(entry, seen);
+  }
+  seen.delete(value);
+  return result;
+}
+
 function createPlatform() {
   return {
     appendFile(filePath, text) {
@@ -818,6 +886,10 @@ function createPlatform() {
       });
     },
   };
+}
+
+function describeError(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 module.exports = plugin;

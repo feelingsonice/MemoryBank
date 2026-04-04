@@ -344,12 +344,88 @@ test("deduplicates repeated prompt capture payloads only within the duplicate wi
   assert.equal(harness.emitted.length, 2);
 });
 
+test("sanitizes non-JSON-safe tool payloads before emit", async () => {
+  const harness = createHarness();
+  const circularArgs = { file: "README.md" };
+  circularArgs.self = circularArgs;
+  const circularOutput = {
+    count: BigInt(7),
+    infinite: Infinity,
+    when: new Date("2026-03-28T12:00:05Z"),
+  };
+  circularOutput.self = circularOutput;
+
+  await harness.runtime.handleBeforeToolCall({
+    args: circularArgs,
+    sessionId: "session-1",
+    tool: { name: "read_file", callId: "tool-1" },
+  });
+  await harness.runtime.handleAfterToolCall({
+    output: circularOutput,
+    sessionId: "session-1",
+    tool: { name: "read_file", callId: "tool-1" },
+  });
+
+  assert.deepEqual(harness.emitted, [
+    {
+      event: "before_tool_call",
+      payload: {
+        hook_event_name: "before_tool_call",
+        run_id: null,
+        session_id: "session-1",
+        timestamp: harness.emitted[0].payload.timestamp,
+        tool_arguments: {
+          file: "README.md",
+          self: "[circular]",
+        },
+        tool_name: "read_file",
+        tool_use_id: "tool-1",
+      },
+    },
+    {
+      event: "after_tool_call",
+      payload: {
+        hook_event_name: "after_tool_call",
+        run_id: null,
+        session_id: "session-1",
+        timestamp: harness.emitted[1].payload.timestamp,
+        tool_name: "read_file",
+        tool_output: {
+          count: "7",
+          infinite: "Infinity",
+          self: "[circular]",
+          when: "2026-03-28T12:00:05.000Z",
+        },
+        tool_use_id: "tool-1",
+      },
+    },
+  ]);
+});
+
+test("debug file failures do not abort runtime startup or logging", async () => {
+  const harness = createHarness({
+    appendFile() {
+      throw new Error("disk full");
+    },
+    pluginConfig: {
+      debugFile: "/tmp/memory-bank-openclaw.log",
+    },
+  });
+
+  await harness.runtime.logger.warn("still logging");
+
+  assert.deepEqual(harness.emitted, []);
+});
+
 function createHarness(options = {}) {
   const emitted = [];
   const files = new Map();
   let now = options.now ?? Date.parse("2026-03-28T12:00:00Z");
   const platform = {
     appendFile(filePath, text) {
+      if (typeof options.appendFile === "function") {
+        return options.appendFile(filePath, text);
+      }
       files.set(filePath, `${files.get(filePath) || ""}${text}`);
     },
     cwd() {
