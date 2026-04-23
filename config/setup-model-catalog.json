@@ -1,7 +1,12 @@
 {
   "providers": {
     "anthropic": {
-      "models": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"]
+      "models": [
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5"
+      ]
     },
     "gemini": {
       "models": [
@@ -11,7 +16,7 @@
       ]
     },
     "open-ai": {
-      "models": ["gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"]
+      "models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"]
     },
     "ollama": {
       "models": [
